@@ -26,7 +26,7 @@ import {
 } from '../repositories/artifact-repository.js'
 import { ImportRepository, type ImportItemStage } from '../repositories/import-repository.js'
 import { SearchVisibilityRepository } from '../repositories/search-visibility-repository.js'
-import type { AuthorizedFile } from '../security/path-policy.js'
+import { AssetReadLimitError, type AuthorizedFile } from '../security/path-policy.js'
 import { SQLiteSearchIndexer } from '../search/sqlite-search-indexer.js'
 import {
   MAX_THUMBNAIL_BYTES,
@@ -92,7 +92,11 @@ export interface ArtifactProcessorDependencies {
     render(markdown: string): MarkdownRenderResult
   }
   readonly htmlRenderer: {
-    render(request: { html: string; sourcePath: string }): Promise<HtmlRenderResult>
+    render(request: {
+      html: string
+      sourcePath: string
+      signal?: AbortSignal
+    }): Promise<HtmlRenderResult>
   }
   readonly indexer?: ArtifactIndexer
   readonly thumbnailDirectory: string
@@ -109,6 +113,7 @@ export interface ArtifactProcessRequest {
   readonly userTitle?: string | null
   readonly runId?: number
   readonly itemId?: number
+  readonly signal?: AbortSignal
 }
 
 export type ProcessingOutcome = 'completed' | 'partial' | 'failed' | 'cancelled' | 'stale'
@@ -235,7 +240,11 @@ export class ArtifactProcessor {
     let sourceFormat: ArtifactFormat
     try {
       if (!this.startStage(run, 'inspect')) return this.cancel(run, attempt, 'inspect')
-      authorizedFile = await this.dependencies.pathPolicy.authorizeFile(request.sourcePath)
+      authorizedFile = await this.waitForAttempt(
+        this.dependencies.pathPolicy.authorizeFile(request.sourcePath),
+        request.signal,
+        'inspect',
+      )
       sourceFormat = formatFor(authorizedFile.canonicalPath)
       const artifact = this.artifacts.register({
         sourcePath: authorizedFile.canonicalPath,
@@ -274,7 +283,11 @@ export class ArtifactProcessor {
 
     if (!this.startStage(run, 'extract')) return this.cancel(run, attempt, 'extract')
     try {
-      const source = await authorizedFile.read('utf8')
+      const source = await this.waitForAttempt(
+        authorizedFile.read('utf8', MAX_SOURCE_BYTES),
+        request.signal,
+        'extract',
+      )
       if (Buffer.byteLength(source, 'utf8') > MAX_SOURCE_BYTES) {
         throw new ArtifactProcessingError('INPUT_TOO_LARGE', 'extract')
       }
@@ -285,11 +298,15 @@ export class ArtifactProcessor {
       attempt.contentStatus = 'ready'
       attempt.title = this.resolveTitle(attempt.artifactId, request.userTitle, attempt.extraction, authorizedFile)
     } catch (error) {
-      const mapped = mapProcessingError(
-        error,
-        'extract',
-        sourceFormat === 'markdown' ? 'MARKDOWN_PARSE_FAILED' : 'UNKNOWN',
-      )
+      const mapped =
+        error instanceof AssetReadLimitError
+          ? new ArtifactProcessingError('INPUT_TOO_LARGE', 'extract')
+          : mapProcessingError(
+              error,
+              'extract',
+              sourceFormat === 'markdown' ? 'MARKDOWN_PARSE_FAILED' : 'UNKNOWN',
+            )
+      if (mapped.code === 'TIMEOUT') return this.timeout(run, attempt, 'extract')
       this.recordError(attempt, mapped)
     }
 
@@ -299,36 +316,47 @@ export class ArtifactProcessor {
         attempt.renderResult = await this.dependencies.htmlRenderer.render({
           html: attempt.extraction.html,
           sourcePath: authorizedFile.canonicalPath,
+          signal: request.signal,
         })
         attempt.renderStatus = 'ready'
       } catch (error) {
-        this.recordError(attempt, mapProcessingError(error, 'render', 'HTML_RENDER_FAILED'))
+        const mapped = mapProcessingError(error, 'render', 'HTML_RENDER_FAILED')
+        if (mapped.code === 'TIMEOUT') return this.timeout(run, attempt, 'render')
+        this.recordError(attempt, mapped)
       }
     }
 
     if (!this.startStage(run, 'index')) return this.cancel(run, attempt, 'index')
     if (attempt.extraction) {
       try {
-        attempt.preparedIndex = await this.indexer.prepare({
-          artifactId: attempt.artifactId,
-          generation: attempt.generation,
-          sourcePath: authorizedFile.canonicalPath,
-          text: attempt.extraction.text,
-        })
+        attempt.preparedIndex = await this.waitForAttempt(
+          this.indexer.prepare({
+            artifactId: attempt.artifactId,
+            generation: attempt.generation,
+            sourcePath: authorizedFile.canonicalPath,
+            text: attempt.extraction.text,
+          }),
+          request.signal,
+          'index',
+          (prepared) => prepared.rollback(),
+        )
         attempt.indexStatus = 'ready'
       } catch (error) {
-        this.recordError(attempt, mapProcessingError(error, 'index', 'INDEX_UPDATE_FAILED'))
+        const mapped = mapProcessingError(error, 'index', 'INDEX_UPDATE_FAILED')
+        if (mapped.code === 'TIMEOUT') return this.timeout(run, attempt, 'index')
+        this.recordError(attempt, mapped)
       }
     }
 
     if (!this.startStage(run, 'commit')) return this.cancel(run, attempt, 'commit')
-    return this.commit(run, attempt, authorizedFile)
+    return this.commit(run, attempt, authorizedFile, request.signal)
   }
 
   private async commit(
     run: RunContext,
     attempt: MutableAttempt,
     authorizedFile: AuthorizedFile,
+    signal?: AbortSignal,
   ): Promise<ArtifactProcessResult> {
     const artifactId = requireAttemptNumber(attempt.artifactId, 'artifact id')
     const generationId = requireAttemptNumber(attempt.generationId, 'generation id')
@@ -340,25 +368,38 @@ export class ArtifactProcessor {
 
     try {
       if (attempt.renderResult) {
-        const optimized = await this.optimizer.optimize({
-          bytes: attempt.renderResult.screenshot,
-          width: attempt.renderResult.width,
-          height: attempt.renderResult.height,
-        })
+        const optimized = await this.waitForAttempt(
+          this.optimizer.optimize({
+            bytes: attempt.renderResult.screenshot,
+            width: attempt.renderResult.width,
+            height: attempt.renderResult.height,
+            signal,
+          }),
+          signal,
+          'commit',
+        )
         if (optimized.bytes.byteLength > MAX_THUMBNAIL_BYTES) {
           throw new ThumbnailOptimizationError()
         }
         if (this.isCancellationRequested(run.runId)) {
           return this.cancel(run, attempt, 'commit')
         }
-        await this.fileSystem.mkdir(this.dependencies.thumbnailDirectory, { recursive: true })
+        await this.waitForAttempt(
+          this.fileSystem.mkdir(this.dependencies.thumbnailDirectory, { recursive: true }),
+          signal,
+          'commit',
+        )
         const base = `artifact-${artifactId}-generation-${generation}.webp`
         finalPath = join(this.dependencies.thumbnailDirectory, base)
         temporaryPath = join(
           this.dependencies.thumbnailDirectory,
           `.${base}.${randomUUID()}.tmp`,
         )
-        await this.fileSystem.writeFile(temporaryPath, optimized.bytes)
+        await this.waitForAttempt(
+          this.fileSystem.writeFile(temporaryPath, optimized.bytes),
+          signal,
+          'commit',
+        )
       }
 
       if (this.isCancellationRequested(run.runId)) {
@@ -456,7 +497,10 @@ export class ArtifactProcessor {
       this.recordError(attempt, mapped)
       if (attempt.generationId !== null) {
         this.artifacts.setGenerationState(attempt.generationId, {
-          jobStatus: mapped.code === 'STALE_GENERATION' ? 'interrupted' : 'idle',
+          jobStatus:
+            mapped.code === 'STALE_GENERATION' || mapped.code === 'TIMEOUT'
+              ? 'interrupted'
+              : 'idle',
           contentStatus: 'failed',
           renderStatus: 'failed',
           indexStatus: 'failed',
@@ -547,6 +591,63 @@ export class ArtifactProcessor {
     this.imports.cancelItem(run.itemId, this.now())
     this.finishRunIfTerminal(run.runId, this.now())
     return this.result('cancelled', attempt)
+  }
+
+  private async timeout(
+    run: RunContext,
+    attempt: MutableAttempt,
+    stage: ProcessingStage,
+  ): Promise<ArtifactProcessResult> {
+    const indexRecoveryError = await this.recoverPreparedIndex(attempt)
+    if (indexRecoveryError) this.recordError(attempt, indexRecoveryError)
+    const error = new ArtifactProcessingError('TIMEOUT', stage)
+    this.recordError(attempt, error)
+    if (attempt.generationId !== null) {
+      this.artifacts.setGenerationState(attempt.generationId, {
+        jobStatus: 'interrupted',
+        contentStatus: attempt.contentStatus,
+        renderStatus: attempt.renderStatus,
+        indexStatus: attempt.indexStatus,
+      })
+    }
+    this.failItemAndRun(run, attempt)
+    return this.result('failed', attempt)
+  }
+
+  private waitForAttempt<T>(
+    operation: Promise<T>,
+    signal: AbortSignal | undefined,
+    stage: ProcessingStage,
+    disposeLateResult?: (value: T) => Promise<unknown>,
+  ): Promise<T> {
+    if (!signal) return operation
+    return new Promise<T>((resolve, reject) => {
+      let settled = false
+      const onAbort = () => {
+        if (settled) return
+        settled = true
+        reject(new ArtifactProcessingError('TIMEOUT', stage, undefined, { cause: signal.reason }))
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      if (signal.aborted) onAbort()
+      void operation.then(
+        (value) => {
+          if (settled) {
+            void disposeLateResult?.(value).catch(() => undefined)
+            return
+          }
+          settled = true
+          signal.removeEventListener('abort', onAbort)
+          resolve(value)
+        },
+        (error: unknown) => {
+          if (settled) return
+          settled = true
+          signal.removeEventListener('abort', onAbort)
+          reject(error)
+        },
+      )
+    })
   }
 
   private isCancellationRequested(runId: number): boolean {

@@ -5,6 +5,7 @@ import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
+import { ArtifactProcessingError } from '../../shared/errors.js'
 import { openDatabase } from '../db/database.js'
 import { MarkdownRenderer } from '../rendering/markdown-renderer.js'
 import { ArtifactRepository } from '../repositories/artifact-repository.js'
@@ -270,6 +271,61 @@ describe('ArtifactProcessor staged pipeline', () => {
     expect(renderFinished).toBe(true)
     expect(result).toMatchObject({ outcome: 'cancelled' })
     expect(result.errors.at(-1)).toMatchObject({ code: 'CANCELLED', stage: 'index' })
+    harness.database.close()
+  })
+
+  it('records a worker deadline during render as a durable TIMEOUT and starts no later stage', async () => {
+    let indexStarted = false
+    let markRenderStarted!: () => void
+    const renderStarted = new Promise<void>((resolve) => {
+      markRenderStarted = resolve
+    })
+    const harness = await makeHarness({
+      render: async (request) => {
+        markRenderStarted()
+        return new Promise((resolve, reject) => {
+          request.signal?.addEventListener(
+            'abort',
+            () => reject(request.signal?.reason),
+            { once: true },
+          )
+        })
+      },
+      indexer: {
+        prepare: async () => {
+          indexStarted = true
+          return preparedIndex()
+        },
+      },
+    })
+    await writeFile(harness.sourcePath, '# Deadline')
+    const imports = new ImportRepository(harness.database)
+    const run = imports.createRun([harness.sourcePath])
+    const deadline = new AbortController()
+
+    const processing = harness.processor.register({
+      sourcePath: harness.sourcePath,
+      runId: run.id,
+      itemId: run.itemIds[0],
+      signal: deadline.signal,
+    })
+    await renderStarted
+    deadline.abort(new ArtifactProcessingError('TIMEOUT', 'render'))
+    const result = await processing
+
+    expect(result).toMatchObject({
+      outcome: 'failed',
+      errors: [expect.objectContaining({ code: 'TIMEOUT', stage: 'render' })],
+    })
+    expect(indexStarted).toBe(false)
+    expect(imports.getItem(run.itemIds[0]).status).toBe('failed')
+    expect(imports.getRun(run.id).status).toBe('failed')
+    expect(
+      harness.database
+        .prepare('SELECT job_status FROM artifact_generation WHERE id = ?')
+        .pluck()
+        .get(result.generationId),
+    ).toBe('interrupted')
     harness.database.close()
   })
 
@@ -938,7 +994,7 @@ interface Controls {
 }
 
 interface ArtifactProcessorConstructor {
-  render: (request: { html: string; sourcePath: string }) => Promise<{
+  render: (request: { html: string; sourcePath: string; signal?: AbortSignal }) => Promise<{
     screenshot: Buffer
     width: number
     height: number

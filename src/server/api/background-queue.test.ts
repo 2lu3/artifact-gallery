@@ -33,4 +33,35 @@ describe('BackgroundQueue', () => {
     await queue.onIdle()
     expect(peak).toBe(2)
   })
+
+  it('rejects new work after close begins and drains already accepted work', async () => {
+    const queue = new BackgroundQueue({ concurrency: 1, capacity: 2 })
+    let release!: () => void
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const completed: string[] = []
+
+    expect(
+      queue.enqueue(async () => {
+        await blocked
+        completed.push('active')
+      }),
+    ).toBe(true)
+    expect(
+      queue.enqueue(async () => {
+        completed.push('pending')
+      }),
+    ).toBe(true)
+    await new Promise<void>((resolve) => setImmediate(resolve))
+
+    const closing = queue.close()
+    expect(queue.enqueue(async () => undefined)).toBe(false)
+    expect(completed).toEqual([])
+
+    release()
+    await closing
+    expect(completed).toEqual(['active', 'pending'])
+    await expect(queue.close()).resolves.toBeUndefined()
+  })
 })

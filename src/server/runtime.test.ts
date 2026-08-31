@@ -1,9 +1,12 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
+import { openDatabase } from './db/database.js'
+import type { StartupReconciliationReport } from './processing/recovery.js'
+import { ImportRepository } from './repositories/import-repository.js'
 import { createServerRuntime, runtimeOptionsFromEnvironment } from './runtime.js'
 
 const temporaryDirectories: string[] = []
@@ -17,6 +20,53 @@ afterEach(async () => {
 })
 
 describe('server composition root', () => {
+  it('reconciles interrupted SQLite and derivative state before exposing the API', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'artifact-gallery-runtime-recovery-'))
+    temporaryDirectories.push(root)
+    const databaseFilename = join(root, 'state', 'catalog.sqlite')
+    const thumbnailDirectory = join(root, 'state', 'thumbnails')
+    await mkdir(thumbnailDirectory, { recursive: true })
+    const temporaryThumbnail = join(thumbnailDirectory, '.artifact-1.webp.crash.tmp')
+    await writeFile(temporaryThumbnail, 'partial')
+    const seed = openDatabase({ filename: databaseFilename })
+    const imports = new ImportRepository(seed)
+    const run = imports.createRun([join(root, 'queued.md')])
+    seed.close()
+
+    const reports: StartupReconciliationReport[] = []
+    const app = await createServerRuntime({
+      databaseFilename,
+      thumbnailDirectory,
+      allowedRoots: [root],
+      port: 4173,
+      reportRecovery: (report) => {
+        reports.push(report)
+      },
+    })
+    const recovered = await app.inject({
+      method: 'GET',
+      url: `/api/imports/${run.id}`,
+      headers: {
+        host: '127.0.0.1:4173',
+        'x-artifact-gallery-token': app.sessionToken,
+      },
+    })
+
+    expect(recovered.json()).toMatchObject({
+      status: 'interrupted',
+      items: [{ status: 'interrupted', stage: 'queued' }],
+    })
+    expect(reports).toEqual([
+      expect.objectContaining({
+        unstartedItems: [
+          expect.objectContaining({ runId: run.id, canonicalPath: join(root, 'queued.md') }),
+        ],
+      }),
+    ])
+    await expect(access(temporaryThumbnail)).rejects.toThrow()
+    await app.close()
+  })
+
   it('wires the protected API without persisting its startup token', async () => {
     const root = await mkdtemp(join(tmpdir(), 'artifact-gallery-runtime-'))
     temporaryDirectories.push(root)

@@ -2,9 +2,14 @@ import { mkdir } from 'node:fs/promises'
 import { delimiter, dirname, resolve } from 'node:path'
 
 import { buildApp, DEFAULT_LISTEN_OPTIONS, type LocalApiApp } from './app.js'
-import { BackgroundQueue } from './api/background-queue.js'
 import { openDatabase } from './db/database.js'
 import { ArtifactProcessor } from './processing/artifact-processor.js'
+import { WebpThumbnailOptimizer } from './processing/thumbnail-optimizer.js'
+import {
+  reconcileStartup,
+  type StartupReconciliationReport,
+} from './processing/recovery.js'
+import { ImportWorker } from './processing/worker.js'
 import { HtmlRenderer } from './rendering/html-renderer.js'
 import { PathPolicy } from './security/path-policy.js'
 
@@ -14,6 +19,7 @@ export interface ServerRuntimeOptions {
   readonly allowedRoots: readonly string[]
   readonly clientDirectory?: string
   readonly port?: number
+  readonly reportRecovery?: (report: StartupReconciliationReport) => void | Promise<void>
 }
 
 export async function createServerRuntime(options: ServerRuntimeOptions): Promise<LocalApiApp> {
@@ -21,28 +27,35 @@ export async function createServerRuntime(options: ServerRuntimeOptions): Promis
   await mkdir(options.thumbnailDirectory, { recursive: true })
   const database = openDatabase({ filename: options.databaseFilename })
   try {
+    const recovery = await reconcileStartup(database, {
+      temporaryDerivativeDirectory: options.thumbnailDirectory,
+      interruptedAt: new Date().toISOString(),
+    })
+    await reportRecovery(options, recovery)
     const pathPolicy = await PathPolicy.create(options.allowedRoots)
     const derivativePathPolicy = await PathPolicy.create([options.thumbnailDirectory])
-    const backgroundQueue = new BackgroundQueue({ concurrency: 2, capacity: 64 })
     const htmlRenderer = new HtmlRenderer(pathPolicy)
     const processor = new ArtifactProcessor({
       database,
       pathPolicy,
       htmlRenderer,
       thumbnailDirectory: options.thumbnailDirectory,
+      thumbnailOptimizer: new WebpThumbnailOptimizer({
+        encode: (request) => htmlRenderer.encodeWebp(request),
+      }),
     })
+    const importWorker = new ImportWorker({ processor, concurrency: 2, capacity: 64 })
     const app = buildApp({
       database,
       pathPolicy,
       derivativePathPolicy,
-      processor,
+      importWorker,
       thumbnailDirectory: options.thumbnailDirectory,
       clientDirectory: options.clientDirectory,
-      backgroundQueue,
       trustedPort: options.port ?? DEFAULT_LISTEN_OPTIONS.port,
     })
     app.addHook('onClose', async () => {
-      await backgroundQueue.onIdle()
+      await importWorker.close()
       await htmlRenderer.close()
       database.close()
     })
@@ -50,6 +63,28 @@ export async function createServerRuntime(options: ServerRuntimeOptions): Promis
   } catch (error) {
     database.close()
     throw error
+  }
+}
+
+async function reportRecovery(
+  options: ServerRuntimeOptions,
+  report: StartupReconciliationReport,
+): Promise<void> {
+  if (
+    report.interruptedRunIds.length === 0 &&
+    report.unstartedItems.length === 0 &&
+    report.errors.length === 0
+  ) {
+    return
+  }
+  try {
+    if (options.reportRecovery) {
+      await options.reportRecovery(report)
+      return
+    }
+    process.stderr.write(`[artifact-gallery] startup-recovery ${JSON.stringify(report)}\n`)
+  } catch {
+    // Recovery reporting must not make a reconciled local catalog unavailable.
   }
 }
 

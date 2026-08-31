@@ -24,8 +24,13 @@ import {
   toPublicProcessingError,
   type PublicProcessingError,
 } from '../../shared/errors.js'
-import type { ArtifactProcessor } from '../processing/artifact-processor.js'
 import { MAX_THUMBNAIL_BYTES } from '../processing/thumbnail-optimizer.js'
+import type {
+  ArtifactProcessOperation,
+  ImportWorker,
+  ImportWorkerCallbacks,
+  ImportWorkerContext,
+} from '../processing/worker.js'
 import {
   ArtifactRepository,
   deriveCardPresentation,
@@ -41,7 +46,6 @@ import type { PathPolicy, PathPolicyItemError } from '../security/path-policy.js
 import { normalizeSearchText } from '../search/search-query.js'
 import { SearchRepository } from '../search/search-repository.js'
 import { CursorCodec, StaleCursorError, type CursorContext } from './cursor.js'
-import { BackgroundQueue } from './background-queue.js'
 import { InvalidResourceTokenError, ThumbnailResourceCodec } from './resource-token.js'
 
 const MAX_PATH_LENGTH = 4096
@@ -67,9 +71,8 @@ export interface ApiRouteDependencies {
   readonly database: Database.Database
   readonly pathPolicy: Pick<PathPolicy, 'authorizeFile' | 'enumerateFolder'>
   readonly derivativePathPolicy: Pick<PathPolicy, 'authorizeAsset'>
-  readonly processor: ArtifactProcessor
+  readonly importWorker: Pick<ImportWorker, 'enqueue' | 'enqueueTask' | 'close'>
   readonly thumbnailDirectory: string
-  readonly backgroundQueue?: BackgroundQueue
   readonly cursorSecret?: Buffer
   readonly platformAdapter?: PlatformAdapter
   readonly now?: () => string
@@ -105,36 +108,34 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
   const imports = new ImportRepository(dependencies.database)
   const artifacts = new ArtifactRepository(dependencies.database)
   const now = dependencies.now ?? (() => new Date().toISOString())
-  const queue =
-    dependencies.backgroundQueue ??
-    new BackgroundQueue({ concurrency: 2, capacity: 64 })
-  const sourceLocks = new Map<string, Promise<void>>()
-  app.addHook('onClose', () => queue.onIdle())
-
-  const serializeSource = async (sourcePath: string, task: () => Promise<void>): Promise<void> => {
-    const predecessor = sourceLocks.get(sourcePath) ?? Promise.resolve()
-    const operation = predecessor.catch(() => undefined).then(task)
-    sourceLocks.set(sourcePath, operation)
-    try {
-      await operation
-    } finally {
-      if (sourceLocks.get(sourcePath) === operation) sourceLocks.delete(sourcePath)
-    }
-  }
+  const worker = dependencies.importWorker
+  app.addHook('onClose', () => worker.close())
 
   const enqueueItem = (
+    operation: ArtifactProcessOperation,
     runId: number,
     itemId: number,
     sourcePath: string,
-    task: () => Promise<void>,
+    onResult?: ImportWorkerCallbacks['onResult'],
   ): boolean =>
-    queue.enqueue(async () => {
-      try {
-        await serializeSource(sourcePath, task)
-      } catch (error) {
-        persistBackgroundFailure(dependencies.database, imports, artifacts, runId, itemId, error, now())
-      }
-    })
+    worker.enqueue(
+      operation,
+      { sourcePath, runId, itemId },
+      {
+        onResult,
+        onError: (error) => {
+          persistBackgroundFailure(
+            dependencies.database,
+            imports,
+            artifacts,
+            runId,
+            itemId,
+            error,
+            now(),
+          )
+        },
+      },
+    )
 
   const cancelRunOnAbort = (request: IncomingMessage, reply: FastifyReply, runId: number) => {
     const remove = observeRequestAbort(
@@ -228,13 +229,7 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
       const authorized = await dependencies.pathPolicy.authorizeFile(sourcePath)
       const canonicalPath = authorized.canonicalPath
       const run = imports.createRun([canonicalPath])
-      const accepted = enqueueItem(run.id, run.itemIds[0] as number, canonicalPath, async () => {
-        await dependencies.processor.register({
-          sourcePath: canonicalPath,
-          runId: run.id,
-          itemId: run.itemIds[0] as number,
-        })
-      })
+      const accepted = enqueueItem('register', run.id, run.itemIds[0] as number, canonicalPath)
       if (!accepted) {
         persistBackgroundFailure(
           dependencies.database,
@@ -260,20 +255,20 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
       assertKeys(body, ['path'])
       const folderPath = readPath(body.path)
       const run = imports.createRun([])
-      const accepted = queue.enqueue(async () => {
-        try {
+      const accepted = worker.enqueueTask(
+        async (context) => {
           await processFolderRun({
             database: dependencies.database,
             imports,
             artifacts,
-            processor: dependencies.processor,
             pathPolicy: dependencies.pathPolicy,
             runId: run.id,
             folderPath,
             now,
-            serializeSource,
+            process: context.process,
           })
-        } catch (error) {
+        },
+        (error) => {
           persistFolderBackgroundFailure(
             dependencies.database,
             imports,
@@ -283,8 +278,8 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
             error,
             now(),
           )
-        }
-      })
+        },
+      )
       if (!accepted) {
         imports.requestCancellation(run.id, now())
         imports.cancelRun(run.id, now())
@@ -333,15 +328,11 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
         if (!artifact) return sendNotFound(reply)
         const run = imports.createRun([artifact.sourcePath])
         const accepted = enqueueItem(
+          operation,
           run.id,
           run.itemIds[0] as number,
           artifact.sourcePath,
-          async () => {
-            const result = await dependencies.processor[operation]({
-              sourcePath: artifact.sourcePath,
-              runId: run.id,
-              itemId: run.itemIds[0] as number,
-            })
+          (result) => {
             const missingError = result.errors.find(({ code }) => code === 'SOURCE_MISSING')
             if (missingError) {
               dependencies.database
@@ -504,16 +495,15 @@ interface FolderRunDependencies {
   readonly database: Database.Database
   readonly imports: ImportRepository
   readonly artifacts: ArtifactRepository
-  readonly processor: ArtifactProcessor
   readonly pathPolicy: Pick<PathPolicy, 'enumerateFolder'>
   readonly runId: number
   readonly folderPath: string
   readonly now: () => string
-  readonly serializeSource: (sourcePath: string, task: () => Promise<void>) => Promise<void>
+  readonly process: ImportWorkerContext['process']
 }
 
 async function processFolderRun(dependencies: FolderRunDependencies): Promise<void> {
-  const { database, imports, artifacts, processor, runId, folderPath, now, serializeSource } =
+  const { database, imports, artifacts, process, runId, folderPath, now } =
     dependencies
   if (imports.getRun(runId).cancelRequestedAt !== null) {
     imports.cancelRun(runId, now())
@@ -570,12 +560,10 @@ async function processFolderRun(dependencies: FolderRunDependencies): Promise<vo
       cancelOutstandingRun(database, imports, runId, now())
       return
     }
-    await serializeSource(file.canonicalPath, async () => {
-      await processor.register({
-        sourcePath: file.canonicalPath,
-        runId,
-        itemId: fileItemIds[index] as number,
-      })
+    await process('register', {
+      sourcePath: file.canonicalPath,
+      runId,
+      itemId: fileItemIds[index] as number,
     })
   }
   finishImportRun(database, imports, runId, now())

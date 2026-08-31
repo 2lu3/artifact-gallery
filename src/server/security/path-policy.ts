@@ -42,7 +42,7 @@ export class PathPolicyError extends Error {
 
 export interface AuthorizedFile {
   readonly canonicalPath: string;
-  read(encoding: 'utf8'): Promise<string>;
+  read(encoding: 'utf8', maxBytes?: number): Promise<string>;
 }
 
 export interface AuthorizedDirectory {
@@ -119,12 +119,13 @@ export class PathPolicy {
 
     return {
       canonicalPath: authorizedSnapshot.canonicalPath,
-      read: (encoding) =>
+      read: (encoding, maxBytes) =>
         normalizeFilesystemOperation(requestedPath, async () => {
           const bytes = await readAuthorizedFile(
             authorizedSnapshot,
             requestedPath,
             () => this.validateFileSnapshot(requestedPath),
+            maxBytes,
           );
           return bytes.toString(encoding);
         }),

@@ -72,6 +72,7 @@ describe('reconcileStartup', () => {
         },
       ],
       removedTemporaryFiles: [temporaryThumbnail],
+      errors: [],
     })
 
     const imports = new ImportRepository(database)

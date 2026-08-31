@@ -127,6 +127,19 @@ describe('PathPolicy', () => {
     await expect(authorized.read('utf8')).resolves.toBe('<h1>Artifact</h1>');
   });
 
+  test('bounds a real source read before loading an oversized file', async () => {
+    const root = await makeTemporaryDirectory();
+    const source = join(root, 'oversized.md');
+    await writeFile(source, Buffer.alloc(1025, 0x61));
+    const policy = await PathPolicy.create([root]);
+    const authorized = await policy.authorizeFile(source);
+
+    await expect(authorized.read('utf8', 1024)).rejects.toMatchObject({
+      name: 'AssetReadLimitError',
+      maxBytes: 1024,
+    });
+  });
+
   test('rejects a file outside the allowed root, including a sibling with the same prefix', async () => {
     const parent = await makeTemporaryDirectory();
     const root = join(parent, 'allowed');

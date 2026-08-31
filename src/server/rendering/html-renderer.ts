@@ -32,6 +32,7 @@ export class HtmlRenderError extends Error {
 export interface HtmlRenderRequest {
   readonly html: string;
   readonly sourcePath: string;
+  readonly signal?: AbortSignal;
 }
 
 export type HtmlRenderWarningCode = 'ASSET_BLOCKED' | 'CONTENT_CLIPPED';
@@ -45,6 +46,14 @@ export interface HtmlRenderResult {
   readonly width: number;
   readonly height: number;
   readonly warnings: readonly HtmlRenderWarning[];
+}
+
+export interface HtmlRendererWebpEncodeRequest {
+  readonly bytes: Buffer;
+  readonly width: number;
+  readonly height: number;
+  readonly quality: number;
+  readonly signal?: AbortSignal;
 }
 
 type AssetPathPolicy = Pick<PathPolicy, 'authorizeAsset'>;
@@ -233,9 +242,16 @@ export class HtmlRenderer {
     const abortController = new AbortController();
     const attempt = this.renderAttempt(request, handle, abortController.signal);
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    let rejectExternalAbort: (() => void) | undefined;
+    const externalAbort = new Promise<never>((_resolve, reject) => {
+      rejectExternalAbort = () => reject(new HtmlRenderError('TIMEOUT'));
+      if (request.signal?.aborted) rejectExternalAbort();
+      else request.signal?.addEventListener('abort', rejectExternalAbort, { once: true });
+    });
     try {
       return await Promise.race([
         attempt,
+        externalAbort,
         new Promise<never>((_resolve, reject) => {
           timeout = setTimeout(
             () => reject(new HtmlRenderError('TIMEOUT')),
@@ -254,6 +270,53 @@ export class HtmlRenderer {
       if (timeout) {
         clearTimeout(timeout);
       }
+      if (rejectExternalAbort) {
+        request.signal?.removeEventListener('abort', rejectExternalAbort);
+      }
+    }
+  }
+
+  async encodeWebp(request: HtmlRendererWebpEncodeRequest): Promise<Buffer> {
+    const abortController = new AbortController();
+    const abortFromWorker = () => abortController.abort(request.signal?.reason);
+    if (request.signal?.aborted) abortFromWorker();
+    else request.signal?.addEventListener('abort', abortFromWorker, { once: true });
+    const timeout = setTimeout(() => abortController.abort(), this.renderTimeoutMs);
+    let context: BrowserContext | undefined;
+    let releaseContextSlot: (() => void) | undefined;
+    try {
+      releaseContextSlot = await this.contextLimiter.acquire(abortController.signal);
+      const browser = await this.awaitAttempt(this.ensureBrowser(), abortController.signal);
+      context = await this.awaitAttempt(
+        browser.newContext({
+          acceptDownloads: false,
+          javaScriptEnabled: false,
+          serviceWorkers: 'block',
+          viewport: { width: request.width, height: request.height },
+        }),
+        abortController.signal,
+        (lateContext) => lateContext.close(),
+      );
+      const page = await this.awaitAttempt(context.newPage(), abortController.signal);
+      const source = `data:image/webp;base64,${request.bytes.toString('base64')}`;
+      await this.awaitAttempt(
+        page.setContent(
+          `<style>html,body{margin:0;width:${request.width}px;height:${request.height}px;overflow:hidden}` +
+            `img{display:block;width:${request.width}px;height:${request.height}px;object-fit:contain}</style>` +
+            `<img src="${source}" alt="">`,
+          { waitUntil: 'load' },
+        ),
+        abortController.signal,
+      );
+      return await this.awaitAttempt(
+        this.capturePageWebp(page, request.width, request.height, request.quality),
+        abortController.signal,
+      );
+    } finally {
+      clearTimeout(timeout);
+      request.signal?.removeEventListener('abort', abortFromWorker);
+      await context?.close().catch(() => undefined);
+      releaseContextSlot?.();
     }
   }
 
@@ -697,12 +760,21 @@ export class HtmlRenderer {
   }
 
   private async captureWebp(page: Page, height: number): Promise<Buffer> {
+    return this.capturePageWebp(page, SCREENSHOT_WIDTH, height, 80);
+  }
+
+  private async capturePageWebp(
+    page: Page,
+    width: number,
+    height: number,
+    quality: number,
+  ): Promise<Buffer> {
     const session = await page.context().newCDPSession(page);
     try {
       const result = await session.send('Page.captureScreenshot', {
         format: 'webp',
-        quality: 80,
-        clip: { x: 0, y: 0, width: SCREENSHOT_WIDTH, height, scale: 1 },
+        quality,
+        clip: { x: 0, y: 0, width, height, scale: 1 },
         captureBeyondViewport: true,
       });
       return Buffer.from(result.data, 'base64');

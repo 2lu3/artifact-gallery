@@ -11,6 +11,7 @@ export interface ThumbnailInput {
   readonly bytes: Buffer
   readonly width: number
   readonly height: number
+  readonly signal?: AbortSignal
 }
 
 export interface OptimizedThumbnail extends ThumbnailInput {

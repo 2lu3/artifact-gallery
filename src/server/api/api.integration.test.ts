@@ -6,9 +6,9 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { buildApp } from '../app.js'
-import { BackgroundQueue } from './background-queue.js'
 import { openDatabase } from '../db/database.js'
 import { ArtifactProcessor } from '../processing/artifact-processor.js'
+import { ImportWorker } from '../processing/worker.js'
 import { SearchVisibilityRepository } from '../repositories/search-visibility-repository.js'
 import { PathPolicy } from '../security/path-policy.js'
 
@@ -732,7 +732,6 @@ async function makeHarness(
     },
   }
   const derivativePathPolicy = await PathPolicy.create([thumbnailDirectory])
-  const backgroundQueue = new BackgroundQueue({ concurrency: 2, capacity: 64 })
   let renderFailure = false
   const processor = new ArtifactProcessor({
     database,
@@ -753,13 +752,13 @@ async function makeHarness(
       optimize: async ({ bytes, width, height }) => ({ bytes, width, height, quality: 80 }),
     },
   })
+  const importWorker = new ImportWorker({ processor, concurrency: 2, capacity: 64 })
   const app = buildApp({
     database,
     pathPolicy: routePathPolicy,
     derivativePathPolicy,
-    processor,
+    importWorker,
     thumbnailDirectory,
-    backgroundQueue,
   })
   const headers = {
     host: '127.0.0.1:3000',
@@ -774,7 +773,7 @@ async function makeHarness(
     sourceDirectory,
     thumbnailDirectory,
     processor,
-    backgroundQueue,
+    importWorker,
     setRenderFailure: (value: boolean) => {
       renderFailure = value
     },
@@ -825,7 +824,7 @@ async function waitForRun(
   }>
   [key: string]: unknown
 }> {
-  await harness.backgroundQueue.onIdle()
+  await harness.importWorker.onIdle()
   for (let attempt = 0; attempt < 500; attempt += 1) {
     const response = await harness.app.inject({
       method: 'GET',

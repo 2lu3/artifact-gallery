@@ -9,6 +9,7 @@ export class BackgroundQueue {
   private readonly idleWaiters: Array<() => void> = []
   private active = 0
   private scheduled = false
+  private accepting = true
 
   constructor(private readonly options: BackgroundQueueOptions) {
     if (!Number.isInteger(options.concurrency) || options.concurrency < 1) {
@@ -20,6 +21,7 @@ export class BackgroundQueue {
   }
 
   enqueue(task: () => Promise<void>): boolean {
+    if (!this.accepting) return false
     if (this.active + this.pending.length >= this.options.capacity) return false
     this.pending.push(task)
     this.schedulePump()
@@ -29,6 +31,11 @@ export class BackgroundQueue {
   onIdle(): Promise<void> {
     if (this.active === 0 && this.pending.length === 0) return Promise.resolve()
     return new Promise((resolve) => this.idleWaiters.push(resolve))
+  }
+
+  close(): Promise<void> {
+    this.accepting = false
+    return this.onIdle()
   }
 
   private schedulePump(): void {

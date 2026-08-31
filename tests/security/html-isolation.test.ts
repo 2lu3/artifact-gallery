@@ -567,6 +567,35 @@ describe('HTML isolation', () => {
     10_000,
   );
 
+  test('reuses the rendering Chromium process for bounded thumbnail re-encoding', async () => {
+    const root = await makeTemporaryDirectory();
+    const sourcePath = join(root, 'artifact.html');
+    await writeFile(sourcePath, '<h1>source</h1>');
+    const policy = await PathPolicy.create([root]);
+    const launchedBrowsers: Browser[] = [];
+    const renderer = new HtmlRenderer(policy, {
+      launchBrowser: async () => {
+        const browser = await chromium.launch({ headless: true });
+        launchedBrowsers.push(browser);
+        return browser;
+      },
+    });
+    renderers.push(renderer);
+    const rendered = await renderer.render({ sourcePath, html: '<h1>Shared browser</h1>' });
+
+    const encoded = await renderer.encodeWebp({
+      bytes: rendered.screenshot,
+      width: rendered.width,
+      height: rendered.height,
+      quality: 70,
+    });
+
+    expect(encoded.subarray(0, 4).toString('ascii')).toBe('RIFF');
+    expect(encoded.subarray(8, 12).toString('ascii')).toBe('WEBP');
+    expect(launchedBrowsers).toHaveLength(1);
+    expect(launchedBrowsers[0]?.contexts()).toHaveLength(0);
+  });
+
   test(
     'waits to open a third context until one of two active contexts closes',
     async () => {
@@ -668,6 +697,60 @@ describe('HTML isolation', () => {
     expect(recovered.screenshot.subarray(8, 12).toString('ascii')).toBe('WEBP');
     expect(launchedBrowsers[1]?.contexts()).toHaveLength(0);
   });
+
+  test(
+    'closes the disposable context promptly when the worker deadline aborts a real render',
+    async () => {
+      const root = await makeTemporaryDirectory();
+      const sourcePath = join(root, 'artifact.html');
+      const assetPath = join(root, 'stalled.css');
+      await writeFile(sourcePath, '<h1>source</h1>');
+      await writeFile(assetPath, 'body { color: purple; }');
+      const realPolicy = await PathPolicy.create([root]);
+      const readStarted = deferred<void>();
+      let launchedBrowser: Browser | undefined;
+      const renderer = new HtmlRenderer(
+        {
+          authorizeAsset: async (requestedPath) => {
+            const asset = await realPolicy.authorizeAsset(requestedPath);
+            return {
+              canonicalPath: asset.canonicalPath,
+              mimeType: asset.mimeType,
+              read: () => {
+                readStarted.resolve();
+                return new Promise<Buffer>(() => undefined);
+              },
+            };
+          },
+        },
+        {
+          renderTimeoutMs: 3_000,
+          launchBrowser: async () => {
+            launchedBrowser = await chromium.launch({ headless: true });
+            return launchedBrowser;
+          },
+        },
+      );
+      renderers.push(renderer);
+      const deadline = new AbortController();
+      const startedAt = performance.now();
+      const outcome = renderer
+        .render({
+          sourcePath,
+          html: '<link rel="stylesheet" href="./stalled.css">',
+          signal: deadline.signal,
+        })
+        .then(() => ({ code: 'RENDERED' }), (error: unknown) => error);
+
+      await readStarted.promise;
+      deadline.abort();
+
+      await expect(outcome).resolves.toMatchObject({ code: 'TIMEOUT' });
+      expect(performance.now() - startedAt).toBeLessThan(1_000);
+      expect(launchedBrowser?.contexts()).toHaveLength(0);
+    },
+    5_000,
+  );
 
   test(
     'closes a context returned after the render timeout before clearing permissions',
