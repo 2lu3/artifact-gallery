@@ -234,3 +234,96 @@ Fix round and report: this commit.
 
 - Real Chromium verification retains the same macOS managed-sandbox limitation documented above;
   all 124 tests pass in the permitted execution context.
+
+---
+
+## Fix round 2/5
+
+### Findings addressed
+
+1. **Post-commit thumbnail maintenance isolation**
+   - The rollback catch now ends at the SQLite/index/file activation boundary. Once generation,
+     item, and run commit successfully, inactive-thumbnail cleanup cannot delete the new active
+     file or attempt an invalid failure transition.
+   - Cleanup-marker persistence failures are reported only through the internal
+     `ProcessingOperationalError` channel and do not alter the completed public result.
+2. **Non-silent prepared-index recovery**
+   - `PreparedArtifactIndex` now requires `quarantine()` in addition to `commit()` and
+     `rollback()`.
+   - A rollback failure quarantines search visibility, records durable `INDEX_REPAIR_PENDING`,
+     reports the internal recovery fault, and returns/persists `INDEX_UPDATE_FAILED` at `index`.
+   - A later successful prepared-index commit clears the repair marker only after the full
+     generation transaction succeeds.
+3. **Durable thumbnail cleanup retry**
+   - Clean processing no longer deletes `THUMBNAIL_RETIRE_PENDING` or `INDEX_REPAIR_PENDING`.
+   - Every committed generation retries removal of all inactive, non-active thumbnail paths.
+     The original pending-warning row remains unchanged across failed retries and is deleted only
+     after every inactive path is removed successfully.
+4. **Index commit failure classification and state consistency**
+   - Prepared-index `commit()` failures are mapped to public and persisted
+     `INDEX_UPDATE_FAILED / index`, rather than `DERIVED_WRITE_FAILED / commit`.
+   - Failed transaction results now return the same `failed` content/render/index statuses stored
+     on the attempted generation.
+
+### Focused RED / GREEN evidence
+
+| Regression | Observed RED | GREEN evidence |
+| --- | --- | --- |
+| Thumbnail unlink plus warning-insert failure | Processor threw `InvalidImportTransitionError` after trying to fail an already completed item | Result remains completed; new generation/file stay active; old file stays pending; internal warning-persistence event is captured |
+| Prepared-index rollback failure | Returned `DERIVED_WRITE_FAILED / commit`; uncommitted search text remained visible | Returns `INDEX_UPDATE_FAILED / index`; old DB generation remains active; search is quarantined; durable repair marker exists |
+| Prepared-index commit failure | Returned `DERIVED_WRITE_FAILED / commit` with ready result statuses | Public and persisted error is `INDEX_UPDATE_FAILED / index`; returned and stored statuses are all failed |
+| Repeated thumbnail cleanup failure | Existing warning was rewritten from generation 2 to generation 3 while the oldest file remained | Original warning identity is preserved; next successful retry removes all inactive files before deleting it |
+
+Focused command:
+
+```text
+pnpm test src/server/processing/artifact-processor.test.ts
+
+Test Files  1 passed (1)
+Tests       22 passed (22)
+```
+
+### Verification
+
+Fresh verification after the final change:
+
+```text
+pnpm lint
+eslint .                                      exit 0
+
+pnpm typecheck
+tsc --noEmit                                  exit 0
+
+pnpm test
+Test Files  12 passed (12)
+Tests       128 passed (128)
+
+pnpm build
+vite build                                   exit 0
+tsc --project tsconfig.server.json            exit 0
+```
+
+The full suite ran outside the managed macOS process sandbox solely because Chromium Mach
+rendezvous registration is denied inside it.
+
+### Self-review
+
+- Mutation: rejoining post-commit cleanup with the transaction catch reproduces the completed-item
+  transition exception and removes the new active file.
+- Mutation: swallowing index rollback failure leaves the uncommitted search document visible and
+  loses both the public index error and durable repair marker.
+- Mutation: deleting all warnings on clean success changes the pending-warning identity before the
+  associated inactive files are removed.
+- Mutation: classifying prepared-index commit through the generic commit fallback restores the
+  wrong code/stage and returned-versus-persisted status mismatch.
+- Existing repository, import-transition, rendering, and path-policy contracts remain unchanged;
+  the index contract intentionally gains mandatory quarantine semantics.
+
+### Commit
+
+Fix round and report: this commit.
+
+### Concerns
+
+- Real Chromium verification retains the same managed-sandbox limitation; all 128 tests pass in
+  the permitted execution context.

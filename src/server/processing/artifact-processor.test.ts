@@ -13,6 +13,7 @@ import { PathPolicy } from '../security/path-policy.js'
 import {
   ArtifactProcessor,
   type ArtifactIndexer,
+  type ProcessingOperationalError,
   type ProcessorFileSystem,
 } from './artifact-processor.js'
 import { MAX_THUMBNAIL_BYTES, type ThumbnailOptimizer } from './thumbnail-optimizer.js'
@@ -364,6 +365,9 @@ describe('ArtifactProcessor staged pipeline', () => {
           rollback: async () => {
             visibleText = previousText
           },
+          quarantine: async () => {
+            visibleText = null
+          },
         }
       },
     }
@@ -383,6 +387,93 @@ describe('ArtifactProcessor staged pipeline', () => {
 
     expect(failed.outcome).toBe('failed')
     expect(visibleText).toBe('First searchable text')
+    harness.database.close()
+  })
+
+  it('quarantines a prepared index and records durable repair work when rollback fails', async () => {
+    let visibleText: string | null = null
+    let quarantined = false
+    const indexer = {
+      prepare: async ({ text }: { text: string }) => {
+        const previousText = visibleText
+        return {
+          commit: () => {
+            visibleText = text
+          },
+          rollback: async () => {
+            if (text.includes('Unrecoverable')) throw new Error('index rollback unavailable')
+            visibleText = previousText
+          },
+          quarantine: async () => {
+            visibleText = null
+            quarantined = true
+          },
+        }
+      },
+    }
+    const harness = await makeHarness({ indexer })
+    await writeFile(harness.sourcePath, '# Previous searchable text')
+    const first = await harness.processor.register({ sourcePath: harness.sourcePath })
+    const artifactId = requireResultNumber(first.artifactId)
+    expect(visibleText).toBe('Previous searchable text')
+    await writeFile(harness.sourcePath, '# Unrecoverable searchable text')
+    const failingProcessor = harness.withFileSystem({
+      ...realFileSystem,
+      rename: () => {
+        throw new Error('rename failed after index activation')
+      },
+    })
+
+    const failed = await failingProcessor.refresh({ sourcePath: harness.sourcePath })
+
+    expect(failed.outcome).toBe('failed')
+    expect(failed.errors.at(-1)).toMatchObject({ code: 'INDEX_UPDATE_FAILED', stage: 'index' })
+    expect(failed.indexStatus).toBe('failed')
+    expect(activeGenerationId(harness.database, artifactId)).toBe(first.generationId)
+    expect(quarantined).toBe(true)
+    expect(visibleText).toBeNull()
+    expect(new ArtifactRepository(harness.database).listWarnings(artifactId)).toContainEqual({
+      code: 'INDEX_REPAIR_PENDING',
+      detail: 'Search index repair is pending.',
+      occurredAt: NOW,
+    })
+    harness.database.close()
+  })
+
+  it('reports an index commit failure at the index stage with matching persisted statuses', async () => {
+    const harness = await makeHarness({
+      indexer: {
+        prepare: async () => ({
+          commit: () => {
+            throw new Error('index commit failed')
+          },
+          rollback: async () => undefined,
+          quarantine: async () => undefined,
+        }),
+      },
+    })
+    await writeFile(harness.sourcePath, '# Index commit failure')
+
+    const failed = await harness.processor.register({ sourcePath: harness.sourcePath })
+
+    expect(failed.outcome).toBe('failed')
+    expect(failed.errors.at(-1)).toMatchObject({ code: 'INDEX_UPDATE_FAILED', stage: 'index' })
+    expect({
+      content_status: failed.contentStatus,
+      render_status: failed.renderStatus,
+      index_status: failed.indexStatus,
+    }).toEqual(
+      harness.database
+        .prepare(
+          `SELECT content_status, render_status, index_status
+           FROM artifact_generation WHERE id = ?`,
+        )
+        .get(failed.generationId),
+    )
+    expect(failed.indexStatus).toBe('failed')
+    expect(new ArtifactRepository(harness.database).listErrors(requireResultNumber(failed.artifactId))).toContainEqual(
+      expect.objectContaining({ code: 'INDEX_UPDATE_FAILED', stage: 'index' }),
+    )
     harness.database.close()
   })
 
@@ -501,6 +592,114 @@ describe('ArtifactProcessor staged pipeline', () => {
     harness.database.close()
   })
 
+  it('does not roll back a completed generation when retirement warning persistence fails', async () => {
+    const harness = await makeHarness()
+    await writeFile(harness.sourcePath, '# Old active thumbnail')
+    const first = await harness.processor.register({ sourcePath: harness.sourcePath })
+    const artifactId = requireResultNumber(first.artifactId)
+    const oldThumbnail = first.thumbnailPath as string
+    harness.database.exec(`
+      CREATE TRIGGER fail_retirement_warning
+      BEFORE INSERT ON artifact_warning
+      WHEN NEW.code = 'THUMBNAIL_RETIRE_PENDING'
+      BEGIN
+        SELECT RAISE(ABORT, 'warning persistence probe failed');
+      END;
+    `)
+    const processor = harness.createProcessor({
+      fileSystem: {
+        ...realFileSystem,
+        remove: async (path) => {
+          if (path === oldThumbnail) throw new Error('old thumbnail unlink failed')
+          return realFileSystem.remove(path)
+        },
+      },
+    })
+    await writeFile(harness.sourcePath, '# New active thumbnail')
+
+    const completed = await processor.refresh({ sourcePath: harness.sourcePath })
+
+    expect(completed.outcome).toBe('completed')
+    expect(activeGenerationId(harness.database, artifactId)).toBe(completed.generationId)
+    expect(existsSync(oldThumbnail)).toBe(true)
+    expect(existsSync(completed.thumbnailPath as string)).toBe(true)
+    expect(harness.operationalErrors).toEqual([
+      {
+        operation: 'thumbnail-retirement-warning',
+        artifactId,
+        generationId: completed.generationId,
+        technicalDetail: 'warning persistence probe failed',
+      },
+    ])
+    expect(
+      harness.database
+        .prepare(
+          `SELECT import_item.status AS item_status, import_run.status AS run_status
+           FROM import_item JOIN import_run ON import_run.id = import_item.run_id
+           ORDER BY import_item.id DESC LIMIT 1`,
+        )
+        .get(),
+    ).toEqual({ item_status: 'completed', run_status: 'completed' })
+    harness.database.close()
+  })
+
+  it('preserves a pending retirement warning until retry removes every inactive thumbnail', async () => {
+    const harness = await makeHarness()
+    await writeFile(harness.sourcePath, '# Generation one')
+    const first = await harness.processor.register({ sourcePath: harness.sourcePath })
+    const artifactId = requireResultNumber(first.artifactId)
+    const firstThumbnail = first.thumbnailPath as string
+    const neverRemoveThumbnail = harness.createProcessor({
+      fileSystem: {
+        ...realFileSystem,
+        remove: async (path) => {
+          if (path.endsWith('.webp')) throw new Error('thumbnail remains in use')
+          return realFileSystem.remove(path)
+        },
+      },
+    })
+    await writeFile(harness.sourcePath, '# Generation two')
+    const second = await neverRemoveThumbnail.refresh({ sourcePath: harness.sourcePath })
+    const secondThumbnail = second.thumbnailPath as string
+    const firstWarning = harness.database
+      .prepare(
+        `SELECT id, generation_id FROM artifact_warning
+         WHERE artifact_id = ? AND code = 'THUMBNAIL_RETIRE_PENDING'`,
+      )
+      .get(artifactId)
+    expect(firstWarning).toBeDefined()
+
+    await writeFile(harness.sourcePath, '# Generation three')
+    await neverRemoveThumbnail.refresh({ sourcePath: harness.sourcePath })
+
+    expect(
+      harness.database
+        .prepare(
+          `SELECT id, generation_id FROM artifact_warning
+           WHERE artifact_id = ? AND code = 'THUMBNAIL_RETIRE_PENDING'`,
+        )
+        .get(artifactId),
+    ).toEqual(firstWarning)
+    expect(existsSync(firstThumbnail)).toBe(true)
+    expect(existsSync(secondThumbnail)).toBe(true)
+
+    await writeFile(harness.sourcePath, '# Generation four')
+    const fourth = await harness.processor.refresh({ sourcePath: harness.sourcePath })
+
+    expect(fourth.outcome).toBe('completed')
+    expect(existsSync(firstThumbnail)).toBe(false)
+    expect(existsSync(secondThumbnail)).toBe(false)
+    expect(
+      harness.database
+        .prepare(
+          `SELECT COUNT(*) AS count FROM artifact_warning
+           WHERE artifact_id = ? AND code = 'THUMBNAIL_RETIRE_PENDING'`,
+        )
+        .get(artifactId),
+    ).toEqual({ count: 0 })
+    harness.database.close()
+  })
+
   it('writes no thumbnail over 500KB and keeps errors until a clean success while persisting clipped warnings', async () => {
     let renderMode: 'clipped' | 'failed' | 'clean' = 'clipped'
     const optimizer: ThumbnailOptimizer = {
@@ -569,6 +768,7 @@ async function makeHarness(options: {
   const database = openDatabase({ filename: join(root, 'gallery.sqlite') })
   const realPolicy = await PathPolicy.create([root])
   const controls: Controls = {}
+  const operationalErrors: ProcessingOperationalError[] = []
   const markdown = new MarkdownRenderer()
   const indexer = options.indexer ?? { prepare: async () => preparedIndex() }
   const render = options.render ?? (async () => rendered(Buffer.from('RIFF-small-preview-WEBP')))
@@ -618,6 +818,9 @@ async function makeHarness(options: {
     thumbnailOptimizer: overrides.optimizer ?? defaultOptimizer,
     fileSystem: overrides.fileSystem ?? realFileSystem,
     now: () => NOW,
+    reportOperationalError: async (error: ProcessingOperationalError) => {
+      operationalErrors.push(error)
+    },
   })
   const processor = new ArtifactProcessor(dependencies())
   return {
@@ -626,6 +829,7 @@ async function makeHarness(options: {
     derivedDirectory,
     database,
     controls,
+    operationalErrors,
     processor,
     createProcessor: (overrides: {
       fileSystem?: ProcessorFileSystem
@@ -688,5 +892,6 @@ function preparedIndex() {
   return {
     commit: () => undefined,
     rollback: async () => undefined,
+    quarantine: async () => undefined,
   }
 }

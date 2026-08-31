@@ -57,6 +57,20 @@ export interface PreparedArtifactIndex {
   commit(): void
   /** Restores the previously visible index after any later transaction or file failure. */
   rollback(): Promise<void>
+  /** Hides the index if the previous visible state cannot be restored. */
+  quarantine(): Promise<void>
+}
+
+export interface ProcessingOperationalError {
+  readonly operation:
+    | 'thumbnail-retirement-cleanup'
+    | 'thumbnail-retirement-warning'
+    | 'index-rollback'
+    | 'index-quarantine'
+    | 'index-repair-warning'
+  readonly artifactId: number
+  readonly generationId: number
+  readonly technicalDetail: string | null
 }
 
 export interface ProcessorFileSystem {
@@ -82,6 +96,9 @@ export interface ArtifactProcessorDependencies {
   readonly thumbnailOptimizer?: ThumbnailOptimizer
   readonly fileSystem?: ProcessorFileSystem
   readonly now?: () => string
+  readonly reportOperationalError?: (
+    error: ProcessingOperationalError,
+  ) => void | Promise<void>
 }
 
 export interface ArtifactProcessRequest {
@@ -125,6 +142,13 @@ class CommitCancellationError extends Error {
   }
 }
 
+class IndexCommitError extends Error {
+  constructor(readonly originalError: unknown) {
+    super('The prepared index could not be committed.', { cause: originalError })
+    this.name = 'IndexCommitError'
+  }
+}
+
 interface MutableAttempt {
   artifactId: number | null
   generationId: number | null
@@ -152,6 +176,7 @@ const noOpIndexer: ArtifactIndexer = {
   prepare: async () => ({
     commit: () => undefined,
     rollback: async () => undefined,
+    quarantine: async () => undefined,
   }),
 }
 
@@ -327,8 +352,7 @@ export class ArtifactProcessor {
           throw new ThumbnailOptimizationError()
         }
         if (this.isCancellationRequested(run.runId)) {
-          await attempt.preparedIndex?.rollback().catch(() => undefined)
-          return this.cancel(run, attempt, 'commit', false)
+          return this.cancel(run, attempt, 'commit')
         }
         await this.fileSystem.mkdir(this.dependencies.thumbnailDirectory, { recursive: true })
         const base = `artifact-${artifactId}-generation-${generation}.webp`
@@ -341,9 +365,8 @@ export class ArtifactProcessor {
       }
 
       if (this.isCancellationRequested(run.runId)) {
-        await attempt.preparedIndex?.rollback().catch(() => undefined)
         await this.cleanupPath(temporaryPath)
-        return this.cancel(run, attempt, 'commit', false)
+        return this.cancel(run, attempt, 'commit')
       }
 
       const cleanSuccess = attempt.errors.length === 0
@@ -374,7 +397,11 @@ export class ArtifactProcessor {
             .prepare('DELETE FROM artifact_error WHERE artifact_id = ?')
             .run(artifactId)
           this.dependencies.database
-            .prepare('DELETE FROM artifact_warning WHERE artifact_id = ?')
+            .prepare(
+              `DELETE FROM artifact_warning
+               WHERE artifact_id = ?
+                 AND code NOT IN ('THUMBNAIL_RETIRE_PENDING', 'INDEX_REPAIR_PENDING')`,
+            )
             .run(artifactId)
         }
         for (const warning of attempt.renderResult?.warnings ?? []) {
@@ -389,7 +416,11 @@ export class ArtifactProcessor {
             occurredAt: completedAt,
           })
         }
-        attempt.preparedIndex?.commit()
+        try {
+          attempt.preparedIndex?.commit()
+        } catch (error) {
+          throw new IndexCommitError(error)
+        }
         if (temporaryPath && finalPath) {
           this.fileSystem.rename(temporaryPath, finalPath)
           renamed = true
@@ -404,33 +435,27 @@ export class ArtifactProcessor {
       })
       transaction()
       attempt.thumbnailPath = thumbnailPath
-
-      if (finalPath && active?.thumbnailPath && active.thumbnailPath !== finalPath) {
-        try {
-          await this.fileSystem.remove(active.thumbnailPath)
-        } catch {
-          this.recordThumbnailRetirementWarning(artifactId, generationId, completedAt)
-        }
-      }
-
-      if (attempt.errors.length > 0) {
-        return this.result(hasReadyDerivative(attempt) ? 'partial' : 'failed', attempt)
-      }
-      return this.result('completed', attempt)
     } catch (error) {
-      await attempt.preparedIndex?.rollback().catch(() => undefined)
+      const indexRecoveryError = await this.recoverPreparedIndex(attempt)
       await this.cleanupPath(temporaryPath)
       if (renamed) await this.cleanupPath(finalPath)
       if (error instanceof CommitCancellationError) {
         this.ensureCancellationRequested(run.runId)
+        if (indexRecoveryError) this.recordError(attempt, indexRecoveryError)
         return this.cancel(run, attempt, 'commit', false)
       }
       const mapped =
-        error instanceof StaleGenerationError
+        indexRecoveryError ??
+        (error instanceof IndexCommitError
+          ? mapProcessingError(error.originalError, 'index', 'INDEX_UPDATE_FAILED')
+          : error instanceof StaleGenerationError
           ? new ArtifactProcessingError('STALE_GENERATION', 'commit', error.message, {
               cause: error,
             })
-          : mapProcessingError(error, 'commit', 'DERIVED_WRITE_FAILED')
+          : mapProcessingError(error, 'commit', 'DERIVED_WRITE_FAILED'))
+      attempt.contentStatus = 'failed'
+      attempt.renderStatus = 'failed'
+      attempt.indexStatus = 'failed'
       this.recordError(attempt, mapped)
       if (attempt.generationId !== null) {
         this.artifacts.setGenerationState(attempt.generationId, {
@@ -443,6 +468,41 @@ export class ArtifactProcessor {
       this.failItemAndRun(run, attempt)
       return this.result(mapped.code === 'STALE_GENERATION' ? 'stale' : 'failed', attempt)
     }
+
+    // The generation, import item, and index are committed at this point. Cleanup failures
+    // must never enter the transaction rollback path or remove the new active thumbnail.
+    try {
+      await this.cleanupInactiveThumbnails(artifactId, generationId, attempt.thumbnailPath)
+    } catch (error) {
+      await this.reportOperationalError({
+        operation: 'thumbnail-retirement-cleanup',
+        artifactId,
+        generationId,
+        technicalDetail: technicalDetail(error),
+      })
+    }
+    if (attempt.indexStatus === 'ready') {
+      try {
+        this.dependencies.database
+          .prepare(
+            `DELETE FROM artifact_warning
+             WHERE artifact_id = ? AND code = 'INDEX_REPAIR_PENDING'`,
+          )
+          .run(artifactId)
+      } catch (error) {
+        await this.reportOperationalError({
+          operation: 'index-repair-warning',
+          artifactId,
+          generationId,
+          technicalDetail: technicalDetail(error),
+        })
+      }
+    }
+
+    if (attempt.errors.length > 0) {
+      return this.result(hasReadyDerivative(attempt) ? 'partial' : 'failed', attempt)
+    }
+    return this.result('completed', attempt)
   }
 
   private prepareRun(request: ArtifactProcessRequest): RunContext {
@@ -474,7 +534,8 @@ export class ArtifactProcessor {
     rollbackPreparedIndex = true,
   ): Promise<ArtifactProcessResult> {
     if (rollbackPreparedIndex) {
-      await attempt.preparedIndex?.rollback().catch(() => undefined)
+      const indexRecoveryError = await this.recoverPreparedIndex(attempt)
+      if (indexRecoveryError) this.recordError(attempt, indexRecoveryError)
     }
     const error = new ArtifactProcessingError('CANCELLED', stage)
     this.recordError(attempt, error)
@@ -591,18 +652,126 @@ export class ArtifactProcessor {
     await this.fileSystem.remove(path).catch(() => undefined)
   }
 
-  private recordThumbnailRetirementWarning(
+  private async cleanupInactiveThumbnails(
     artifactId: number,
     generationId: number,
-    occurredAt: string,
-  ): void {
-    this.artifacts.recordWarning({
-      artifactId,
-      generationId,
-      code: 'THUMBNAIL_RETIRE_PENDING',
-      detail: 'Previous thumbnail cleanup is pending.',
-      occurredAt,
-    })
+    activeThumbnailPath: string | null,
+  ): Promise<void> {
+    const rows = this.dependencies.database
+      .prepare(
+        `SELECT DISTINCT thumbnail_path
+         FROM artifact_generation
+         WHERE artifact_id = ? AND id <> ? AND thumbnail_path IS NOT NULL
+           AND (? IS NULL OR thumbnail_path <> ?)`,
+      )
+      .all(artifactId, generationId, activeThumbnailPath, activeThumbnailPath) as Array<{
+      thumbnail_path: string
+    }>
+    let cleanupFailed = false
+    for (const row of rows) {
+      try {
+        await this.fileSystem.remove(row.thumbnail_path)
+      } catch {
+        cleanupFailed = true
+      }
+    }
+
+    if (!cleanupFailed) {
+      this.dependencies.database
+        .prepare(
+          `DELETE FROM artifact_warning
+           WHERE artifact_id = ? AND code = 'THUMBNAIL_RETIRE_PENDING'`,
+        )
+        .run(artifactId)
+      return
+    }
+
+    const pending = this.dependencies.database
+      .prepare(
+        `SELECT 1 FROM artifact_warning
+         WHERE artifact_id = ? AND code = 'THUMBNAIL_RETIRE_PENDING' LIMIT 1`,
+      )
+      .get(artifactId)
+    if (pending) return
+    try {
+      this.artifacts.recordWarning({
+        artifactId,
+        generationId,
+        code: 'THUMBNAIL_RETIRE_PENDING',
+        detail: 'Previous thumbnail cleanup is pending.',
+        occurredAt: this.now(),
+      })
+    } catch (error) {
+      await this.reportOperationalError({
+        operation: 'thumbnail-retirement-warning',
+        artifactId,
+        generationId,
+        technicalDetail: technicalDetail(error),
+      })
+    }
+  }
+
+  private async recoverPreparedIndex(
+    attempt: MutableAttempt,
+  ): Promise<ArtifactProcessingError | null> {
+    if (!attempt.preparedIndex) return null
+    try {
+      await attempt.preparedIndex.rollback()
+      return null
+    } catch (rollbackError) {
+      attempt.indexStatus = 'failed'
+      const artifactId = requireAttemptNumber(attempt.artifactId, 'artifact id')
+      const generationId = requireAttemptNumber(attempt.generationId, 'generation id')
+      await this.reportOperationalError({
+        operation: 'index-rollback',
+        artifactId,
+        generationId,
+        technicalDetail: technicalDetail(rollbackError),
+      })
+      try {
+        await attempt.preparedIndex.quarantine()
+      } catch (quarantineError) {
+        await this.reportOperationalError({
+          operation: 'index-quarantine',
+          artifactId,
+          generationId,
+          technicalDetail: technicalDetail(quarantineError),
+        })
+      }
+      try {
+        const pending = this.dependencies.database
+          .prepare(
+            `SELECT 1 FROM artifact_warning
+             WHERE artifact_id = ? AND code = 'INDEX_REPAIR_PENDING' LIMIT 1`,
+          )
+          .get(artifactId)
+        if (!pending) {
+          this.artifacts.recordWarning({
+            artifactId,
+            generationId,
+            code: 'INDEX_REPAIR_PENDING',
+            detail: 'Search index repair is pending.',
+            occurredAt: this.now(),
+          })
+        }
+      } catch (warningError) {
+        await this.reportOperationalError({
+          operation: 'index-repair-warning',
+          artifactId,
+          generationId,
+          technicalDetail: technicalDetail(warningError),
+        })
+      }
+      return mapProcessingError(rollbackError, 'index', 'INDEX_UPDATE_FAILED')
+    }
+  }
+
+  private async reportOperationalError(error: ProcessingOperationalError): Promise<void> {
+    try {
+      await this.dependencies.reportOperationalError?.(error)
+    } catch {
+      // Operational reporting cannot change an already committed user-visible result.
+    }
   }
 
   private result(outcome: ProcessingOutcome, attempt: MutableAttempt): ArtifactProcessResult {
@@ -683,4 +852,10 @@ function hasReadyDerivative(attempt: MutableAttempt): boolean {
 function requireAttemptNumber(value: number | null, label: string): number {
   if (value === null) throw new Error(`Processing attempt is missing ${label}.`)
   return value
+}
+
+function technicalDetail(error: unknown): string | null {
+  if (error instanceof Error) return error.message
+  if (typeof error === 'string') return error
+  return null
 }
