@@ -5,6 +5,7 @@ import {
   normalizePathSegments,
   normalizeSearchQuery,
   normalizeSearchText,
+  parseSearchQuery,
   searchableCharacterCount,
 } from './search-query.js'
 
@@ -28,6 +29,14 @@ describe('search query normalization', () => {
     expect(buildFts5Query('"Alpha beta" node.js C++ foo:bar')).toBe(
       '"alpha beta" AND "node.js" AND "c++" AND "foo:bar"',
     )
+  })
+
+  it('preserves whether each normalized query part is an unquoted term or quoted phrase', () => {
+    expect(parseSearchQuery('A "猫 犬" Ｂ')).toEqual([
+      { value: 'a', phrase: false },
+      { value: '猫 犬', phrase: true },
+      { value: 'b', phrase: false },
+    ])
   })
 
   it('counts normalized query content by Unicode code point without quote or whitespace syntax', () => {

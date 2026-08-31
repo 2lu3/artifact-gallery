@@ -18,7 +18,7 @@ export function normalizePathSegments(sourcePath: string): string {
 
 export function searchableCharacterCount(value: string): number {
   return Array.from(
-    parseTerms(value)
+    parseSearchQuery(value)
       .map((term) => term.value)
       .join('')
       .replace(QUERY_WHITESPACE, ''),
@@ -26,22 +26,23 @@ export function searchableCharacterCount(value: string): number {
 }
 
 export function normalizeSearchNeedle(value: string): string {
-  return parseTerms(value).map((term) => term.value).join(' ')
+  return parseSearchQuery(value).map((term) => term.value).join(' ')
 }
 
 export function buildFts5Query(value: string): string | null {
-  const terms = parseTerms(value)
+  const terms = parseSearchQuery(value)
   if (terms.length === 0) return null
   return terms.map(({ value }) => `"${value.replaceAll('"', '""')}"`).join(' AND ')
 }
 
-interface SearchTerm {
+export interface SearchQueryPart {
   readonly value: string
+  readonly phrase: boolean
 }
 
-function parseTerms(value: string): SearchTerm[] {
+export function parseSearchQuery(value: string): SearchQueryPart[] {
   const normalized = normalizeSearchQuery(value)
-  const terms: SearchTerm[] = []
+  const terms: SearchQueryPart[] = []
   let cursor = 0
 
   while (cursor < normalized.length) {
@@ -57,7 +58,7 @@ function parseTerms(value: string): SearchTerm[] {
       }
       if (normalized[cursor] === '"') cursor += 1
       const trimmed = phrase.trim()
-      if (trimmed) terms.push({ value: trimmed })
+      if (trimmed) terms.push({ value: trimmed, phrase: true })
       continue
     }
 
@@ -67,7 +68,7 @@ function parseTerms(value: string): SearchTerm[] {
       cursor += 1
     }
     const trimmed = term.replaceAll('"', '').trim()
-    if (trimmed) terms.push({ value: trimmed })
+    if (trimmed) terms.push({ value: trimmed, phrase: false })
   }
 
   return terms

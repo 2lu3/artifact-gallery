@@ -22,3 +22,17 @@
 
 - 実装上の未解決事項なし。
 - sandbox 内では macOS Mach port 制限により Chromium が起動できない。権限付きの同一 `pnpm test` 実行では HTML isolation 37 件を含む全 147 件が通過した。
+
+## Review fix round 1
+
+- Status: 完了。
+- Commit: `fix: preserve eligible search candidates and short query semantics`（この追記を含む review fix コミット）。
+- P1 visibility starvation: FTS candidate SQL が active generation、`index_status=ready`、visibility `visible` を BM25 ranking と `LIMIT 500` より前に適用するよう修正。最終 `SearchVisibilityRepository.filterVisibleCandidates()` gate は全 return path で維持。
+- P1 short fallback: parser が normalized part ごとの `{ value, phrase }` を公開し、unquoted part はフィールド横断 AND、quoted part のみ contiguous phrase として評価。1–2 Unicode 文字と最大 100 active candidates の境界を維持。
+- RED/GREEN: stale 500 世代が active generation 501 を押し出す実 SQLite 再現、`a middle b`、`"a b"`、`猫 a`、`猫 middle 犬` を追加。
+- `pnpm lint`: PASS。
+- `pnpm typecheck`: PASS。
+- `pnpm build`: PASS。
+- `pnpm test`: PASS（17 files、150 tests。実 Chromium のため sandbox 外で実行）。
+- 固定 corpus: trigram 20/20 top-five、prototype bigram 20/20 top-five。10 回/query の全体 median 0.110 ms、max 5.325 ms。200 ms／400 ms gate を維持。
+- Concerns: 未解決事項なし。

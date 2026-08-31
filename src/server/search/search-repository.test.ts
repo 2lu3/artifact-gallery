@@ -104,6 +104,57 @@ describe('SearchRepository', () => {
     harness.database.close()
   })
 
+  it('applies AND to unquoted short terms while only quoted short text requires adjacency', async () => {
+    const harness = await makeHarness()
+    const separated = await harness.seed({
+      sourcePath: '/short/separated.md',
+      derivedTitle: 'Title',
+      text: 'a middle b',
+      registeredAt: timestamp(1),
+    })
+    const exact = await harness.seed({
+      sourcePath: '/short/exact.md',
+      derivedTitle: 'Title',
+      text: 'a b',
+      registeredAt: timestamp(2),
+    })
+    await harness.seed({
+      sourcePath: '/short/incomplete.md',
+      derivedTitle: 'Title',
+      text: 'a middle',
+      registeredAt: timestamp(3),
+    })
+    const mixed = await harness.seed({
+      sourcePath: '/short/mixed.md',
+      userTitle: '猫',
+      derivedTitle: 'Title',
+      text: 'a marker',
+      registeredAt: timestamp(4),
+    })
+    const japanese = await harness.seed({
+      sourcePath: '/short/japanese.md',
+      derivedTitle: 'Title',
+      text: '猫 middle 犬',
+      registeredAt: timestamp(5),
+    })
+
+    expect(harness.search.search('a b').map(({ artifactId }) => artifactId)).toEqual([
+      exact.artifactId,
+      separated.artifactId,
+    ])
+    expect(harness.search.search('"a b"').map(({ artifactId }) => artifactId)).toEqual([
+      exact.artifactId,
+    ])
+    expect(harness.search.search('猫 a').map(({ artifactId }) => artifactId)).toEqual([
+      mixed.artifactId,
+    ])
+    expect(harness.search.search('猫 犬').map(({ artifactId }) => artifactId)).toEqual([
+      japanese.artifactId,
+    ])
+    expect(harness.search.search('"猫 犬"')).toEqual([])
+    harness.database.close()
+  })
+
   it('returns visible indexed artifacts newest registered first for an empty query', async () => {
     const harness = await makeHarness()
     const oldest = await harness.seed({
@@ -182,6 +233,36 @@ describe('SearchRepository', () => {
     expect(harness.search.search('').map(({ artifactId }) => artifactId)).not.toContain(
       failed.artifactId,
     )
+    harness.database.close()
+  })
+
+  it('ranks and limits only eligible active rows when 500 stale generations score higher', async () => {
+    const harness = await makeHarness()
+    const artifact = await harness.seed({
+      sourcePath: '/visibility/overflow.md',
+      derivedTitle: 'overflowtoken',
+      text: 'old body',
+    })
+    for (let generation = 2; generation <= 500; generation += 1) {
+      await harness.addGeneration(
+        artifact.artifactId,
+        '/visibility/overflow.md',
+        `old body ${generation}`,
+      )
+    }
+    harness.database
+      .prepare('UPDATE artifact SET derived_title = ? WHERE id = ?')
+      .run('active title', artifact.artifactId)
+    const active = await harness.addGeneration(
+      artifact.artifactId,
+      '/visibility/overflow.md',
+      'active body contains overflowtoken',
+    )
+
+    expect(active.generation).toBe(501)
+    expect(harness.search.search('overflowtoken').map(({ artifactId }) => artifactId)).toEqual([
+      artifact.artifactId,
+    ])
     harness.database.close()
   })
 })

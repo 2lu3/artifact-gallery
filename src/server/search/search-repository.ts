@@ -8,8 +8,9 @@ import {
 } from '../repositories/search-visibility-repository.js'
 import {
   buildFts5Query,
-  normalizeSearchNeedle,
+  parseSearchQuery,
   searchableCharacterCount,
+  type SearchQueryPart,
 } from './search-query.js'
 
 const DEFAULT_LIMIT = 5
@@ -42,6 +43,13 @@ interface SearchCandidateRow {
   source_path: string
 }
 
+interface ShortCandidateRow extends SearchCandidateRow {
+  user_title_normalized: string
+  derived_title_normalized: string
+  body_normalized: string
+  registered_at: string
+}
+
 export class SearchRepository {
   private readonly visibility: SearchVisibilityRepository
 
@@ -57,7 +65,7 @@ export class SearchRepository {
     if (characterCount === 0) {
       candidates = this.readNewestCandidates()
     } else if (characterCount <= 2) {
-      candidates = this.readShortQueryCandidates(normalizeSearchNeedle(query))
+      candidates = this.readShortQueryCandidates(parseSearchQuery(query))
     } else {
       candidates = this.readFtsCandidates(buildFts5Query(query) as string)
     }
@@ -87,6 +95,15 @@ export class SearchRepository {
          FROM artifact_search_fts
          JOIN artifact
            ON artifact.id = CAST(artifact_search_fts.artifact_id AS INTEGER)
+         JOIN artifact_generation
+           ON artifact_generation.id = artifact.active_generation_id
+          AND artifact_generation.artifact_id = artifact.id
+          AND artifact_generation.generation = CAST(artifact_search_fts.generation AS INTEGER)
+          AND artifact_generation.index_status = 'ready'
+         JOIN artifact_search_visibility
+           ON artifact_search_visibility.artifact_id = artifact.id
+          AND artifact_search_visibility.generation_id = artifact_generation.id
+          AND artifact_search_visibility.state = 'visible'
          WHERE artifact_search_fts MATCH ?
          ORDER BY bm25(artifact_search_fts, 0.0, 0.0, 16.0, 8.0, 2.0, 1.0),
                   artifact.registered_at DESC,
@@ -97,7 +114,7 @@ export class SearchRepository {
     return rows.map(toCandidate)
   }
 
-  private readShortQueryCandidates(needle: string): SearchCandidate[] {
+  private readShortQueryCandidates(parts: readonly SearchQueryPart[]): SearchCandidate[] {
     const rows = this.database
       .prepare(
         `WITH recent AS (
@@ -117,21 +134,27 @@ export class SearchRepository {
            ORDER BY artifact.registered_at DESC, artifact.id DESC
            LIMIT ${SHORT_SCAN_LIMIT}
          )
-         SELECT artifact_id, generation, user_title, derived_title, source_path
+         SELECT artifact_id,
+                generation,
+                user_title,
+                derived_title,
+                source_path,
+                user_title_normalized,
+                derived_title_normalized,
+                body_normalized,
+                registered_at
          FROM recent
-         WHERE instr(user_title_normalized, ?) > 0
-            OR instr(derived_title_normalized, ?) > 0
-            OR instr(body_normalized, ?) > 0
-         ORDER BY CASE
-                    WHEN instr(user_title_normalized, ?) > 0 THEN 0
-                    WHEN instr(derived_title_normalized, ?) > 0 THEN 1
-                    ELSE 2
-                  END,
-                  registered_at DESC,
-                  artifact_id DESC`,
+         ORDER BY registered_at DESC, artifact_id DESC`,
       )
-      .all(needle, needle, needle, needle, needle) as SearchCandidateRow[]
-    return rows.map(toCandidate)
+      .all() as ShortCandidateRow[]
+    return rows
+      .map((row) => ({ row, rank: shortCandidateRank(row, parts) }))
+      .filter(
+        (candidate): candidate is { row: ShortCandidateRow; rank: ShortCandidateRank } =>
+          candidate.rank !== null,
+      )
+      .toSorted(compareShortCandidates)
+      .map(({ row }) => toCandidate(row))
   }
 
   private readNewestCandidates(): SearchCandidate[] {
@@ -152,6 +175,40 @@ export class SearchRepository {
       .all(EXTERNAL_CANDIDATE_LIMIT) as SearchCandidateRow[]
     return rows.map(toCandidate)
   }
+}
+
+type ShortCandidateRank = readonly [userTitle: number, derivedTitle: number, body: number]
+
+function shortCandidateRank(
+  row: ShortCandidateRow,
+  parts: readonly SearchQueryPart[],
+): ShortCandidateRank | null {
+  const counts = [0, 0, 0] as [number, number, number]
+  const fields = [
+    row.user_title_normalized,
+    row.derived_title_normalized,
+    row.body_normalized,
+  ]
+  for (const part of parts) {
+    const fieldIndex = fields.findIndex((field) => field.includes(part.value))
+    if (fieldIndex === -1) return null
+    counts[fieldIndex] += 1
+  }
+  return counts
+}
+
+function compareShortCandidates(
+  left: { row: ShortCandidateRow; rank: ShortCandidateRank },
+  right: { row: ShortCandidateRow; rank: ShortCandidateRank },
+): number {
+  for (let field = 0; field < left.rank.length; field += 1) {
+    const difference = (right.rank[field] as number) - (left.rank[field] as number)
+    if (difference !== 0) return difference
+  }
+  return (
+    right.row.registered_at.localeCompare(left.row.registered_at) ||
+    right.row.artifact_id - left.row.artifact_id
+  )
 }
 
 function toCandidate(row: SearchCandidateRow): SearchCandidate {
