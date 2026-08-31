@@ -34,6 +34,7 @@ export interface ArtifactCard {
   readonly title: string
   readonly sourcePath: string
   readonly format: ArtifactFormat
+  readonly registeredAt: string
   readonly status: CardPresentation
   readonly thumbnailUrl: string | null
   readonly diagram: string

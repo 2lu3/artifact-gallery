@@ -20,7 +20,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "pnpm build:client && playwright test"
   },
   "dependencies": {
     "better-sqlite3": "12.8.0",

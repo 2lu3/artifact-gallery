@@ -861,6 +861,7 @@ function toArtifactCard(row: ArtifactRow, thumbnailCodec: ThumbnailResourceCodec
     title: row.user_title ?? row.derived_title ?? basename(row.source_path),
     sourcePath: row.source_path,
     format: row.format,
+    registeredAt: row.registered_at,
     status,
     thumbnailUrl:
       row.thumbnail_path && row.thumbnail_generation_id
