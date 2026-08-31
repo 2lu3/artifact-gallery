@@ -43,12 +43,20 @@ type ActiveGeneration = {
 }
 
 export interface ArtifactIndexer {
-  update(request: {
+  /** Prepares generation-keyed index data without changing the currently visible result. */
+  prepare(request: {
     readonly artifactId: number
     readonly generation: number
     readonly sourcePath: string
     readonly text: string
-  }): Promise<void>
+  }): Promise<PreparedArtifactIndex>
+}
+
+export interface PreparedArtifactIndex {
+  /** Runs synchronously while the active-generation SQLite transaction is still open. */
+  commit(): void
+  /** Restores the previously visible index after any later transaction or file failure. */
+  rollback(): Promise<void>
 }
 
 export interface ProcessorFileSystem {
@@ -95,8 +103,7 @@ export interface ArtifactProcessResult {
   readonly indexStatus: DerivedStatus
   readonly title: string | null
   readonly thumbnailPath: string | null
-  readonly errors: readonly ArtifactProcessingError[]
-  readonly publicErrors: readonly PublicProcessingError[]
+  readonly errors: readonly PublicProcessingError[]
 }
 
 interface RunContext {
@@ -111,6 +118,13 @@ interface Extraction {
   readonly extractorVersion: string
 }
 
+class CommitCancellationError extends Error {
+  constructor() {
+    super('Cancellation was requested during commit work.')
+    this.name = 'CommitCancellationError'
+  }
+}
+
 interface MutableAttempt {
   artifactId: number | null
   generationId: number | null
@@ -122,6 +136,7 @@ interface MutableAttempt {
   thumbnailPath: string | null
   extraction: Extraction | null
   renderResult: HtmlRenderResult | null
+  preparedIndex: PreparedArtifactIndex | null
   errors: ArtifactProcessingError[]
   errorIds: number[]
 }
@@ -134,7 +149,10 @@ const nodeFileSystem: ProcessorFileSystem = {
 }
 
 const noOpIndexer: ArtifactIndexer = {
-  update: async () => undefined,
+  prepare: async () => ({
+    commit: () => undefined,
+    rollback: async () => undefined,
+  }),
 }
 
 export class ArtifactProcessor {
@@ -186,6 +204,7 @@ export class ArtifactProcessor {
       thumbnailPath: null,
       extraction: null,
       renderResult: null,
+      preparedIndex: null,
       errors: [],
       errorIds: [],
     }
@@ -268,7 +287,7 @@ export class ArtifactProcessor {
     if (!this.startStage(run, 'index')) return this.cancel(run, attempt, 'index')
     if (attempt.extraction) {
       try {
-        await this.indexer.update({
+        attempt.preparedIndex = await this.indexer.prepare({
           artifactId: attempt.artifactId,
           generation: attempt.generation,
           sourcePath: authorizedFile.canonicalPath,
@@ -307,6 +326,10 @@ export class ArtifactProcessor {
         if (optimized.bytes.byteLength > MAX_THUMBNAIL_BYTES) {
           throw new ThumbnailOptimizationError()
         }
+        if (this.isCancellationRequested(run.runId)) {
+          await attempt.preparedIndex?.rollback().catch(() => undefined)
+          return this.cancel(run, attempt, 'commit', false)
+        }
         await this.fileSystem.mkdir(this.dependencies.thumbnailDirectory, { recursive: true })
         const base = `artifact-${artifactId}-generation-${generation}.webp`
         finalPath = join(this.dependencies.thumbnailDirectory, base)
@@ -315,6 +338,12 @@ export class ArtifactProcessor {
           `.${base}.${randomUUID()}.tmp`,
         )
         await this.fileSystem.writeFile(temporaryPath, optimized.bytes)
+      }
+
+      if (this.isCancellationRequested(run.runId)) {
+        await attempt.preparedIndex?.rollback().catch(() => undefined)
+        await this.cleanupPath(temporaryPath)
+        return this.cancel(run, attempt, 'commit', false)
       }
 
       const cleanSuccess = attempt.errors.length === 0
@@ -360,28 +389,42 @@ export class ArtifactProcessor {
             occurredAt: completedAt,
           })
         }
+        attempt.preparedIndex?.commit()
         if (temporaryPath && finalPath) {
           this.fileSystem.rename(temporaryPath, finalPath)
           renamed = true
+        }
+        if (this.isCancellationRequested(run.runId)) throw new CommitCancellationError()
+        if (attempt.errors.length > 0) {
+          this.failItemAndRun(run, attempt)
+        } else {
+          this.imports.completeItem(run.itemId, completedAt)
+          this.finishRunIfTerminal(run.runId, completedAt)
         }
       })
       transaction()
       attempt.thumbnailPath = thumbnailPath
 
       if (finalPath && active?.thumbnailPath && active.thumbnailPath !== finalPath) {
-        await this.fileSystem.remove(active.thumbnailPath).catch(() => undefined)
+        try {
+          await this.fileSystem.remove(active.thumbnailPath)
+        } catch {
+          this.recordThumbnailRetirementWarning(artifactId, generationId, completedAt)
+        }
       }
 
       if (attempt.errors.length > 0) {
-        this.failItemAndRun(run, attempt)
         return this.result(hasReadyDerivative(attempt) ? 'partial' : 'failed', attempt)
       }
-      this.imports.completeItem(run.itemId, completedAt)
-      this.finishRunIfTerminal(run.runId, completedAt)
       return this.result('completed', attempt)
     } catch (error) {
+      await attempt.preparedIndex?.rollback().catch(() => undefined)
       await this.cleanupPath(temporaryPath)
       if (renamed) await this.cleanupPath(finalPath)
+      if (error instanceof CommitCancellationError) {
+        this.ensureCancellationRequested(run.runId)
+        return this.cancel(run, attempt, 'commit', false)
+      }
       const mapped =
         error instanceof StaleGenerationError
           ? new ArtifactProcessingError('STALE_GENERATION', 'commit', error.message, {
@@ -424,11 +467,15 @@ export class ArtifactProcessor {
     return this.imports.startStage(run.itemId, stage, this.now())
   }
 
-  private cancel(
+  private async cancel(
     run: RunContext,
     attempt: MutableAttempt,
     stage: ProcessingStage,
-  ): ArtifactProcessResult {
+    rollbackPreparedIndex = true,
+  ): Promise<ArtifactProcessResult> {
+    if (rollbackPreparedIndex) {
+      await attempt.preparedIndex?.rollback().catch(() => undefined)
+    }
     const error = new ArtifactProcessingError('CANCELLED', stage)
     this.recordError(attempt, error)
     if (attempt.generationId !== null) {
@@ -442,6 +489,16 @@ export class ArtifactProcessor {
     this.imports.cancelItem(run.itemId, this.now())
     this.finishRunIfTerminal(run.runId, this.now())
     return this.result('cancelled', attempt)
+  }
+
+  private isCancellationRequested(runId: number): boolean {
+    return this.imports.getRun(runId).cancelRequestedAt !== null
+  }
+
+  private ensureCancellationRequested(runId: number): void {
+    if (!this.isCancellationRequested(runId)) {
+      this.imports.requestCancellation(runId, this.now())
+    }
   }
 
   private recordError(attempt: MutableAttempt, error: ArtifactProcessingError): void {
@@ -534,6 +591,20 @@ export class ArtifactProcessor {
     await this.fileSystem.remove(path).catch(() => undefined)
   }
 
+  private recordThumbnailRetirementWarning(
+    artifactId: number,
+    generationId: number,
+    occurredAt: string,
+  ): void {
+    this.artifacts.recordWarning({
+      artifactId,
+      generationId,
+      code: 'THUMBNAIL_RETIRE_PENDING',
+      detail: 'Previous thumbnail cleanup is pending.',
+      occurredAt,
+    })
+  }
+
   private result(outcome: ProcessingOutcome, attempt: MutableAttempt): ArtifactProcessResult {
     return {
       outcome,
@@ -545,8 +616,7 @@ export class ArtifactProcessor {
       indexStatus: attempt.indexStatus,
       title: attempt.title,
       thumbnailPath: attempt.thumbnailPath,
-      errors: attempt.errors,
-      publicErrors: attempt.errors.map(toPublicProcessingError),
+      errors: attempt.errors.map(toPublicProcessingError),
     }
   }
 }

@@ -124,3 +124,113 @@ Implementation: `1f168ff` (`feat: add staged artifact processor`)
 - Real Chromium tests and the default oversized-WebP encoder require execution outside the
   managed macOS process sandbox. This is an environment permission restriction, not a product
   test failure; the full suite passed in the permitted execution context.
+
+---
+
+## Fix round 1/5
+
+### Findings addressed
+
+1. **Generation, file, and import terminal atomicity**
+   - Moved successful and partial `import_item` / `import_run` terminal transitions into the
+     same outer SQLite transaction as generation activation, title/issues, staged-index commit,
+     and atomic thumbnail rename.
+   - The old thumbnail is now retired only after that complete transaction succeeds.
+   - A real SQLite trigger that rejects `completeItem` proves the active pointer rolls back, the
+     renamed new file is removed, and the prior active generation and file remain intact.
+2. **Prepared search index contract**
+   - Replaced eager `ArtifactIndexer.update()` with `prepare()` returning explicit synchronous
+     `commit()` and asynchronous `rollback()` operations.
+   - `commit()` runs inside the active-generation transaction. Any stale, rename, terminal, or
+     database failure invokes `rollback()`, so the prior visible search result remains visible.
+3. **Cancellation after non-interruptible work**
+   - Rechecks durable cancellation after optimizer completion, after temp-file write, and after
+     atomic rename while the database transaction can still roll back.
+   - Cancellation observed inside a transaction is re-persisted after rollback before the item
+     and run are terminally cancelled.
+4. **CommonMark-compatible Markdown**
+   - Replaced the handwritten regex parser with pinned `markdown-it` 14.1.0.
+   - Kept raw HTML disabled in the parser and added a separate parse5 DOM allowlist sanitizer
+     for elements, attributes, code-language classes, ordered-list starts, and local-only links.
+   - Text/title extraction now consumes the sanitized DOM.
+5. **Public/internal error separation**
+   - `ArtifactProcessResult.errors` now contains only `PublicProcessingError` projections.
+   - Raw `ArtifactProcessingError` values, causes, and `technicalDetail` remain internal and in
+     persistence only; serializing the complete result cannot expose them.
+6. **Old-thumbnail cleanup retry record**
+   - An unlink failure leaves both the active new thumbnail and old cleanup target intact and
+     records `THUMBNAIL_RETIRE_PENDING` durably against the new generation.
+   - The warning detail is fixed, path-free user text; the old path is discoverable only from
+     internal inactive-generation persistence for a future cleanup retry.
+
+### Focused RED / GREEN evidence
+
+| Regression | Observed RED | GREEN evidence |
+| --- | --- | --- |
+| Completion transition fails after generation commit | Expected old active generation `1`, received new generation `2` | Completion trigger failure rolls back DB activation and rename; old file is the only `.webp` |
+| Search update survives failed generation | Expected `First searchable text`, received `Uncommitted searchable text` | Prepared index rollback restores prior visible result after rename failure |
+| Cancellation during optimization | Expected `cancelled`, received `completed` | Optimizer finishes, durable cancel is rechecked, no new file/generation is activated |
+| Cancellation during rename | Expected `cancelled`, received `completed` | Rename completes, transaction detects cancel and rolls back; cancel is re-persisted |
+| CommonMark continuation/fences | Continuation became a separate paragraph; `~~~` and indented code became paragraphs | Continuation stays in its `<li>`; both code forms emit allowlisted `<pre><code>` |
+| Raw error serialization | Result contained `ArtifactProcessingError.technicalDetail` with `/private/path` | Complete result JSON contains only code/stage/retryability/safe message |
+| Old-thumbnail unlink failure | No warning was persisted | Durable path-free `THUMBNAIL_RETIRE_PENDING` warning is stored |
+
+Focused command:
+
+```text
+pnpm test src/server/processing/artifact-processor.test.ts \
+  src/server/processing/thumbnail-optimizer.test.ts \
+  src/server/rendering/markdown-renderer.test.ts \
+  src/shared/errors.test.ts
+
+Test Files  4 passed (4)
+Tests       30 passed (30)
+```
+
+### Verification
+
+Fresh verification after the final fix and self-review:
+
+```text
+pnpm lint
+eslint .                                      exit 0
+
+pnpm typecheck
+tsc --noEmit                                  exit 0
+
+pnpm test
+Test Files  12 passed (12)
+Tests       124 passed (124)
+
+pnpm build
+vite build                                   exit 0
+tsc --project tsconfig.server.json            exit 0
+```
+
+The full suite again ran outside the managed macOS process sandbox solely because Chromium Mach
+rendezvous registration is denied inside it.
+
+### Self-review
+
+- Mutation: moving item completion outside the transaction fails the completion-trigger test.
+- Mutation: publishing index state from `prepare()` or omitting rollback fails the retained-search
+  result test.
+- Mutation: removing either post-optimizer or post-rename cancellation probe fails its dedicated
+  non-activation test.
+- Mutation: returning internal errors restores the technical-path JSON leak.
+- Mutation: replacing markdown-it with the former parser fails list continuation, tilde fence,
+  and indented-code coverage.
+- Mutation: skipping the DOM sanitizer restores unsafe/external link attributes and non-allowlist
+  elements.
+- Mutation: swallowing old-thumbnail unlink failure loses the durable cleanup-pending warning.
+- Existing persistence, PathPolicy, and isolated HTML renderer APIs remain unchanged; the indexer
+  interface intentionally changed to the review-required prepare/commit/rollback contract.
+
+### Commit
+
+Fix round and report: this commit.
+
+### Concerns
+
+- Real Chromium verification retains the same macOS managed-sandbox limitation documented above;
+  all 124 tests pass in the permitted execution context.
