@@ -17,6 +17,31 @@ afterEach(async () => {
 })
 
 describe('ImportRepository', () => {
+  it('adds enumerated items to an existing queued or running run', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-import-'))
+    temporaryDirectories.push(directory)
+    const database = openDatabase({ filename: join(directory, 'gallery.sqlite') })
+    const repository = new ImportRepository(database)
+    const now = '2026-08-31T00:00:00.000Z'
+    const run = repository.createRun([])
+
+    repository.startRun(run.id, now)
+    const itemIds = repository.addItems(run.id, ['/canonical/a.md', '/canonical/b.html'])
+
+    expect(itemIds).toHaveLength(2)
+    expect(repository.getItem(itemIds[0] as number)).toMatchObject({
+      runId: run.id,
+      canonicalPath: '/canonical/a.md',
+      stage: 'queued',
+      status: 'queued',
+    })
+    expect(repository.getItem(itemIds[1] as number)).toMatchObject({
+      runId: run.id,
+      canonicalPath: '/canonical/b.html',
+    })
+    database.close()
+  })
+
   it('persists run and item transitions before stage work can start', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-import-'))
     temporaryDirectories.push(directory)

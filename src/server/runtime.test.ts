@@ -1,6 +1,6 @@
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -56,6 +56,7 @@ describe('server composition root', () => {
       databaseFilename: '/tmp/artifact-gallery-state/catalog.sqlite',
       thumbnailDirectory: '/tmp/artifact-gallery-state/thumbnails',
       allowedRoots: ['/tmp/one', '/tmp/two'],
+      clientDirectory: resolve('dist'),
     })
     expect(options).not.toHaveProperty('host')
   })

@@ -82,6 +82,25 @@ export class ImportRepository {
     })()
   }
 
+  addItems(runId: number, canonicalPaths: readonly string[]): number[] {
+    return this.database.transaction(() => {
+      const active = this.database
+        .prepare(
+          `SELECT 1 FROM import_run
+           WHERE id = ? AND status IN ('queued', 'running') AND cancel_requested_at IS NULL`,
+        )
+        .get(runId)
+      if (!active) throw new InvalidImportTransitionError('run', runId, 'add items')
+      const insertItem = this.database.prepare(
+        `INSERT INTO import_item (run_id, canonical_path, stage, status)
+         VALUES (?, ?, 'queued', 'queued')`,
+      )
+      return canonicalPaths.map((canonicalPath) =>
+        Number(insertItem.run(runId, canonicalPath).lastInsertRowid),
+      )
+    })()
+  }
+
   startRun(runId: number, startedAt: string): void {
     const result = this.database
       .prepare(

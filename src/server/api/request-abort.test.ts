@@ -6,6 +6,19 @@ import { describe, expect, it } from 'vitest'
 import { observeRequestAbort } from './routes.js'
 
 describe('observeRequestAbort', () => {
+  it('cancels an already-aborted request immediately', () => {
+    const source = abortSource()
+    Object.assign(source.request, { aborted: true })
+    let cancellations = 0
+
+    const cleanup = observeRequestAbort(source, () => {
+      cancellations += 1
+    })
+
+    expect(cancellations).toBe(1)
+    cleanup()
+  })
+
   it('cancels on request abort and removes every listener after cleanup', () => {
     const source = abortSource()
     let cancellations = 0

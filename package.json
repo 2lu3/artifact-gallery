@@ -10,7 +10,7 @@
   "packageManager": "pnpm@11.21.0",
   "scripts": {
     "dev": "concurrently -k \"pnpm dev:api\" \"pnpm dev:worker\" \"pnpm dev:web\"",
-    "dev:api": "tsx watch src/server/index.ts",
+    "dev:api": "ARTIFACT_GALLERY_DEVELOPMENT=1 tsx watch src/server/index.ts",
     "dev:worker": "tsx watch src/worker/index.ts",
     "dev:web": "vite",
     "build": "pnpm build:client && pnpm build:server",

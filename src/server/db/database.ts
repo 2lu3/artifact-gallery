@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { basename, resolve } from 'node:path'
 import Database from 'better-sqlite3'
 
 import { normalizePathSegments, normalizeSearchText } from '../search/search-query.js'
@@ -26,6 +26,7 @@ export function openDatabase({
       { deterministic: true },
       (value: string) => normalizePathSegments(value),
     )
+    database.function('path_basename', { deterministic: true }, (value: string) => basename(value))
     database.pragma('journal_mode = WAL')
     database.pragma('foreign_keys = ON')
     database.pragma('busy_timeout = 5000')

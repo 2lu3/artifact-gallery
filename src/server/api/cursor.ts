@@ -1,10 +1,15 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 
-import type { GalleryFilter, GallerySortMode } from '../../shared/contracts.js'
+import type {
+  GalleryFilter,
+  GallerySortMode,
+  GalleryStatusFilter,
+} from '../../shared/contracts.js'
 
 export interface CursorContext {
   readonly sort: GallerySortMode
   readonly filter: GalleryFilter
+  readonly status: GalleryStatusFilter
   readonly queryFingerprint: string
   readonly catalogRevision: string
   readonly searchRevision: string
@@ -68,7 +73,13 @@ function isCursorPayload(value: unknown): value is CursorPayload {
     typeof candidate.lastId === 'number' &&
     Number.isSafeInteger(candidate.lastId) &&
     (candidate.sort === 'newest' || candidate.sort === 'title') &&
-    typeof candidate.filter === 'string' &&
+    (candidate.filter === 'all' || candidate.filter === 'html' || candidate.filter === 'markdown') &&
+    (candidate.status === 'all' ||
+      candidate.status === 'missing' ||
+      candidate.status === 'processing' ||
+      candidate.status === 'ready' ||
+      candidate.status === 'partial' ||
+      candidate.status === 'failed') &&
     typeof candidate.queryFingerprint === 'string' &&
     typeof candidate.catalogRevision === 'string' &&
     typeof candidate.searchRevision === 'string'
@@ -79,6 +90,7 @@ function sameContext(payload: CursorPayload, expected: CursorContext): boolean {
   return (
     payload.sort === expected.sort &&
     payload.filter === expected.filter &&
+    payload.status === expected.status &&
     payload.queryFingerprint === expected.queryFingerprint &&
     payload.catalogRevision === expected.catalogRevision &&
     payload.searchRevision === expected.searchRevision

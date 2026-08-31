@@ -6,7 +6,8 @@ export const SESSION_TOKEN_HEADER = 'x-artifact-gallery-token'
 export const GALLERY_PAGE_SIZE = 30
 
 export type GallerySortMode = 'newest' | 'title'
-export type GalleryFilter = 'all' | CardPresentation
+export type GalleryFilter = 'all' | ArtifactFormat
+export type GalleryStatusFilter = 'all' | CardPresentation
 
 export type ApiErrorCode =
   | 'UNAUTHORIZED'
@@ -33,7 +34,7 @@ export interface ArtifactCard {
   readonly sourcePath: string
   readonly format: ArtifactFormat
   readonly status: CardPresentation
-  readonly thumbnailPath: string | null
+  readonly thumbnailUrl: string | null
   readonly diagram: string
 }
 
@@ -48,13 +49,7 @@ export interface ArtifactDetail extends ArtifactCard {
 }
 
 export interface RegistrationResponse {
-  readonly runIds: readonly number[]
-  readonly results: readonly {
-    readonly runId: number
-    readonly artifactId: number | null
-    readonly outcome: 'completed' | 'partial' | 'failed' | 'cancelled' | 'stale'
-    readonly errors: readonly PublicProcessingError[]
-  }[]
+  readonly runId: number
 }
 
 export interface PlatformActionResult {

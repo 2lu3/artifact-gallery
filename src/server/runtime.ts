@@ -2,6 +2,7 @@ import { mkdir } from 'node:fs/promises'
 import { delimiter, dirname, resolve } from 'node:path'
 
 import { buildApp, type LocalApiApp } from './app.js'
+import { BackgroundQueue } from './api/background-queue.js'
 import { openDatabase } from './db/database.js'
 import { ArtifactProcessor } from './processing/artifact-processor.js'
 import { HtmlRenderer } from './rendering/html-renderer.js'
@@ -11,6 +12,7 @@ export interface ServerRuntimeOptions {
   readonly databaseFilename: string
   readonly thumbnailDirectory: string
   readonly allowedRoots: readonly string[]
+  readonly clientDirectory?: string
 }
 
 export async function createServerRuntime(options: ServerRuntimeOptions): Promise<LocalApiApp> {
@@ -19,6 +21,8 @@ export async function createServerRuntime(options: ServerRuntimeOptions): Promis
   const database = openDatabase({ filename: options.databaseFilename })
   try {
     const pathPolicy = await PathPolicy.create(options.allowedRoots)
+    const derivativePathPolicy = await PathPolicy.create([options.thumbnailDirectory])
+    const backgroundQueue = new BackgroundQueue({ concurrency: 2, capacity: 64 })
     const htmlRenderer = new HtmlRenderer(pathPolicy)
     const processor = new ArtifactProcessor({
       database,
@@ -29,10 +33,14 @@ export async function createServerRuntime(options: ServerRuntimeOptions): Promis
     const app = buildApp({
       database,
       pathPolicy,
+      derivativePathPolicy,
       processor,
       thumbnailDirectory: options.thumbnailDirectory,
+      clientDirectory: options.clientDirectory,
+      backgroundQueue,
     })
     app.addHook('onClose', async () => {
+      await backgroundQueue.onIdle()
       await htmlRenderer.close()
       database.close()
     })
@@ -62,5 +70,9 @@ export function runtimeOptionsFromEnvironment(
             .split(delimiter)
             .map((root) => root.trim())
             .filter(Boolean),
+    clientDirectory:
+      environment.ARTIFACT_GALLERY_DEVELOPMENT === '1'
+        ? undefined
+        : resolve(environment.ARTIFACT_GALLERY_CLIENT_DIRECTORY ?? 'dist'),
   }
 }

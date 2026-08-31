@@ -14,6 +14,7 @@ import {
   type GalleryFilter,
   type GalleryPage,
   type GallerySortMode,
+  type GalleryStatusFilter,
   type PlatformActionResult,
   type RegistrationResponse,
 } from '../../shared/contracts.js'
@@ -23,7 +24,8 @@ import {
   toPublicProcessingError,
   type PublicProcessingError,
 } from '../../shared/errors.js'
-import type { ArtifactProcessor, ArtifactProcessResult } from '../processing/artifact-processor.js'
+import type { ArtifactProcessor } from '../processing/artifact-processor.js'
+import { MAX_THUMBNAIL_BYTES } from '../processing/thumbnail-optimizer.js'
 import {
   ArtifactRepository,
   deriveCardPresentation,
@@ -34,10 +36,13 @@ import {
   type SourceStatus,
 } from '../repositories/artifact-repository.js'
 import { ImportRepository, type ImportRunStatus } from '../repositories/import-repository.js'
-import type { AuthorizedFile, PathPolicy } from '../security/path-policy.js'
+import { GalleryRepository } from '../repositories/gallery-repository.js'
+import type { PathPolicy, PathPolicyItemError } from '../security/path-policy.js'
 import { normalizeSearchText } from '../search/search-query.js'
 import { SearchRepository } from '../search/search-repository.js'
 import { CursorCodec, StaleCursorError, type CursorContext } from './cursor.js'
+import { BackgroundQueue } from './background-queue.js'
+import { InvalidResourceTokenError, ThumbnailResourceCodec } from './resource-token.js'
 
 const MAX_PATH_LENGTH = 4096
 const MAX_QUERY_LENGTH = 512
@@ -60,9 +65,11 @@ export interface PlatformAdapter {
 
 export interface ApiRouteDependencies {
   readonly database: Database.Database
-  readonly pathPolicy: PathPolicy
+  readonly pathPolicy: Pick<PathPolicy, 'authorizeFile' | 'enumerateFolder'>
+  readonly derivativePathPolicy: Pick<PathPolicy, 'authorizeAsset'>
   readonly processor: ArtifactProcessor
   readonly thumbnailDirectory: string
+  readonly backgroundQueue?: BackgroundQueue
   readonly cursorSecret?: Buffer
   readonly platformAdapter?: PlatformAdapter
   readonly now?: () => string
@@ -82,11 +89,7 @@ interface ArtifactRow {
   render_status: DerivedStatus | null
   index_status: DerivedStatus | null
   thumbnail_path: string | null
-}
-
-interface RegistrationEnvelope {
-  readonly runId: number
-  readonly result: ArtifactProcessResult
+  thumbnail_generation_id: number | null
 }
 
 export interface AbortSource {
@@ -96,31 +99,49 @@ export interface AbortSource {
 
 export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDependencies): void {
   const cursorCodec = new CursorCodec(dependencies.cursorSecret ?? randomBytes(32))
+  const thumbnailCodec = new ThumbnailResourceCodec(randomBytes(32))
   const search = new SearchRepository(dependencies.database)
+  const gallery = new GalleryRepository(dependencies.database)
   const imports = new ImportRepository(dependencies.database)
+  const artifacts = new ArtifactRepository(dependencies.database)
   const now = dependencies.now ?? (() => new Date().toISOString())
-  const inflightRegistrations = new Map<string, Promise<RegistrationEnvelope>>()
+  const queue =
+    dependencies.backgroundQueue ??
+    new BackgroundQueue({ concurrency: 2, capacity: 64 })
+  const sourceLocks = new Map<string, Promise<void>>()
+  app.addHook('onClose', () => queue.onIdle())
 
-  const registerAuthorized = (
-    file: AuthorizedFile,
-    abortSource?: AbortSource,
-  ): Promise<RegistrationEnvelope> => {
-    const existing = inflightRegistrations.get(file.canonicalPath)
-    if (existing) return existing
-    const processing = dependencies.processor.register({ sourcePath: file.canonicalPath })
-    const runId = readResultRunId(dependencies.database, file.canonicalPath)
-    const cancelOnAbort = () => requestCancellationIfActive(imports, dependencies.database, runId, now())
-    const removeAbortListeners = abortSource
-      ? observeRequestAbort(abortSource, cancelOnAbort)
-      : () => undefined
-    const operation = processing
-      .then((result) => ({ runId, result }))
-      .finally(() => {
-        removeAbortListeners()
-        inflightRegistrations.delete(file.canonicalPath)
-      })
-    inflightRegistrations.set(file.canonicalPath, operation)
-    return operation
+  const serializeSource = async (sourcePath: string, task: () => Promise<void>): Promise<void> => {
+    const predecessor = sourceLocks.get(sourcePath) ?? Promise.resolve()
+    const operation = predecessor.catch(() => undefined).then(task)
+    sourceLocks.set(sourcePath, operation)
+    try {
+      await operation
+    } finally {
+      if (sourceLocks.get(sourcePath) === operation) sourceLocks.delete(sourcePath)
+    }
+  }
+
+  const enqueueItem = (
+    runId: number,
+    itemId: number,
+    sourcePath: string,
+    task: () => Promise<void>,
+  ): boolean =>
+    queue.enqueue(async () => {
+      try {
+        await serializeSource(sourcePath, task)
+      } catch (error) {
+        persistBackgroundFailure(dependencies.database, imports, artifacts, runId, itemId, error, now())
+      }
+    })
+
+  const cancelRunOnAbort = (request: IncomingMessage, reply: FastifyReply, runId: number) => {
+    const remove = observeRequestAbort(
+      { request, response: reply.raw },
+      () => requestCancellationIfActive(imports, dependencies.database, runId, now()),
+    )
+    reply.raw.once('finish', remove)
   }
 
   app.get('/api/gallery', async (request, reply) => {
@@ -129,7 +150,8 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
       return pageResponse(
         dependencies.database,
         cursorCodec,
-        readArtifactRows(dependencies.database),
+        thumbnailCodec,
+        gallery,
         query,
         'gallery:',
       )
@@ -143,13 +165,14 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
       const query = readPageQuery(request.query, true)
       const results = search.search(query.query, { limit: MAX_SEARCH_RESULTS })
       const ids = results.map(({ artifactId }) => artifactId)
-      const rows = readArtifactRows(dependencies.database, ids)
       return pageResponse(
         dependencies.database,
         cursorCodec,
-        rows,
+        thumbnailCodec,
+        gallery,
         query,
         `search:${normalizeSearchText(query.query)}`,
+        ids,
       )
     } catch (error) {
       return sendBoundaryError(reply, error)
@@ -161,9 +184,39 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
       const artifactId = readPositiveId(request.params)
       const row = readArtifactRows(dependencies.database, [artifactId])[0]
       if (!row) return sendNotFound(reply)
-      return toArtifactDetail(dependencies.database, row)
+      return toArtifactDetail(dependencies.database, row, thumbnailCodec)
     } catch (error) {
       return sendBoundaryError(reply, error)
+    }
+  })
+
+  app.get('/api/thumbnails/:token', async (request, reply) => {
+    try {
+      const token = readObject(request.params).token
+      if (typeof token !== 'string' || token.length > MAX_CURSOR_LENGTH) return sendNotFound(reply)
+      const resource = thumbnailCodec.decode(token)
+      const thumbnailPath = dependencies.database
+        .prepare(
+          `SELECT thumbnail_path
+           FROM artifact_generation
+           WHERE id = ? AND artifact_id = ? AND thumbnail_path IS NOT NULL`,
+        )
+        .pluck()
+        .get(resource.generationId, resource.artifactId)
+      if (typeof thumbnailPath !== 'string' || extname(thumbnailPath).toLowerCase() !== '.webp') {
+        return sendNotFound(reply)
+      }
+      const authorized = await dependencies.derivativePathPolicy.authorizeAsset(thumbnailPath)
+      if (authorized.mimeType !== 'image/webp') return sendNotFound(reply)
+      const bytes = await authorized.read(MAX_THUMBNAIL_BYTES)
+      return reply
+        .header('cache-control', 'private, no-store')
+        .header('x-content-type-options', 'nosniff')
+        .type('image/webp')
+        .send(bytes)
+    } catch (error) {
+      if (error instanceof InvalidResourceTokenError) return sendNotFound(reply)
+      return sendNotFound(reply)
     }
   })
 
@@ -172,12 +225,28 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
       const body = readObject(request.body)
       assertKeys(body, ['path'])
       const sourcePath = readPath(body.path)
-      const file = await dependencies.pathPolicy.authorizeFile(sourcePath)
-      const registration = await registerAuthorized(file, {
-        request: request.raw,
-        response: reply.raw,
+      const run = imports.createRun([sourcePath])
+      const accepted = enqueueItem(run.id, run.itemIds[0] as number, sourcePath, async () => {
+        await dependencies.processor.register({
+          sourcePath,
+          runId: run.id,
+          itemId: run.itemIds[0] as number,
+        })
       })
-      return reply.code(202).send(toRegistrationResponse([registration]))
+      if (!accepted) {
+        persistBackgroundFailure(
+          dependencies.database,
+          imports,
+          artifacts,
+          run.id,
+          run.itemIds[0] as number,
+          new ArtifactProcessingError('DATABASE_BUSY', 'inspect'),
+          now(),
+        )
+        return sendError(reply, 503, toPublicProcessingError(new ArtifactProcessingError('DATABASE_BUSY', 'inspect')))
+      }
+      cancelRunOnAbort(request.raw, reply, run.id)
+      return reply.code(202).send({ runId: run.id } satisfies RegistrationResponse)
     } catch (error) {
       return sendBoundaryError(reply, error)
     }
@@ -188,25 +257,39 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
       const body = readObject(request.body)
       assertKeys(body, ['path'])
       const folderPath = readPath(body.path)
-      const enumeration = await dependencies.pathPolicy.enumerateFolder(folderPath)
-      if (enumeration.files.length > MAX_FOLDER_FILES) throw invalidRequest()
-      const distinct = [...new Map(enumeration.files.map((file) => [file.canonicalPath, file])).values()]
-      const cancelFolderOnAbort = () => {
-        for (const file of distinct) {
-          const runId = readLatestRunId(dependencies.database, file.canonicalPath)
-          if (runId !== undefined) {
-            requestCancellationIfActive(imports, dependencies.database, runId, now())
-          }
+      const run = imports.createRun([])
+      const accepted = queue.enqueue(async () => {
+        try {
+          await processFolderRun({
+            database: dependencies.database,
+            imports,
+            artifacts,
+            processor: dependencies.processor,
+            pathPolicy: dependencies.pathPolicy,
+            runId: run.id,
+            folderPath,
+            now,
+            serializeSource,
+          })
+        } catch (error) {
+          persistFolderBackgroundFailure(
+            dependencies.database,
+            imports,
+            artifacts,
+            run.id,
+            folderPath,
+            error,
+            now(),
+          )
         }
+      })
+      if (!accepted) {
+        imports.requestCancellation(run.id, now())
+        imports.cancelRun(run.id, now())
+        return sendError(reply, 503, toPublicProcessingError(new ArtifactProcessingError('DATABASE_BUSY', 'inspect')))
       }
-      const removeAbortListeners = observeRequestAbort(
-        { request: request.raw, response: reply.raw },
-        cancelFolderOnAbort,
-      )
-      const registrations = await Promise.all(distinct.map((file) => registerAuthorized(file))).finally(
-        removeAbortListeners,
-      )
-      return reply.code(202).send(toRegistrationResponse(registrations))
+      cancelRunOnAbort(request.raw, reply, run.id)
+      return reply.code(202).send({ runId: run.id } satisfies RegistrationResponse)
     } catch (error) {
       return sendBoundaryError(reply, error)
     }
@@ -246,24 +329,49 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
         const artifactId = readPositiveId(request.params)
         const artifact = readArtifactIdentity(dependencies.database, artifactId)
         if (!artifact) return sendNotFound(reply)
-        const result = await dependencies.processor[operation]({ sourcePath: artifact.sourcePath })
-        const missingError = result.errors.find(({ code }) => code === 'SOURCE_MISSING')
-        if (missingError) {
-          dependencies.database
-            .prepare("UPDATE artifact SET source_status = 'missing', updated_at = ? WHERE id = ?")
-            .run(now(), artifactId)
-          new ArtifactRepository(dependencies.database).recordError({
-            artifactId,
-            generationId: null,
-            code: missingError.code,
-            stage: missingError.stage,
-            retryable: missingError.retryable,
-            userMessage: missingError.message,
-            technicalDetail: null,
-            occurredAt: now(),
-          })
+        const run = imports.createRun([artifact.sourcePath])
+        const accepted = enqueueItem(
+          run.id,
+          run.itemIds[0] as number,
+          artifact.sourcePath,
+          async () => {
+            const result = await dependencies.processor[operation]({
+              sourcePath: artifact.sourcePath,
+              runId: run.id,
+              itemId: run.itemIds[0] as number,
+            })
+            const missingError = result.errors.find(({ code }) => code === 'SOURCE_MISSING')
+            if (missingError) {
+              dependencies.database
+                .prepare("UPDATE artifact SET source_status = 'missing', updated_at = ? WHERE id = ?")
+                .run(now(), artifactId)
+              artifacts.recordError({
+                artifactId,
+                generationId: null,
+                code: missingError.code,
+                stage: missingError.stage,
+                retryable: missingError.retryable,
+                userMessage: missingError.message,
+                technicalDetail: null,
+                occurredAt: now(),
+              })
+            }
+          },
+        )
+        if (!accepted) {
+          persistBackgroundFailure(
+            dependencies.database,
+            imports,
+            artifacts,
+            run.id,
+            run.itemIds[0] as number,
+            new ArtifactProcessingError('DATABASE_BUSY', 'inspect'),
+            now(),
+          )
+          return sendError(reply, 503, toPublicProcessingError(new ArtifactProcessingError('DATABASE_BUSY', 'inspect')))
         }
-        return result
+        cancelRunOnAbort(request.raw, reply, run.id)
+        return reply.code(202).send({ runId: run.id } satisfies RegistrationResponse)
       } catch (error) {
         return sendBoundaryError(reply, error)
       }
@@ -305,6 +413,7 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
       return toArtifactDetail(
         dependencies.database,
         readArtifactRows(dependencies.database, [artifactId])[0] as ArtifactRow,
+        thumbnailCodec,
       )
     } catch (error) {
       return sendBoundaryError(reply, error)
@@ -334,6 +443,7 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
       return toArtifactDetail(
         dependencies.database,
         readArtifactRows(dependencies.database, [artifactId])[0] as ArtifactRow,
+        thumbnailCodec,
       )
     } catch (error) {
       return sendBoundaryError(reply, error)
@@ -388,31 +498,246 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
   }
 }
 
+interface FolderRunDependencies {
+  readonly database: Database.Database
+  readonly imports: ImportRepository
+  readonly artifacts: ArtifactRepository
+  readonly processor: ArtifactProcessor
+  readonly pathPolicy: Pick<PathPolicy, 'enumerateFolder'>
+  readonly runId: number
+  readonly folderPath: string
+  readonly now: () => string
+  readonly serializeSource: (sourcePath: string, task: () => Promise<void>) => Promise<void>
+}
+
+async function processFolderRun(dependencies: FolderRunDependencies): Promise<void> {
+  const { database, imports, artifacts, processor, runId, folderPath, now, serializeSource } =
+    dependencies
+  if (imports.getRun(runId).cancelRequestedAt !== null) {
+    imports.cancelRun(runId, now())
+    return
+  }
+  imports.startRun(runId, now())
+
+  let enumeration: Awaited<ReturnType<FolderRunDependencies['pathPolicy']['enumerateFolder']>>
+  try {
+    enumeration = await dependencies.pathPolicy.enumerateFolder(folderPath)
+  } catch (error) {
+    if (imports.getRun(runId).cancelRequestedAt !== null) {
+      cancelOutstandingRun(database, imports, runId, now())
+      return
+    }
+    const [itemId] = imports.addItems(runId, [folderPath])
+    persistItemFailure(imports, artifacts, itemId as number, error, now())
+    finishImportRun(database, imports, runId, now())
+    return
+  }
+
+  if (imports.getRun(runId).cancelRequestedAt !== null) {
+    cancelOutstandingRun(database, imports, runId, now())
+    return
+  }
+  const files = [
+    ...new Map(enumeration.files.map((file) => [file.canonicalPath, file])).values(),
+  ]
+  if (files.length + enumeration.errors.length > MAX_FOLDER_FILES) {
+    const [itemId] = imports.addItems(runId, [folderPath])
+    persistItemFailure(
+      imports,
+      artifacts,
+      itemId as number,
+      new ArtifactProcessingError('INPUT_TOO_LARGE', 'inspect'),
+      now(),
+    )
+    finishImportRun(database, imports, runId, now())
+    return
+  }
+
+  const itemIds = imports.addItems(runId, [
+    ...files.map(({ canonicalPath }) => canonicalPath),
+    ...enumeration.errors.map(({ path }) => path),
+  ])
+  const fileItemIds = itemIds.slice(0, files.length)
+  const errorItemIds = itemIds.slice(files.length)
+  enumeration.errors.forEach((error, index) => {
+    persistEnumerationError(imports, artifacts, errorItemIds[index] as number, error, now())
+  })
+
+  for (const [index, file] of files.entries()) {
+    if (imports.getRun(runId).cancelRequestedAt !== null) {
+      cancelOutstandingRun(database, imports, runId, now())
+      return
+    }
+    await serializeSource(file.canonicalPath, async () => {
+      await processor.register({
+        sourcePath: file.canonicalPath,
+        runId,
+        itemId: fileItemIds[index] as number,
+      })
+    })
+  }
+  finishImportRun(database, imports, runId, now())
+}
+
+function persistEnumerationError(
+  imports: ImportRepository,
+  artifacts: ArtifactRepository,
+  itemId: number,
+  error: PathPolicyItemError,
+  occurredAt: string,
+): void {
+  persistItemFailure(
+    imports,
+    artifacts,
+    itemId,
+    new ArtifactProcessingError(error.code, 'inspect'),
+    occurredAt,
+  )
+}
+
+function persistItemFailure(
+  imports: ImportRepository,
+  artifacts: ArtifactRepository,
+  itemId: number,
+  error: unknown,
+  occurredAt: string,
+): void {
+  const mapped = mapProcessingError(error, 'inspect')
+  if (!imports.startStage(itemId, 'inspect', occurredAt)) return
+  const item = imports.getItem(itemId)
+  const errorId = artifacts.recordError({
+    artifactId: item.artifactId,
+    generationId: null,
+    code: mapped.code,
+    stage: mapped.stage,
+    retryable: mapped.retryable,
+    userMessage: mapped.userMessage,
+    technicalDetail: mapped.technicalDetail,
+    occurredAt,
+  })
+  imports.failItem(itemId, errorId, occurredAt)
+}
+
+function persistFolderBackgroundFailure(
+  database: Database.Database,
+  imports: ImportRepository,
+  artifacts: ArtifactRepository,
+  runId: number,
+  folderPath: string,
+  error: unknown,
+  occurredAt: string,
+): void {
+  const run = imports.getRun(runId)
+  if (run.status !== 'queued' && run.status !== 'running') return
+  if (run.cancelRequestedAt !== null) {
+    cancelOutstandingRun(database, imports, runId, occurredAt)
+    return
+  }
+  if (run.status === 'queued') imports.startRun(runId, occurredAt)
+  let itemIds = database
+    .prepare(
+      `SELECT id FROM import_item
+       WHERE run_id = ? AND status IN ('queued', 'processing') ORDER BY id`,
+    )
+    .pluck()
+    .all(runId) as number[]
+  if (itemIds.length === 0) itemIds = imports.addItems(runId, [folderPath])
+  itemIds.forEach((itemId) => persistItemFailure(imports, artifacts, itemId, error, occurredAt))
+  finishImportRun(database, imports, runId, occurredAt)
+}
+
+function persistBackgroundFailure(
+  database: Database.Database,
+  imports: ImportRepository,
+  artifacts: ArtifactRepository,
+  runId: number,
+  itemId: number,
+  error: unknown,
+  occurredAt: string,
+): void {
+  const run = imports.getRun(runId)
+  if (run.status !== 'queued' && run.status !== 'running') return
+  if (run.cancelRequestedAt !== null) {
+    cancelOutstandingRun(database, imports, runId, occurredAt)
+    return
+  }
+  if (run.status === 'queued') imports.startRun(runId, occurredAt)
+  persistItemFailure(imports, artifacts, itemId, error, occurredAt)
+  finishImportRun(database, imports, runId, occurredAt)
+}
+
+function cancelOutstandingRun(
+  database: Database.Database,
+  imports: ImportRepository,
+  runId: number,
+  completedAt: string,
+): void {
+  const itemIds = database
+    .prepare(
+      `SELECT id FROM import_item
+       WHERE run_id = ? AND status IN ('queued', 'processing') ORDER BY id`,
+    )
+    .pluck()
+    .all(runId) as number[]
+  itemIds.forEach((itemId) => imports.cancelItem(itemId, completedAt))
+  const run = imports.getRun(runId)
+  if (run.status === 'queued' || run.status === 'running') imports.cancelRun(runId, completedAt)
+}
+
+function finishImportRun(
+  database: Database.Database,
+  imports: ImportRepository,
+  runId: number,
+  completedAt: string,
+): void {
+  const run = imports.getRun(runId)
+  if (run.status !== 'running') return
+  const statuses = database
+    .prepare('SELECT status FROM import_item WHERE run_id = ?')
+    .pluck()
+    .all(runId) as string[]
+  if (statuses.some((status) => status === 'queued' || status === 'processing')) return
+  if (run.cancelRequestedAt !== null || statuses.some((status) => status === 'cancelled')) {
+    imports.cancelRun(runId, completedAt)
+  } else if (statuses.some((status) => status === 'failed' || status === 'interrupted')) {
+    database
+      .prepare("UPDATE import_run SET status = 'failed', completed_at = ? WHERE id = ? AND status = 'running'")
+      .run(completedAt, runId)
+  } else {
+    imports.completeRun(runId, completedAt)
+  }
+}
+
 function pageResponse(
   database: Database.Database,
   codec: CursorCodec,
-  rows: ArtifactRow[],
+  thumbnailCodec: ThumbnailResourceCodec,
+  gallery: GalleryRepository,
   query: PageQuery,
   queryIdentity: string,
+  artifactIds?: readonly number[],
 ): GalleryPage {
   const context = cursorContext(database, query, queryIdentity)
   const cursor = query.cursor ? codec.decode(query.cursor, context) : null
-  const filtered = rows
-    .map((row) => ({ row, card: toArtifactCard(row), sortKey: sortKey(row, query.sort) }))
-    .filter(({ card }) => query.filter === 'all' || card.status === query.filter)
-    .toSorted((left, right) => comparePageRows(left, right, query.sort))
-    .filter(({ row, sortKey: key }) => !cursor || isAfterCursor(key, row.id, cursor, query.sort))
-  const page = filtered.slice(0, GALLERY_PAGE_SIZE)
+  const rows = gallery.readPage({
+    sort: query.sort,
+    format: query.filter,
+    status: query.status,
+    cursor,
+    artifactIds,
+    limit: GALLERY_PAGE_SIZE + 1,
+  })
+  const page = rows.slice(0, GALLERY_PAGE_SIZE)
   const last = page.at(-1)
   return {
-    items: page.map(({ card }) => card),
+    items: page.map((row) => toArtifactCard(row, thumbnailCodec)),
     nextCursor:
-      filtered.length > GALLERY_PAGE_SIZE && last
+      rows.length > GALLERY_PAGE_SIZE && last
         ? codec.encode({
             version: 1,
             ...context,
-            lastSortKey: last.sortKey,
-            lastId: last.row.id,
+            lastSortKey: last.sort_key,
+            lastId: last.id,
           })
         : null,
   }
@@ -422,20 +747,33 @@ interface PageQuery {
   readonly cursor: string | null
   readonly sort: GallerySortMode
   readonly filter: GalleryFilter
+  readonly status: GalleryStatusFilter
   readonly query: string
 }
 
 function readPageQuery(value: unknown, requiresQuery: boolean): PageQuery {
   const query = readObject(value)
-  assertKeys(query, requiresQuery ? ['q', 'sort', 'filter', 'cursor'] : ['sort', 'filter', 'cursor'])
+  assertKeys(
+    query,
+    requiresQuery
+      ? ['q', 'sort', 'filter', 'status', 'cursor']
+      : ['sort', 'filter', 'status', 'cursor'],
+  )
   const sort = query.sort ?? 'newest'
   const filter = query.filter ?? 'all'
+  const status = query.status ?? 'all'
   const searchQuery = query.q ?? ''
   const cursor = query.cursor ?? null
   if (sort !== 'newest' && sort !== 'title') throw invalidRequest()
   if (
     typeof filter !== 'string' ||
-    !['all', 'missing', 'processing', 'ready', 'partial', 'failed'].includes(filter)
+    !['all', 'html', 'markdown'].includes(filter)
+  ) {
+    throw invalidRequest()
+  }
+  if (
+    typeof status !== 'string' ||
+    !['all', 'missing', 'processing', 'ready', 'partial', 'failed'].includes(status)
   ) {
     throw invalidRequest()
   }
@@ -450,6 +788,7 @@ function readPageQuery(value: unknown, requiresQuery: boolean): PageQuery {
     cursor,
     sort,
     filter: filter as GalleryFilter,
+    status: status as GalleryStatusFilter,
     query: searchQuery,
   }
 }
@@ -463,6 +802,7 @@ function cursorContext(
   return {
     sort: query.sort,
     filter: query.filter,
+    status: query.status,
     queryFingerprint: createHash('sha256').update(queryIdentity).digest('base64url'),
     catalogRevision: revision,
     searchRevision: revision,
@@ -475,9 +815,9 @@ function databaseRevision(database: Database.Database): string {
   return `${String(dataVersion)}:${String(totalChanges)}`
 }
 
-function readArtifactRows(database: Database.Database, ids?: readonly number[]): ArtifactRow[] {
-  if (ids && ids.length === 0) return []
-  const where = ids ? `WHERE artifact.id IN (${ids.map(() => '?').join(', ')})` : ''
+function readArtifactRows(database: Database.Database, ids: readonly number[]): ArtifactRow[] {
+  if (ids.length === 0) return []
+  const where = `WHERE artifact.id IN (${ids.map(() => '?').join(', ')})`
   return database
     .prepare(
       `SELECT artifact.id,
@@ -492,7 +832,8 @@ function readArtifactRows(database: Database.Database, ids?: readonly number[]):
               current_generation.content_status,
               current_generation.render_status,
               current_generation.index_status,
-              active_generation.thumbnail_path
+              active_generation.thumbnail_path,
+              active_generation.id AS thumbnail_generation_id
        FROM artifact
        LEFT JOIN artifact_generation AS current_generation
          ON current_generation.artifact_id = artifact.id
@@ -502,10 +843,10 @@ function readArtifactRows(database: Database.Database, ids?: readonly number[]):
         AND active_generation.artifact_id = artifact.id
        ${where}`,
     )
-    .all(...(ids ?? [])) as ArtifactRow[]
+    .all(...ids) as ArtifactRow[]
 }
 
-function toArtifactCard(row: ArtifactRow): ArtifactCard {
+function toArtifactCard(row: ArtifactRow, thumbnailCodec: ThumbnailResourceCodec): ArtifactCard {
   const status = deriveCardPresentation({
     source_status: row.source_status,
     job_status: row.job_status,
@@ -519,14 +860,21 @@ function toArtifactCard(row: ArtifactRow): ArtifactCard {
     sourcePath: row.source_path,
     format: row.format,
     status,
-    thumbnailPath: row.thumbnail_path,
+    thumbnailUrl:
+      row.thumbnail_path && row.thumbnail_generation_id
+        ? `/api/thumbnails/${thumbnailCodec.encode(row.id, row.thumbnail_generation_id)}`
+        : null,
     diagram: statusDiagram(status),
   }
 }
 
-function toArtifactDetail(database: Database.Database, row: ArtifactRow): ArtifactDetail {
+function toArtifactDetail(
+  database: Database.Database,
+  row: ArtifactRow,
+  thumbnailCodec: ThumbnailResourceCodec,
+): ArtifactDetail {
   return {
-    ...toArtifactCard(row),
+    ...toArtifactCard(row, thumbnailCodec),
     generation: row.generation_counter,
     errors: readPublicErrors(database, row.id),
   }
@@ -547,36 +895,6 @@ function statusDiagram(status: CardPresentation): string {
   }
 }
 
-function sortKey(row: ArtifactRow, sort: GallerySortMode): string {
-  return sort === 'newest'
-    ? row.registered_at
-    : normalizeSearchText(row.user_title ?? row.derived_title ?? basename(row.source_path))
-}
-
-function comparePageRows(
-  left: { row: ArtifactRow; sortKey: string },
-  right: { row: ArtifactRow; sortKey: string },
-  sort: GallerySortMode,
-): number {
-  if (left.sortKey !== right.sortKey) {
-    const comparison = left.sortKey < right.sortKey ? -1 : 1
-    return sort === 'newest' ? -comparison : comparison
-  }
-  return sort === 'newest' ? right.row.id - left.row.id : left.row.id - right.row.id
-}
-
-function isAfterCursor(
-  key: string,
-  id: number,
-  cursor: { lastSortKey: string; lastId: number },
-  sort: GallerySortMode,
-): boolean {
-  if (key === cursor.lastSortKey) {
-    return sort === 'newest' ? id < cursor.lastId : id > cursor.lastId
-  }
-  return sort === 'newest' ? key < cursor.lastSortKey : key > cursor.lastSortKey
-}
-
 function readPublicErrors(database: Database.Database, artifactId: number): PublicProcessingError[] {
   const rows = database
     .prepare(
@@ -595,32 +913,6 @@ function readPublicErrors(database: Database.Database, artifactId: number): Publ
     retryable: row.retryable === 1,
     message: row.user_message,
   }))
-}
-
-function toRegistrationResponse(registrations: readonly RegistrationEnvelope[]): RegistrationResponse {
-  return {
-    runIds: registrations.map(({ runId }) => runId),
-    results: registrations.map(({ runId, result }) => ({
-      runId,
-      artifactId: result.artifactId,
-      outcome: result.outcome,
-      errors: result.errors,
-    })),
-  }
-}
-
-function readResultRunId(database: Database.Database, canonicalPath: string): number {
-  const runId = readLatestRunId(database, canonicalPath)
-  if (runId === undefined) throw new Error('The processor did not create an import run.')
-  return runId
-}
-
-function readLatestRunId(database: Database.Database, canonicalPath: string): number | undefined {
-  const runId = database
-    .prepare('SELECT run_id FROM import_item WHERE canonical_path = ? ORDER BY id DESC LIMIT 1')
-    .pluck()
-    .get(canonicalPath)
-  return typeof runId === 'number' ? runId : undefined
 }
 
 function readImportRun(database: Database.Database, runId: number) {
@@ -684,12 +976,49 @@ export function observeRequestAbort(source: AbortSource, cancel: () => void): ()
 }
 
 function readImportItems(database: Database.Database, runId: number) {
-  return database
+  const rows = database
     .prepare(
-      `SELECT id, artifact_id AS artifactId, stage, status
-       FROM import_item WHERE run_id = ? ORDER BY id`,
+      `SELECT import_item.id,
+              import_item.canonical_path,
+              import_item.artifact_id,
+              import_item.stage,
+              import_item.status,
+              artifact_error.code,
+              artifact_error.stage AS error_stage,
+              artifact_error.retryable,
+              artifact_error.user_message
+       FROM import_item
+       LEFT JOIN artifact_error ON artifact_error.id = import_item.error_id
+       WHERE import_item.run_id = ?
+       ORDER BY import_item.id`,
     )
-    .all(runId)
+    .all(runId) as Array<{
+    id: number
+    canonical_path: string
+    artifact_id: number | null
+    stage: string
+    status: string
+    code: PublicProcessingError['code'] | null
+    error_stage: PublicProcessingError['stage'] | null
+    retryable: number | null
+    user_message: string | null
+  }>
+  return rows.map((row) => ({
+    id: row.id,
+    name: basename(row.canonical_path),
+    artifactId: row.artifact_id,
+    stage: row.stage,
+    status: row.status,
+    error:
+      row.code && row.error_stage && row.retryable !== null && row.user_message
+        ? {
+            code: row.code,
+            stage: row.error_stage,
+            retryable: row.retryable === 1,
+            message: row.user_message,
+          }
+        : null,
+  }))
 }
 
 function readArtifactIdentity(database: Database.Database, artifactId: number) {

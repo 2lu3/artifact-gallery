@@ -1,11 +1,12 @@
 import { existsSync } from 'node:fs'
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { buildApp } from '../app.js'
+import { BackgroundQueue } from './background-queue.js'
 import { openDatabase } from '../db/database.js'
 import { ArtifactProcessor } from '../processing/artifact-processor.js'
 import { SearchVisibilityRepository } from '../repositories/search-visibility-repository.js'
@@ -22,6 +23,215 @@ afterEach(async () => {
 })
 
 describe('local API integration', () => {
+  it('returns a durable run before background rendering finishes', async () => {
+    let markRenderingStarted!: () => void
+    let releaseRendering!: () => void
+    const renderingStarted = new Promise<void>((resolve) => {
+      markRenderingStarted = resolve
+    })
+    const renderingReleased = new Promise<void>((resolve) => {
+      releaseRendering = resolve
+    })
+    const harness = await makeHarness({
+      beforeRender: async () => {
+        markRenderingStarted()
+        await renderingReleased
+      },
+    })
+    const sourcePath = join(harness.sourceDirectory, 'background.md')
+    await writeFile(sourcePath, '# Background')
+
+    let responseSettled = false
+    const responsePromise = harness.app
+      .inject({
+        method: 'POST',
+        url: '/api/registrations/file',
+        headers: harness.headers,
+        payload: { path: sourcePath },
+      })
+      .then((response) => {
+        responseSettled = true
+        return response
+      })
+    await renderingStarted
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    const settledBeforeRenderFinished = responseSettled
+    releaseRendering()
+    const response = await responsePromise
+
+    expect(settledBeforeRenderFinished).toBe(true)
+    expect(response.statusCode).toBe(202)
+    expect(response.json()).toEqual({ runId: expect.any(Number) })
+    await harness.close()
+  })
+
+  it('reports and durably cancels a run while background processing is active', async () => {
+    let markRenderingStarted!: () => void
+    let releaseRendering!: () => void
+    const renderingStarted = new Promise<void>((resolve) => {
+      markRenderingStarted = resolve
+    })
+    const renderingReleased = new Promise<void>((resolve) => {
+      releaseRendering = resolve
+    })
+    const harness = await makeHarness({
+      beforeRender: async () => {
+        markRenderingStarted()
+        await renderingReleased
+      },
+    })
+    const sourcePath = join(harness.sourceDirectory, 'cancel.md')
+    await writeFile(sourcePath, '# Cancel')
+    const queued = await harness.app.inject({
+      method: 'POST',
+      url: '/api/registrations/file',
+      headers: harness.headers,
+      payload: { path: sourcePath },
+    })
+    const runId = queued.json().runId as number
+    await renderingStarted
+
+    const active = await harness.app.inject({
+      method: 'GET',
+      url: `/api/imports/${runId}`,
+      headers: harness.headers,
+    })
+    expect(active.json()).toMatchObject({
+      id: runId,
+      status: 'running',
+      items: [{ stage: 'render', status: 'processing' }],
+    })
+    const cancellation = await harness.app.inject({
+      method: 'POST',
+      url: `/api/imports/${runId}/cancel`,
+      headers: harness.headers,
+    })
+    expect(cancellation.json().cancelRequestedAt).toEqual(expect.any(String))
+    releaseRendering()
+
+    const terminal = await waitForRun(harness, runId)
+    expect(terminal).toMatchObject({ status: 'cancelled', items: [{ status: 'cancelled' }] })
+    await harness.close()
+  })
+
+  it('persists folder enumeration errors with safe item names while valid files continue', async () => {
+    const harness = await makeHarness()
+    const validPath = join(harness.sourceDirectory, 'valid.md')
+    const rejectedPath = join(harness.sourceDirectory, 'linked.md')
+    await writeFile(validPath, '# Valid')
+    await symlink(validPath, rejectedPath)
+
+    const response = await harness.app.inject({
+      method: 'POST',
+      url: '/api/registrations/folder',
+      headers: harness.headers,
+      payload: { path: harness.sourceDirectory },
+    })
+    expect(response.statusCode).toBe(202)
+    const run = await waitForRun(harness, response.json().runId)
+
+    expect(run.status).toBe('failed')
+    expect(run.items).toEqual([
+      expect.objectContaining({ name: 'valid.md', status: 'completed', error: null }),
+      expect.objectContaining({
+        name: 'linked.md',
+        status: 'failed',
+        error: {
+          code: 'SYMLINK_REJECTED',
+          stage: 'inspect',
+          retryable: false,
+          message: 'Symbolic links are not allowed.',
+        },
+      }),
+    ])
+    expect(JSON.stringify(run)).not.toContain(harness.root)
+    expect(harness.database.prepare('SELECT COUNT(*) AS count FROM artifact').get()).toEqual({
+      count: 1,
+    })
+    await harness.close()
+  })
+
+  it('honors cancellation at the folder enumeration boundary', async () => {
+    let markEnumerationStarted!: () => void
+    let releaseEnumeration!: () => void
+    const enumerationStarted = new Promise<void>((resolve) => {
+      markEnumerationStarted = resolve
+    })
+    const enumerationReleased = new Promise<void>((resolve) => {
+      releaseEnumeration = resolve
+    })
+    const harness = await makeHarness({
+      beforeEnumeration: async () => {
+        markEnumerationStarted()
+        await enumerationReleased
+      },
+    })
+    await writeFile(join(harness.sourceDirectory, 'never-processed.md'), '# Cancel folder')
+
+    const queued = await harness.app.inject({
+      method: 'POST',
+      url: '/api/registrations/folder',
+      headers: harness.headers,
+      payload: { path: harness.sourceDirectory },
+    })
+    const runId = queued.json().runId as number
+    await enumerationStarted
+    const cancellation = await harness.app.inject({
+      method: 'POST',
+      url: `/api/imports/${runId}/cancel`,
+      headers: harness.headers,
+    })
+    expect(cancellation.json().cancelRequestedAt).toEqual(expect.any(String))
+    releaseEnumeration()
+
+    const terminal = await waitForRun(harness, runId)
+    expect(terminal).toMatchObject({ status: 'cancelled', items: [] })
+    expect(harness.database.prepare('SELECT COUNT(*) AS count FROM artifact').get()).toEqual({
+      count: 0,
+    })
+    await harness.close()
+  })
+
+  it('serves thumbnails only through an authenticated opaque derivative URL', async () => {
+    const harness = await makeHarness()
+    const sourcePath = join(harness.sourceDirectory, 'thumbnail.md')
+    await writeFile(sourcePath, '# Opaque thumbnail')
+    await harness.processor.register({ sourcePath })
+
+    const gallery = await harness.app.inject({
+      method: 'GET',
+      url: '/api/gallery?filter=markdown&status=ready',
+      headers: harness.headers,
+    })
+    const card = gallery.json().items[0]
+    expect(card.thumbnailUrl).toMatch(/^\/api\/thumbnails\/[A-Za-z0-9_.-]+$/)
+    expect(card).not.toHaveProperty('thumbnailPath')
+    expect(JSON.stringify(card)).not.toContain(harness.thumbnailDirectory)
+
+    const unauthorized = await harness.app.inject({ method: 'GET', url: card.thumbnailUrl })
+    const thumbnail = await harness.app.inject({
+      method: 'GET',
+      url: card.thumbnailUrl,
+      headers: harness.headers,
+    })
+    expect(unauthorized.statusCode).toBe(401)
+    expect(thumbnail.statusCode).toBe(200)
+    expect(thumbnail.headers['content-type']).toContain('image/webp')
+    expect(thumbnail.headers['cache-control']).toBe('private, no-store')
+    expect(thumbnail.rawPayload).toEqual(Buffer.from('RIFF-api-preview-WEBP'))
+
+    const tamperedUrl = `${card.thumbnailUrl.slice(0, -1)}${card.thumbnailUrl.endsWith('x') ? 'y' : 'x'}`
+    const tampered = await harness.app.inject({
+      method: 'GET',
+      url: tamperedUrl,
+      headers: harness.headers,
+    })
+    expect(tampered.statusCode).toBe(404)
+    expect(JSON.stringify(tampered.json())).not.toContain(harness.thumbnailDirectory)
+
+    await harness.close()
+  })
+
   it('paginates exactly 30 visible cards and rejects changed cursor context', async () => {
     const harness = await makeHarness()
     for (let index = 0; index < 35; index += 1) {
@@ -30,6 +240,10 @@ describe('local API integration', () => {
         `# Pagination artifact ${index.toString().padStart(2, '0')}\n\nshared searchable body`,
       )
     }
+    await writeFile(
+      join(harness.sourceDirectory, 'html-only.html'),
+      '<!doctype html><title>HTML only</title><p>format filtered</p>',
+    )
 
     const registered = await harness.app.inject({
       method: 'POST',
@@ -38,11 +252,11 @@ describe('local API integration', () => {
       payload: { path: harness.sourceDirectory },
     })
     expect(registered.statusCode).toBe(202)
-    expect(registered.json().results).toHaveLength(35)
+    await waitForRun(harness, registered.json().runId)
 
     const first = await harness.app.inject({
       method: 'GET',
-      url: '/api/gallery?sort=newest&filter=ready',
+      url: '/api/gallery?sort=newest&filter=markdown&status=ready',
       headers: harness.headers,
     })
     expect(first.statusCode).toBe(200)
@@ -55,7 +269,7 @@ describe('local API integration', () => {
 
     const second = await harness.app.inject({
       method: 'GET',
-      url: `/api/gallery?sort=newest&filter=ready&cursor=${encodeURIComponent(first.json().nextCursor)}`,
+      url: `/api/gallery?sort=newest&filter=markdown&status=ready&cursor=${encodeURIComponent(first.json().nextCursor)}`,
       headers: harness.headers,
     })
     expect(second.statusCode).toBe(200)
@@ -66,9 +280,18 @@ describe('local API integration', () => {
       35,
     )
 
+    const htmlOnly = await harness.app.inject({
+      method: 'GET',
+      url: '/api/gallery?filter=html&status=ready',
+      headers: harness.headers,
+    })
+    expect(htmlOnly.statusCode).toBe(200)
+    expect(htmlOnly.json().items).toHaveLength(1)
+    expect(htmlOnly.json().items[0]).toMatchObject({ format: 'html', title: 'HTML only' })
+
     const search = await harness.app.inject({
       method: 'GET',
-      url: '/api/search?q=shared%20searchable%20body&sort=newest&filter=ready',
+      url: '/api/search?q=shared%20searchable%20body&sort=newest&filter=markdown&status=ready',
       headers: harness.headers,
     })
     expect(search.statusCode).toBe(200)
@@ -78,28 +301,35 @@ describe('local API integration', () => {
     const tamperedCursor = `${cursor.slice(0, -1)}${cursor.endsWith('x') ? 'y' : 'x'}`
     const tampered = await harness.app.inject({
       method: 'GET',
-      url: `/api/gallery?sort=newest&filter=ready&cursor=${encodeURIComponent(tamperedCursor)}`,
+      url: `/api/gallery?sort=newest&filter=markdown&status=ready&cursor=${encodeURIComponent(tamperedCursor)}`,
       headers: harness.headers,
     })
     expectCursorStale(tampered)
 
-    const changedFilter = await harness.app.inject({
+    const changedFormat = await harness.app.inject({
       method: 'GET',
-      url: `/api/gallery?sort=newest&filter=all&cursor=${encodeURIComponent(first.json().nextCursor)}`,
+      url: `/api/gallery?sort=newest&filter=html&status=ready&cursor=${encodeURIComponent(first.json().nextCursor)}`,
       headers: harness.headers,
     })
-    expectCursorStale(changedFilter)
+    expectCursorStale(changedFormat)
+
+    const changedStatus = await harness.app.inject({
+      method: 'GET',
+      url: `/api/gallery?sort=newest&filter=markdown&status=failed&cursor=${encodeURIComponent(first.json().nextCursor)}`,
+      headers: harness.headers,
+    })
+    expectCursorStale(changedStatus)
 
     const changedSort = await harness.app.inject({
       method: 'GET',
-      url: `/api/gallery?sort=title&filter=ready&cursor=${encodeURIComponent(first.json().nextCursor)}`,
+      url: `/api/gallery?sort=title&filter=markdown&status=ready&cursor=${encodeURIComponent(first.json().nextCursor)}`,
       headers: harness.headers,
     })
     expectCursorStale(changedSort)
 
     const changedQuery = await harness.app.inject({
       method: 'GET',
-      url: `/api/search?q=different&sort=newest&filter=ready&cursor=${encodeURIComponent(search.json().nextCursor)}`,
+      url: `/api/search?q=different&sort=newest&filter=markdown&status=ready&cursor=${encodeURIComponent(search.json().nextCursor)}`,
       headers: harness.headers,
     })
     expectCursorStale(changedQuery)
@@ -123,7 +353,7 @@ describe('local API integration', () => {
 
     const stale = await harness.app.inject({
       method: 'GET',
-      url: `/api/gallery?sort=newest&filter=ready&cursor=${encodeURIComponent(first.json().nextCursor)}`,
+      url: `/api/gallery?sort=newest&filter=markdown&status=ready&cursor=${encodeURIComponent(first.json().nextCursor)}`,
       headers: harness.headers,
     })
     expectCursorStale(stale)
@@ -147,13 +377,12 @@ describe('local API integration', () => {
     const responses = await Promise.all(requests)
 
     expect(responses.every((response) => response.statusCode === 202)).toBe(true)
-    expect(
-      harness.database.prepare('SELECT COUNT(*) AS count FROM artifact').get(),
-    ).toEqual({ count: 1 })
-    const artifactIds = responses.map((response) => response.json().results[0].artifactId)
-    expect(new Set(artifactIds).size).toBe(1)
+    await Promise.all(responses.map((response) => waitForRun(harness, response.json().runId)))
+    expect(harness.database.prepare('SELECT COUNT(*) AS count FROM artifact').get()).toEqual({
+      count: 1,
+    })
 
-    const runId = responses[0].json().runIds[0]
+    const runId = responses[0].json().runId
     const status = await harness.app.inject({
       method: 'GET',
       url: `/api/imports/${runId}`,
@@ -179,13 +408,7 @@ describe('local API integration', () => {
     await writeFile(sourcePath, '# Keep the source')
     await writeFile(invalidPath, 'unsupported')
 
-    const registered = await harness.app.inject({
-      method: 'POST',
-      url: '/api/registrations/file',
-      headers: harness.headers,
-      payload: { path: sourcePath },
-    })
-    const artifactId = registered.json().results[0].artifactId
+    const { artifactId } = await registerFile(harness, sourcePath)
     const before = harness.database
       .prepare('SELECT generation_counter FROM artifact WHERE id = ?')
       .get(artifactId)
@@ -216,8 +439,9 @@ describe('local API integration', () => {
       url: `/api/artifacts/${artifactId}/refresh`,
       headers: harness.headers,
     })
-    expect(refreshed.statusCode).toBe(200)
+    expect(refreshed.statusCode).toBe(202)
     expect(JSON.stringify(refreshed.json())).not.toContain(sourcePath)
+    await waitForRun(harness, refreshed.json().runId)
     const detail = await harness.app.inject({
       method: 'GET',
       url: `/api/artifacts/${artifactId}`,
@@ -226,13 +450,18 @@ describe('local API integration', () => {
     expect(detail.json()).toMatchObject({
       id: artifactId,
       status: 'missing',
-      thumbnailPath: expect.any(String),
+      thumbnailUrl: expect.any(String),
       errors: [{ code: 'SOURCE_MISSING', stage: 'inspect', retryable: true }],
     })
     expect(JSON.stringify(detail.json())).not.toContain('technicalDetail')
 
     await writeFile(sourcePath, '# Keep the source')
-    const derivedPath = detail.json().thumbnailPath
+    const derivedPath = harness.database
+      .prepare(
+        'SELECT thumbnail_path FROM artifact_generation WHERE artifact_id = ? AND thumbnail_path IS NOT NULL ORDER BY id DESC LIMIT 1',
+      )
+      .pluck()
+      .get(artifactId) as string
     const firstDelete = await harness.app.inject({
       method: 'DELETE',
       url: `/api/artifacts/${artifactId}`,
@@ -255,13 +484,7 @@ describe('local API integration', () => {
     const harness = await makeHarness()
     const sourcePath = join(harness.sourceDirectory, 'action.md')
     await writeFile(sourcePath, '# Action')
-    const registered = await harness.app.inject({
-      method: 'POST',
-      url: '/api/registrations/file',
-      headers: harness.headers,
-      payload: { path: sourcePath },
-    })
-    const artifactId = registered.json().results[0].artifactId
+    const { artifactId } = await registerFile(harness, sourcePath)
 
     const invalid = await harness.app.inject({
       method: 'POST',
@@ -294,15 +517,10 @@ describe('local API integration', () => {
     const harness = await makeHarness()
     const sourcePath = join(harness.sourceDirectory, 'states.md')
     await writeFile(sourcePath, '# Initial success')
-    const registered = await harness.app.inject({
-      method: 'POST',
-      url: '/api/registrations/file',
-      headers: harness.headers,
-      payload: { path: sourcePath },
-    })
-    const artifactId = registered.json().results[0].artifactId
+    const { artifactId } = await registerFile(harness, sourcePath)
     const ready = await artifactDetail(harness, artifactId)
-    const successfulThumbnail = ready.thumbnailPath
+    const successfulThumbnail = ready.thumbnailUrl
+    const successfulThumbnailPath = activeThumbnailPath(harness, artifactId)
 
     harness.setRenderFailure(true)
     const partialResponse = await harness.app.inject({
@@ -310,11 +528,12 @@ describe('local API integration', () => {
       url: `/api/artifacts/${artifactId}/refresh`,
       headers: harness.headers,
     })
-    expect(partialResponse.json().outcome).toBe('partial')
+    await waitForRun(harness, partialResponse.json().runId)
     expect(await artifactDetail(harness, artifactId)).toMatchObject({
       status: 'partial',
-      thumbnailPath: successfulThumbnail,
+      thumbnailUrl: expect.any(String),
     })
+    expect(activeThumbnailPath(harness, artifactId)).toBe(successfulThumbnailPath)
 
     harness.setRenderFailure(false)
     await writeFile(sourcePath, 'before\0after')
@@ -323,22 +542,26 @@ describe('local API integration', () => {
       url: `/api/artifacts/${artifactId}/retry`,
       headers: harness.headers,
     })
-    expect(failedResponse.json().outcome).toBe('failed')
+    await waitForRun(harness, failedResponse.json().runId)
     expect(await artifactDetail(harness, artifactId)).toMatchObject({
       status: 'failed',
-      thumbnailPath: successfulThumbnail,
+      thumbnailUrl: expect.any(String),
     })
+    expect(activeThumbnailPath(harness, artifactId)).toBe(successfulThumbnailPath)
 
     await rm(sourcePath)
-    await harness.app.inject({
+    const rebuilt = await harness.app.inject({
       method: 'POST',
       url: `/api/artifacts/${artifactId}/rebuild`,
       headers: harness.headers,
     })
+    await waitForRun(harness, rebuilt.json().runId)
     expect(await artifactDetail(harness, artifactId)).toMatchObject({
       status: 'missing',
-      thumbnailPath: successfulThumbnail,
+      thumbnailUrl: expect.any(String),
     })
+    expect(activeThumbnailPath(harness, artifactId)).toBe(successfulThumbnailPath)
+    expect(successfulThumbnail).toEqual(expect.any(String))
 
     await harness.close()
   })
@@ -349,13 +572,7 @@ describe('local API integration', () => {
     const secondPath = join(harness.sourceDirectory, 'second.md')
     await writeFile(firstPath, '# First searchable')
     await writeFile(secondPath, '# Second searchable')
-    const registered = await harness.app.inject({
-      method: 'POST',
-      url: '/api/registrations/file',
-      headers: harness.headers,
-      payload: { path: firstPath },
-    })
-    const artifactId = registered.json().results[0].artifactId
+    const { artifactId } = await registerFile(harness, firstPath)
 
     const relinked = await harness.app.inject({
       method: 'POST',
@@ -382,8 +599,8 @@ describe('local API integration', () => {
         url: `/api/artifacts/${artifactId}/${operation}`,
         headers: harness.headers,
       })
-      expect(response.statusCode).toBe(200)
-      expect(response.json().outcome).toBe('completed')
+      expect(response.statusCode).toBe(202)
+      await waitForRun(harness, response.json().runId)
     }
     expect((await artifactDetail(harness, artifactId)).generation).toBe(4)
 
@@ -421,7 +638,12 @@ function expectCursorStale(response: Awaited<ReturnType<ReturnType<typeof buildA
   })
 }
 
-async function makeHarness() {
+async function makeHarness(
+  options: {
+    beforeRender?: () => Promise<void>
+    beforeEnumeration?: () => Promise<void>
+  } = {},
+) {
   const root = await mkdtemp(join(tmpdir(), 'artifact-gallery-api-'))
   temporaryDirectories.push(root)
   const sourceDirectory = join(root, 'sources')
@@ -430,12 +652,22 @@ async function makeHarness() {
   await mkdir(thumbnailDirectory)
   const database = openDatabase({ filename: join(root, 'gallery.sqlite') })
   const pathPolicy = await PathPolicy.create([sourceDirectory])
+  const routePathPolicy = {
+    authorizeFile: pathPolicy.authorizeFile.bind(pathPolicy),
+    enumerateFolder: async (sourcePath: string) => {
+      await options.beforeEnumeration?.()
+      return pathPolicy.enumerateFolder(sourcePath)
+    },
+  }
+  const derivativePathPolicy = await PathPolicy.create([thumbnailDirectory])
+  const backgroundQueue = new BackgroundQueue({ concurrency: 2, capacity: 64 })
   let renderFailure = false
   const processor = new ArtifactProcessor({
     database,
     pathPolicy,
     htmlRenderer: {
       render: async () => {
+        await options.beforeRender?.()
         if (renderFailure) {
           throw Object.assign(new Error('browser details must stay private'), {
             code: 'HTML_RENDER_FAILED',
@@ -449,7 +681,14 @@ async function makeHarness() {
       optimize: async ({ bytes, width, height }) => ({ bytes, width, height, quality: 80 }),
     },
   })
-  const app = buildApp({ database, pathPolicy, processor, thumbnailDirectory })
+  const app = buildApp({
+    database,
+    pathPolicy: routePathPolicy,
+    derivativePathPolicy,
+    processor,
+    thumbnailDirectory,
+    backgroundQueue,
+  })
   const headers = { 'x-artifact-gallery-token': app.sessionToken }
 
   return {
@@ -458,6 +697,9 @@ async function makeHarness() {
     headers,
     root,
     sourceDirectory,
+    thumbnailDirectory,
+    processor,
+    backgroundQueue,
     setRenderFailure: (value: boolean) => {
       renderFailure = value
     },
@@ -476,6 +718,69 @@ async function artifactDetail(harness: Awaited<ReturnType<typeof makeHarness>>, 
   })
   expect(response.statusCode).toBe(200)
   return response.json()
+}
+
+async function registerFile(
+  harness: Awaited<ReturnType<typeof makeHarness>>,
+  sourcePath: string,
+): Promise<{ runId: number; artifactId: number }> {
+  const response = await harness.app.inject({
+    method: 'POST',
+    url: '/api/registrations/file',
+    headers: harness.headers,
+    payload: { path: sourcePath },
+  })
+  expect(response.statusCode).toBe(202)
+  const runId = response.json().runId as number
+  const run = await waitForRun(harness, runId)
+  const artifactId = run.items[0]?.artifactId
+  expect(artifactId).toEqual(expect.any(Number))
+  if (typeof artifactId !== 'number') throw new Error('Registration did not attach an artifact.')
+  return { runId, artifactId }
+}
+
+async function waitForRun(
+  harness: Awaited<ReturnType<typeof makeHarness>>,
+  runId: number,
+): Promise<{
+  status: string
+  items: Array<{
+    artifactId?: number | null
+    [key: string]: unknown
+  }>
+  [key: string]: unknown
+}> {
+  await harness.backgroundQueue.onIdle()
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    const response = await harness.app.inject({
+      method: 'GET',
+      url: `/api/imports/${runId}`,
+      headers: harness.headers,
+    })
+    const run = response.json() as {
+      status: string
+      items: Array<{ artifactId?: number | null; [key: string]: unknown }>
+      [key: string]: unknown
+    }
+    if (['completed', 'failed', 'cancelled', 'interrupted'].includes(run.status)) return run
+    await new Promise<void>((resolve) => setImmediate(resolve))
+  }
+  throw new Error(`Import run ${runId} did not become terminal.`)
+}
+
+function activeThumbnailPath(
+  harness: Awaited<ReturnType<typeof makeHarness>>,
+  artifactId: number,
+): string {
+  return harness.database
+    .prepare(
+      `SELECT artifact_generation.thumbnail_path
+       FROM artifact
+       JOIN artifact_generation ON artifact_generation.id = artifact.active_generation_id
+       WHERE artifact.id = ?`,
+    )
+    .pluck()
+    .get(artifactId) as string
 }
 
 function renderedPreview() {
