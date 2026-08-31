@@ -132,7 +132,7 @@ Tests       13 passed (13)
 
 ## Commit hash
 
-`PENDING`
+`346f4d11c511c79a948574b9362121dd342d1ca7`
 
 ## Concerns
 
