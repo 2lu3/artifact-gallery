@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { openDatabase } from '../db/database.js'
+import { MarkdownRenderer } from '../rendering/markdown-renderer.js'
 import { ImportRepository } from '../repositories/import-repository.js'
 import { PathPolicy } from '../security/path-policy.js'
 import { ArtifactProcessor } from './artifact-processor.js'
@@ -102,6 +103,47 @@ describe('ImportWorker', () => {
     await worker.close()
   })
 
+  it('rejects a synchronous processor result returned after the absolute deadline', async () => {
+    const results: ArtifactProcessResult[] = []
+    const failures: unknown[] = []
+    const worker = new ImportWorker({
+      processor: processorWith(async () => {
+        const busyUntil = performance.now() + 45
+        while (performance.now() < busyUntil) {
+          // Simulate CPU work that prevents the event-loop timeout from firing.
+        }
+        return RESULT
+      }),
+      attemptTimeoutMs: 20,
+    })
+    const startedAt = performance.now()
+
+    expect(
+      worker.enqueue(
+        'register',
+        { sourcePath: '/cpu-bound.md' },
+        {
+          onResult: (result) => {
+            results.push(result)
+          },
+          onError: (error) => {
+            failures.push(error)
+          },
+        },
+      ),
+    ).toBe(true)
+    await worker.onIdle()
+    const elapsedMs = performance.now() - startedAt
+
+    expect(results).toEqual([])
+    expect(failures).toEqual([
+      expect.objectContaining({ code: 'TIMEOUT', stage: 'inspect' }),
+    ])
+    expect(elapsedMs).toBeGreaterThanOrEqual(20)
+    expect(elapsedMs).toBeLessThan(200)
+    await worker.close()
+  })
+
   it('turns a real SQLite/filesystem processor deadline into a durable terminal result', async () => {
     const root = await mkdtemp(join(tmpdir(), 'artifact-gallery-worker-'))
     temporaryDirectories.push(root)
@@ -114,6 +156,7 @@ describe('ImportWorker', () => {
     const processor = new ArtifactProcessor({
       database,
       pathPolicy,
+      markdownRenderer: new MarkdownRenderer(),
       htmlRenderer: {
         render: (request) =>
           new Promise((_resolve, reject) => {
@@ -157,6 +200,75 @@ describe('ImportWorker', () => {
     ])
     expect(imports.getRun(run.id).status).toBe('failed')
     expect(imports.getItem(run.itemIds[0]).status).toBe('failed')
+    await worker.close()
+    database.close()
+  })
+
+  it('terminally cancels a held render when durable cancellation precedes the worker deadline', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'artifact-gallery-worker-cancel-timeout-'))
+    temporaryDirectories.push(root)
+    const sourcePath = join(root, 'held.md')
+    const thumbnailDirectory = join(root, 'derived')
+    await mkdir(thumbnailDirectory)
+    await writeFile(sourcePath, '# Held render')
+    const database = openDatabase({ filename: join(root, 'gallery.sqlite') })
+    const pathPolicy = await PathPolicy.create([root])
+    let markRenderStarted!: () => void
+    const renderStarted = new Promise<void>((resolve) => {
+      markRenderStarted = resolve
+    })
+    const processor = new ArtifactProcessor({
+      database,
+      pathPolicy,
+      markdownRenderer: new MarkdownRenderer(),
+      htmlRenderer: {
+        render: (request) => {
+          markRenderStarted()
+          return new Promise((_resolve, reject) => {
+            request.signal?.addEventListener(
+              'abort',
+              () => reject(request.signal?.reason),
+              { once: true },
+            )
+          })
+        },
+      },
+      thumbnailDirectory,
+    })
+    const imports = new ImportRepository(database)
+    const run = imports.createRun([sourcePath])
+    const results: ArtifactProcessResult[] = []
+    const failures: unknown[] = []
+    const worker = new ImportWorker({ processor, attemptTimeoutMs: 50 })
+
+    worker.enqueue(
+      'register',
+      { sourcePath, runId: run.id, itemId: run.itemIds[0] },
+      {
+        onResult: (result) => {
+          results.push(result)
+        },
+        onError: (error) => {
+          failures.push(error)
+        },
+      },
+    )
+    await renderStarted
+    imports.requestCancellation(run.id, new Date().toISOString())
+    await worker.onIdle()
+
+    expect(failures).toEqual([])
+    expect(results).toEqual([
+      expect.objectContaining({
+        outcome: 'cancelled',
+        errors: [
+          expect.objectContaining({ code: 'TIMEOUT', stage: 'render' }),
+          expect.objectContaining({ code: 'CANCELLED', stage: 'render' }),
+        ],
+      }),
+    ])
+    expect(imports.getRun(run.id).status).toBe('cancelled')
+    expect(imports.getItem(run.itemIds[0]).status).toBe('cancelled')
     await worker.close()
     database.close()
   })

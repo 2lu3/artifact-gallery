@@ -329,6 +329,57 @@ describe('ArtifactProcessor staged pipeline', () => {
     harness.database.close()
   })
 
+  it('keeps TIMEOUT diagnostics but terminally cancels when cancellation wins during a held render', async () => {
+    let markRenderStarted!: () => void
+    const renderStarted = new Promise<void>((resolve) => {
+      markRenderStarted = resolve
+    })
+    const harness = await makeHarness({
+      render: async (request) => {
+        markRenderStarted()
+        return new Promise((resolve, reject) => {
+          request.signal?.addEventListener(
+            'abort',
+            () => reject(request.signal?.reason),
+            { once: true },
+          )
+        })
+      },
+    })
+    await writeFile(harness.sourcePath, '# Cancelled before deadline')
+    const imports = new ImportRepository(harness.database)
+    const run = imports.createRun([harness.sourcePath])
+    const deadline = new AbortController()
+    const processing = harness.processor.register({
+      sourcePath: harness.sourcePath,
+      runId: run.id,
+      itemId: run.itemIds[0],
+      signal: deadline.signal,
+    })
+
+    await renderStarted
+    imports.requestCancellation(run.id, NOW)
+    deadline.abort(new ArtifactProcessingError('TIMEOUT', 'render'))
+    const result = await processing
+
+    expect(result).toMatchObject({
+      outcome: 'cancelled',
+      errors: [
+        expect.objectContaining({ code: 'TIMEOUT', stage: 'render' }),
+        expect.objectContaining({ code: 'CANCELLED', stage: 'render' }),
+      ],
+    })
+    expect(imports.getItem(run.itemIds[0]).status).toBe('cancelled')
+    expect(imports.getRun(run.id).status).toBe('cancelled')
+    expect(
+      harness.database
+        .prepare('SELECT job_status FROM artifact_generation WHERE id = ?')
+        .pluck()
+        .get(result.generationId),
+    ).toBe('interrupted')
+    harness.database.close()
+  })
+
   it('records cancellation after thumbnail optimization before activating the new generation', async () => {
     const harness = await makeHarness()
     await writeFile(harness.sourcePath, '# Previous thumbnail')
@@ -396,6 +447,98 @@ describe('ArtifactProcessor staged pipeline', () => {
     ])
     expect(imports.getItem(run.itemIds[0]).status).toBe('cancelled')
     expect(imports.getRun(run.id).status).toBe('cancelled')
+    harness.database.close()
+  })
+
+  it('rolls back generation activation when synchronous commit work crosses the absolute deadline', async () => {
+    const harness = await makeHarness()
+    await writeFile(harness.sourcePath, '# Previous active generation')
+    const first = await harness.processor.register({ sourcePath: harness.sourcePath })
+    const artifactId = requireResultNumber(first.artifactId)
+    const oldThumbnail = first.thumbnailPath as string
+    const imports = new ImportRepository(harness.database)
+    const run = imports.createRun([harness.sourcePath])
+    const deadlineProcessor = harness.createProcessor({
+      fileSystem: {
+        ...realFileSystem,
+        rename: (from, to) => {
+          renameSync(from, to)
+          const busyUntil = performance.now() + 35
+          while (performance.now() < busyUntil) {
+            // A synchronous filesystem boundary can delay event-loop timers.
+          }
+        },
+      },
+    })
+
+    const result = await deadlineProcessor.refresh({
+      sourcePath: harness.sourcePath,
+      runId: run.id,
+      itemId: run.itemIds[0],
+      deadlineAt: Date.now() + 20,
+    })
+
+    expect(result).toMatchObject({
+      outcome: 'failed',
+      errors: [expect.objectContaining({ code: 'TIMEOUT', stage: 'commit' })],
+    })
+    expect(activeGenerationId(harness.database, artifactId)).toBe(first.generationId)
+    expect(existsSync(oldThumbnail)).toBe(true)
+    expect(imports.getItem(run.itemIds[0]).status).toBe('failed')
+    expect(imports.getRun(run.id).status).toBe('failed')
+    expect((await readdir(harness.derivedDirectory)).filter((name) => name.includes('.tmp'))).toEqual([])
+    harness.database.close()
+  })
+
+  it('compensates activation when the SQLite transaction call returns after the deadline', async () => {
+    const harness = await makeHarness()
+    await writeFile(harness.sourcePath, '# Previous committed generation')
+    const first = await harness.processor.register({ sourcePath: harness.sourcePath })
+    const artifactId = requireResultNumber(first.artifactId)
+    const oldThumbnail = first.thumbnailPath as string
+    const imports = new ImportRepository(harness.database)
+    const run = imports.createRun([harness.sourcePath])
+    let delayTransactionReturn = false
+    const originalTransaction = harness.database.transaction.bind(harness.database)
+    harness.database.transaction = ((operation: (...parameters: never[]) => unknown) => {
+      const transaction = originalTransaction(operation)
+      return (...parameters: never[]) => {
+        const result = transaction(...parameters)
+        if (delayTransactionReturn && !harness.database.inTransaction) {
+          delayTransactionReturn = false
+          const busyUntil = performance.now() + 35
+          while (performance.now() < busyUntil) {
+            // Model a synchronous SQLite COMMIT returning after the absolute deadline.
+          }
+        }
+        return result
+      }
+    }) as typeof harness.database.transaction
+    const processor = harness.createProcessor({
+      fileSystem: {
+        ...realFileSystem,
+        rename: (from, to) => {
+          renameSync(from, to)
+          delayTransactionReturn = true
+        },
+      },
+    })
+
+    const result = await processor.refresh({
+      sourcePath: harness.sourcePath,
+      runId: run.id,
+      itemId: run.itemIds[0],
+      deadlineAt: Date.now() + 20,
+    })
+
+    expect(result).toMatchObject({
+      outcome: 'failed',
+      errors: [expect.objectContaining({ code: 'TIMEOUT', stage: 'commit' })],
+    })
+    expect(activeGenerationId(harness.database, artifactId)).toBe(first.generationId)
+    expect(existsSync(oldThumbnail)).toBe(true)
+    expect(imports.getItem(run.itemIds[0]).status).toBe('failed')
+    expect(imports.getRun(run.id).status).toBe('failed')
     harness.database.close()
   })
 

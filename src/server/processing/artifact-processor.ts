@@ -4,7 +4,6 @@ import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
 
 import type Database from 'better-sqlite3'
-import { parse as parseHtml, type DefaultTreeAdapterTypes } from 'parse5'
 
 import {
   ArtifactProcessingError,
@@ -34,14 +33,51 @@ import {
   WebpThumbnailOptimizer,
   type ThumbnailOptimizer,
 } from './thumbnail-optimizer.js'
+import {
+  extractHtmlSource,
+  extractMarkdownResult,
+  type SourceExtraction,
+} from './source-extraction.js'
+import { extractSourceInWorker } from './source-extractor.js'
 
 const MAX_SOURCE_BYTES = 10 * 1024 * 1024
-const EXTRACTOR_VERSION = 'commonmark-safe-1'
 
 type ActiveGeneration = {
   readonly extractedText: string | null
   readonly extractorVersion: string | null
   readonly thumbnailPath: string | null
+}
+
+interface CommitSnapshot {
+  readonly artifact: {
+    readonly active_generation_id: number | null
+    readonly derived_title: string | null
+    readonly updated_at: string
+  }
+  readonly generation: {
+    readonly job_status: string
+    readonly content_status: string
+    readonly render_status: string
+    readonly index_status: string
+    readonly extracted_text: string | null
+    readonly extractor_version: string | null
+    readonly thumbnail_path: string | null
+    readonly previewed_at: string | null
+    readonly completed_at: string | null
+  }
+  readonly visibility: {
+    readonly state: string
+    readonly updated_at: string
+  }
+  readonly item: {
+    readonly status: string
+    readonly error_id: number | null
+    readonly completed_at: string | null
+  }
+  readonly run: {
+    readonly status: string
+    readonly completed_at: string | null
+  }
 }
 
 export interface ArtifactIndexer {
@@ -91,6 +127,13 @@ export interface ArtifactProcessorDependencies {
   readonly markdownRenderer?: {
     render(markdown: string): MarkdownRenderResult
   }
+  readonly sourceExtractor?: {
+    extract(request: {
+      readonly format: ArtifactFormat
+      readonly source: string
+      readonly signal?: AbortSignal
+    }): Promise<SourceExtraction>
+  }
   readonly htmlRenderer: {
     render(request: {
       html: string
@@ -114,6 +157,8 @@ export interface ArtifactProcessRequest {
   readonly runId?: number
   readonly itemId?: number
   readonly signal?: AbortSignal
+  /** Epoch milliseconds. The worker owns this absolute deadline. */
+  readonly deadlineAt?: number
 }
 
 export type ProcessingOutcome = 'completed' | 'partial' | 'failed' | 'cancelled' | 'stale'
@@ -134,13 +179,6 @@ export interface ArtifactProcessResult {
 interface RunContext {
   readonly runId: number
   readonly itemId: number
-}
-
-interface Extraction {
-  readonly html: string
-  readonly text: string
-  readonly documentTitle: string | null
-  readonly extractorVersion: string
 }
 
 class CommitCancellationError extends Error {
@@ -166,7 +204,7 @@ interface MutableAttempt {
   indexStatus: DerivedStatus
   title: string | null
   thumbnailPath: string | null
-  extraction: Extraction | null
+  extraction: SourceExtraction | null
   renderResult: HtmlRenderResult | null
   preparedIndex: PreparedArtifactIndex | null
   errors: ArtifactProcessingError[]
@@ -185,6 +223,7 @@ export class ArtifactProcessor {
   private readonly imports: ImportRepository
   private readonly searchVisibility: SearchVisibilityRepository
   private readonly markdownRenderer: NonNullable<ArtifactProcessorDependencies['markdownRenderer']>
+  private readonly sourceExtractor: NonNullable<ArtifactProcessorDependencies['sourceExtractor']>
   private readonly indexer: ArtifactIndexer
   private readonly optimizer: ThumbnailOptimizer
   private readonly fileSystem: ProcessorFileSystem
@@ -195,6 +234,16 @@ export class ArtifactProcessor {
     this.imports = new ImportRepository(dependencies.database)
     this.searchVisibility = new SearchVisibilityRepository(dependencies.database)
     this.markdownRenderer = dependencies.markdownRenderer ?? new MarkdownRenderer()
+    this.sourceExtractor =
+      dependencies.sourceExtractor ??
+      (dependencies.markdownRenderer
+        ? {
+            extract: async ({ format, source }) =>
+              format === 'markdown'
+                ? extractMarkdownResult(this.markdownRenderer.render(source))
+                : extractHtmlSource(source),
+          }
+        : { extract: extractSourceInWorker })
     this.indexer = dependencies.indexer ?? new SQLiteSearchIndexer(dependencies.database)
     this.optimizer = dependencies.thumbnailOptimizer ?? new WebpThumbnailOptimizer()
     this.fileSystem = dependencies.fileSystem ?? nodeFileSystem
@@ -240,11 +289,13 @@ export class ArtifactProcessor {
     let sourceFormat: ArtifactFormat
     try {
       if (!this.startStage(run, 'inspect')) return this.cancel(run, attempt, 'inspect')
+      this.assertWithinDeadline(request.deadlineAt, 'inspect')
       authorizedFile = await this.waitForAttempt(
         this.dependencies.pathPolicy.authorizeFile(request.sourcePath),
         request.signal,
         'inspect',
       )
+      this.assertWithinDeadline(request.deadlineAt, 'inspect')
       sourceFormat = formatFor(authorizedFile.canonicalPath)
       const artifact = this.artifacts.register({
         sourcePath: authorizedFile.canonicalPath,
@@ -274,8 +325,10 @@ export class ArtifactProcessor {
         renderStatus: 'pending',
         indexStatus: 'pending',
       })
+      this.assertWithinDeadline(request.deadlineAt, 'inspect')
     } catch (error) {
       const mapped = mapProcessingError(error, 'inspect')
+      if (mapped.code === 'TIMEOUT') return this.timeout(run, attempt, 'inspect')
       this.recordError(attempt, mapped)
       this.failItemAndRun(run, attempt)
       return this.result('failed', attempt)
@@ -283,18 +336,26 @@ export class ArtifactProcessor {
 
     if (!this.startStage(run, 'extract')) return this.cancel(run, attempt, 'extract')
     try {
+      this.assertWithinDeadline(request.deadlineAt, 'extract')
       const source = await this.waitForAttempt(
         authorizedFile.read('utf8', MAX_SOURCE_BYTES),
         request.signal,
         'extract',
       )
+      this.assertWithinDeadline(request.deadlineAt, 'extract')
       if (Buffer.byteLength(source, 'utf8') > MAX_SOURCE_BYTES) {
         throw new ArtifactProcessingError('INPUT_TOO_LARGE', 'extract')
       }
-      attempt.extraction =
-        sourceFormat === 'markdown'
-          ? extractMarkdown(this.markdownRenderer.render(source))
-          : extractHtml(source)
+      attempt.extraction = await this.waitForAttempt(
+        this.sourceExtractor.extract({
+          format: sourceFormat,
+          source,
+          signal: request.signal,
+        }),
+        request.signal,
+        'extract',
+      )
+      this.assertWithinDeadline(request.deadlineAt, 'extract')
       attempt.contentStatus = 'ready'
       attempt.title = this.resolveTitle(attempt.artifactId, request.userTitle, attempt.extraction, authorizedFile)
     } catch (error) {
@@ -313,11 +374,13 @@ export class ArtifactProcessor {
     if (!this.startStage(run, 'render')) return this.cancel(run, attempt, 'render')
     if (attempt.extraction) {
       try {
+        this.assertWithinDeadline(request.deadlineAt, 'render')
         attempt.renderResult = await this.dependencies.htmlRenderer.render({
           html: attempt.extraction.html,
           sourcePath: authorizedFile.canonicalPath,
           signal: request.signal,
         })
+        this.assertWithinDeadline(request.deadlineAt, 'render')
         attempt.renderStatus = 'ready'
       } catch (error) {
         const mapped = mapProcessingError(error, 'render', 'HTML_RENDER_FAILED')
@@ -329,6 +392,7 @@ export class ArtifactProcessor {
     if (!this.startStage(run, 'index')) return this.cancel(run, attempt, 'index')
     if (attempt.extraction) {
       try {
+        this.assertWithinDeadline(request.deadlineAt, 'index')
         attempt.preparedIndex = await this.waitForAttempt(
           this.indexer.prepare({
             artifactId: attempt.artifactId,
@@ -340,6 +404,7 @@ export class ArtifactProcessor {
           'index',
           (prepared) => prepared.rollback(),
         )
+        this.assertWithinDeadline(request.deadlineAt, 'index')
         attempt.indexStatus = 'ready'
       } catch (error) {
         const mapped = mapProcessingError(error, 'index', 'INDEX_UPDATE_FAILED')
@@ -349,15 +414,16 @@ export class ArtifactProcessor {
     }
 
     if (!this.startStage(run, 'commit')) return this.cancel(run, attempt, 'commit')
-    return this.commit(run, attempt, authorizedFile, request.signal)
+    return this.commit(run, attempt, authorizedFile, request)
   }
 
   private async commit(
     run: RunContext,
     attempt: MutableAttempt,
     authorizedFile: AuthorizedFile,
-    signal?: AbortSignal,
+    request: ArtifactProcessRequest,
   ): Promise<ArtifactProcessResult> {
+    const { deadlineAt, signal } = request
     const artifactId = requireAttemptNumber(attempt.artifactId, 'artifact id')
     const generationId = requireAttemptNumber(attempt.generationId, 'generation id')
     const generation = requireAttemptNumber(attempt.generation, 'generation counter')
@@ -367,6 +433,7 @@ export class ArtifactProcessor {
     let renamed = false
 
     try {
+      this.assertWithinDeadline(deadlineAt, 'commit')
       if (attempt.renderResult) {
         const optimized = await this.waitForAttempt(
           this.optimizer.optimize({
@@ -378,6 +445,7 @@ export class ArtifactProcessor {
           signal,
           'commit',
         )
+        this.assertWithinDeadline(deadlineAt, 'commit')
         if (optimized.bytes.byteLength > MAX_THUMBNAIL_BYTES) {
           throw new ThumbnailOptimizationError()
         }
@@ -389,6 +457,7 @@ export class ArtifactProcessor {
           signal,
           'commit',
         )
+        this.assertWithinDeadline(deadlineAt, 'commit')
         const base = `artifact-${artifactId}-generation-${generation}.webp`
         finalPath = join(this.dependencies.thumbnailDirectory, base)
         temporaryPath = join(
@@ -400,6 +469,7 @@ export class ArtifactProcessor {
           signal,
           'commit',
         )
+        this.assertWithinDeadline(deadlineAt, 'commit')
       }
 
       if (this.isCancellationRequested(run.runId)) {
@@ -413,7 +483,14 @@ export class ArtifactProcessor {
         attempt.extraction?.extractorVersion ?? active?.extractorVersion ?? null
       const thumbnailPath = finalPath ?? active?.thumbnailPath ?? null
       const completedAt = this.now()
+      this.assertWithinDeadline(deadlineAt, 'commit')
+      const commitSnapshot = this.captureCommitSnapshot(
+        artifactId,
+        generationId,
+        run,
+      )
       const transaction = this.dependencies.database.transaction(() => {
+        this.assertWithinDeadline(deadlineAt, 'commit')
         this.artifacts.commitGeneration({
           artifactId,
           generationId,
@@ -427,9 +504,11 @@ export class ArtifactProcessor {
           previewedAt: attempt.renderResult ? completedAt : null,
           completedAt,
         })
+        this.assertWithinDeadline(deadlineAt, 'commit')
         this.dependencies.database
           .prepare('UPDATE artifact SET derived_title = ?, updated_at = ? WHERE id = ?')
           .run(attempt.title ?? basename(authorizedFile.canonicalPath), completedAt, artifactId)
+        this.assertWithinDeadline(deadlineAt, 'commit')
         if (cleanSuccess) {
           this.dependencies.database
             .prepare('DELETE FROM artifact_error WHERE artifact_id = ?')
@@ -459,10 +538,12 @@ export class ArtifactProcessor {
         } catch (error) {
           throw new IndexCommitError(error)
         }
+        this.assertWithinDeadline(deadlineAt, 'commit')
         if (temporaryPath && finalPath) {
           this.fileSystem.rename(temporaryPath, finalPath)
           renamed = true
         }
+        this.assertWithinDeadline(deadlineAt, 'commit')
         if (this.isCancellationRequested(run.runId)) throw new CommitCancellationError()
         if (attempt.errors.length > 0) {
           this.failItemAndRun(run, attempt)
@@ -470,8 +551,13 @@ export class ArtifactProcessor {
           this.imports.completeItem(run.itemId, completedAt)
           this.finishRunIfTerminal(run.runId, completedAt)
         }
+        this.assertWithinDeadline(deadlineAt, 'commit')
       })
       transaction()
+      if (this.deadlineExceeded(deadlineAt)) {
+        this.restoreCommitSnapshot(artifactId, generationId, run, commitSnapshot)
+        throw new ArtifactProcessingError('TIMEOUT', 'commit')
+      }
       attempt.thumbnailPath = thumbnailPath
     } catch (error) {
       const indexRecoveryError = await this.recoverPreparedIndex(attempt)
@@ -491,16 +577,16 @@ export class ArtifactProcessor {
               cause: error,
             })
           : mapProcessingError(error, 'commit', 'DERIVED_WRITE_FAILED'))
+      if (mapped.code === 'TIMEOUT') {
+        return this.timeout(run, attempt, 'commit', false)
+      }
       attempt.contentStatus = 'failed'
       attempt.renderStatus = 'failed'
       attempt.indexStatus = 'failed'
       this.recordError(attempt, mapped)
       if (attempt.generationId !== null) {
         this.artifacts.setGenerationState(attempt.generationId, {
-          jobStatus:
-            mapped.code === 'STALE_GENERATION' || mapped.code === 'TIMEOUT'
-              ? 'interrupted'
-              : 'idle',
+          jobStatus: mapped.code === 'STALE_GENERATION' ? 'interrupted' : 'idle',
           contentStatus: 'failed',
           renderStatus: 'failed',
           indexStatus: 'failed',
@@ -597,11 +683,17 @@ export class ArtifactProcessor {
     run: RunContext,
     attempt: MutableAttempt,
     stage: ProcessingStage,
+    rollbackPreparedIndex = true,
   ): Promise<ArtifactProcessResult> {
-    const indexRecoveryError = await this.recoverPreparedIndex(attempt)
-    if (indexRecoveryError) this.recordError(attempt, indexRecoveryError)
+    if (rollbackPreparedIndex) {
+      const indexRecoveryError = await this.recoverPreparedIndex(attempt)
+      if (indexRecoveryError) this.recordError(attempt, indexRecoveryError)
+    }
     const error = new ArtifactProcessingError('TIMEOUT', stage)
     this.recordError(attempt, error)
+    if (this.isCancellationRequested(run.runId)) {
+      return this.cancel(run, attempt, stage, false)
+    }
     if (attempt.generationId !== null) {
       this.artifacts.setGenerationState(attempt.generationId, {
         jobStatus: 'interrupted',
@@ -612,6 +704,109 @@ export class ArtifactProcessor {
     }
     this.failItemAndRun(run, attempt)
     return this.result('failed', attempt)
+  }
+
+  private assertWithinDeadline(
+    deadlineAt: number | undefined,
+    stage: ProcessingStage,
+  ): void {
+    if (this.deadlineExceeded(deadlineAt)) {
+      throw new ArtifactProcessingError('TIMEOUT', stage)
+    }
+  }
+
+  private deadlineExceeded(deadlineAt: number | undefined): boolean {
+    return deadlineAt !== undefined && Date.now() >= deadlineAt
+  }
+
+  private captureCommitSnapshot(
+    artifactId: number,
+    generationId: number,
+    run: RunContext,
+  ): CommitSnapshot {
+    const artifact = this.dependencies.database
+      .prepare('SELECT active_generation_id, derived_title, updated_at FROM artifact WHERE id = ?')
+      .get(artifactId) as CommitSnapshot['artifact'] | undefined
+    const generation = this.dependencies.database
+      .prepare(
+        `SELECT job_status, content_status, render_status, index_status,
+                extracted_text, extractor_version, thumbnail_path, previewed_at, completed_at
+         FROM artifact_generation WHERE id = ?`,
+      )
+      .get(generationId) as CommitSnapshot['generation'] | undefined
+    const visibility = this.dependencies.database
+      .prepare(
+        `SELECT state, updated_at FROM artifact_search_visibility
+         WHERE artifact_id = ? AND generation_id = ?`,
+      )
+      .get(artifactId, generationId) as CommitSnapshot['visibility'] | undefined
+    const item = this.dependencies.database
+      .prepare('SELECT status, error_id, completed_at FROM import_item WHERE id = ?')
+      .get(run.itemId) as CommitSnapshot['item'] | undefined
+    const importRun = this.dependencies.database
+      .prepare('SELECT status, completed_at FROM import_run WHERE id = ?')
+      .get(run.runId) as CommitSnapshot['run'] | undefined
+    if (!artifact || !generation || !visibility || !item || !importRun) {
+      throw new Error('Commit state could not be snapshotted.')
+    }
+    return { artifact, generation, visibility, item, run: importRun }
+  }
+
+  private restoreCommitSnapshot(
+    artifactId: number,
+    generationId: number,
+    run: RunContext,
+    snapshot: CommitSnapshot,
+  ): void {
+    this.dependencies.database.transaction(() => {
+      this.dependencies.database
+        .prepare(
+          `UPDATE artifact
+           SET active_generation_id = ?, derived_title = ?, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(
+          snapshot.artifact.active_generation_id,
+          snapshot.artifact.derived_title,
+          snapshot.artifact.updated_at,
+          artifactId,
+        )
+      this.dependencies.database
+        .prepare(
+          `UPDATE artifact_generation
+           SET job_status = ?, content_status = ?, render_status = ?, index_status = ?,
+               extracted_text = ?, extractor_version = ?, thumbnail_path = ?,
+               previewed_at = ?, completed_at = ?
+           WHERE id = ?`,
+        )
+        .run(
+          snapshot.generation.job_status,
+          snapshot.generation.content_status,
+          snapshot.generation.render_status,
+          snapshot.generation.index_status,
+          snapshot.generation.extracted_text,
+          snapshot.generation.extractor_version,
+          snapshot.generation.thumbnail_path,
+          snapshot.generation.previewed_at,
+          snapshot.generation.completed_at,
+          generationId,
+        )
+      this.dependencies.database
+        .prepare(
+          `UPDATE artifact_search_visibility SET state = ?, updated_at = ?
+           WHERE artifact_id = ? AND generation_id = ?`,
+        )
+        .run(snapshot.visibility.state, snapshot.visibility.updated_at, artifactId, generationId)
+      this.dependencies.database
+        .prepare(
+          `UPDATE import_item SET status = ?, error_id = ?, completed_at = ?
+           WHERE id = ?`,
+        )
+        .run(snapshot.item.status, snapshot.item.error_id, snapshot.item.completed_at, run.itemId)
+      this.dependencies.database
+        .prepare('UPDATE import_run SET status = ?, completed_at = ? WHERE id = ?')
+        .run(snapshot.run.status, snapshot.run.completed_at, run.runId)
+    })()
   }
 
   private waitForAttempt<T>(
@@ -706,7 +901,7 @@ export class ArtifactProcessor {
   private resolveTitle(
     artifactId: number,
     requestedUserTitle: string | null | undefined,
-    extraction: Extraction,
+    extraction: SourceExtraction,
     authorizedFile: AuthorizedFile,
   ): string {
     const persisted = this.dependencies.database
@@ -905,47 +1100,6 @@ export class ArtifactProcessor {
       thumbnailPath: attempt.thumbnailPath,
       errors: attempt.errors.map(toPublicProcessingError),
     }
-  }
-}
-
-function extractMarkdown(result: MarkdownRenderResult): Extraction {
-  return {
-    html: result.html,
-    text: result.text,
-    documentTitle: result.title,
-    extractorVersion: EXTRACTOR_VERSION,
-  }
-}
-
-function extractHtml(html: string): Extraction {
-  const document = parseHtml(html)
-  let title: string | null = null
-  const text: string[] = []
-  const visit = (node: DefaultTreeAdapterTypes.Node, ignored: boolean): void => {
-    const elementName = 'tagName' in node ? node.tagName : null
-    const ignoreChildren = ignored || elementName === 'script' || elementName === 'style'
-    if (!ignoreChildren && node.nodeName === '#text' && 'value' in node) {
-      const value = node.value.replace(/\s+/gu, ' ').trim()
-      if (value) text.push(value)
-    }
-    if (title === null && elementName === 'title' && 'childNodes' in node) {
-      title = node.childNodes
-        .filter((child): child is DefaultTreeAdapterTypes.TextNode => child.nodeName === '#text')
-        .map((child) => child.value)
-        .join('')
-        .trim()
-    }
-    if ('childNodes' in node) {
-      for (const child of node.childNodes) visit(child, ignoreChildren || elementName === 'title')
-    }
-    if (elementName === 'template' && 'content' in node) visit(node.content, ignoreChildren)
-  }
-  visit(document, false)
-  return {
-    html,
-    text: text.join('\n'),
-    documentTitle: normalizeTitle(title),
-    extractorVersion: 'html-safe-text-1',
   }
 }
 

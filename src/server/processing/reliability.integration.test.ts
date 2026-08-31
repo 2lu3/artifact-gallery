@@ -169,41 +169,52 @@ describe('production worker with real Chromium', () => {
       const worker = new ImportWorker({ processor, concurrency: 2, capacity: 4 })
       const imports = new ImportRepository(database)
       const runs = sourcePaths.map((sourcePath) => imports.createRun([sourcePath]))
-      runs.forEach((run, index) => {
-        worker.enqueue('register', {
-          sourcePath: sourcePaths[index] as string,
-          runId: run.id,
-          itemId: run.itemIds[0],
+      const rssSampler = startPeriodicPeakSampler(
+        () => chromiumDescendantRssBytes(process.pid),
+        100,
+      )
+      let rssMeasurement!: Awaited<ReturnType<typeof rssSampler.stop>>
+      let cancelLatencyMs = 0
+      try {
+        runs.forEach((run, index) => {
+          worker.enqueue('register', {
+            sourcePath: sourcePaths[index] as string,
+            runId: run.id,
+            itemId: run.itemIds[0],
+          })
         })
-      })
 
-      await firstTwoStarted
-      expect(launchedBrowsers).toHaveLength(1)
-      expect(launchedBrowsers[0]?.contexts()).toHaveLength(2)
-      expect(imports.getItem(runs[2]!.itemIds[0]).status).toBe('queued')
-      const peakChromiumRssBytes = await chromiumDescendantRssBytes(process.pid)
-      expect(peakChromiumRssBytes).toBeGreaterThan(0)
-      expect(peakChromiumRssBytes).toBeLessThan(4 * 1024 * 1024 * 1024)
+        await firstTwoStarted
+        expect(launchedBrowsers).toHaveLength(1)
+        expect(launchedBrowsers[0]?.contexts()).toHaveLength(2)
+        expect(imports.getItem(runs[2]!.itemIds[0]).status).toBe('queued')
 
-      const cancelStartedAt = performance.now()
-      imports.requestCancellation(runs[0]!.id, new Date().toISOString())
-      releases.get(1)?.()
-      await waitForTerminal(imports, runs[0]!.id)
-      const cancelLatencyMs = performance.now() - cancelStartedAt
-      expect(imports.getRun(runs[0]!.id).status).toBe('cancelled')
-      expect(cancelLatencyMs).toBeLessThan(1_500)
+        const cancelStartedAt = performance.now()
+        imports.requestCancellation(runs[0]!.id, new Date().toISOString())
+        releases.get(1)?.()
+        await waitForTerminal(imports, runs[0]!.id)
+        cancelLatencyMs = performance.now() - cancelStartedAt
+        expect(imports.getRun(runs[0]!.id).status).toBe('cancelled')
+        expect(cancelLatencyMs).toBeLessThan(1_500)
 
-      releases.get(2)?.()
-      await thirdStarted
-      releases.get(3)?.()
-      await worker.onIdle()
+        releases.get(2)?.()
+        await thirdStarted
+        releases.get(3)?.()
+        await worker.onIdle()
+      } finally {
+        rssMeasurement = await rssSampler.stop()
+      }
+      expect(rssMeasurement.sampleCount).toBeGreaterThan(1)
+      expect(rssMeasurement.peakBytes).toBe(Math.max(...rssMeasurement.samples))
+      expect(rssMeasurement.peakBytes).toBeGreaterThan(0)
+      expect(rssMeasurement.peakBytes).toBeLessThan(4 * 1024 * 1024 * 1024)
       expect(peakContexts).toBe(2)
       expect(launchedBrowsers).toHaveLength(1)
       expect(launchedBrowsers[0]?.contexts()).toHaveLength(0)
       expect(imports.getRun(runs[1]!.id).status).toBe('completed')
       expect(imports.getRun(runs[2]!.id).status).toBe('completed')
       console.info(
-        `task9-reliability chromiumPeakRssMiB=${(peakChromiumRssBytes / 1024 / 1024).toFixed(1)} cancelLatencyMs=${cancelLatencyMs.toFixed(1)}`,
+        `task9-reliability chromiumPeakRssMiB=${(rssMeasurement.peakBytes / 1024 / 1024).toFixed(1)} rssSamples=${rssMeasurement.sampleCount} cancelLatencyMs=${cancelLatencyMs.toFixed(1)}`,
       )
 
       await worker.close()
@@ -350,4 +361,47 @@ async function chromiumDescendantRssBytes(parentPid: number): Promise<number> {
       )
       .reduce((total, row) => total + row.rssKiB, 0) * 1024
   )
+}
+
+function startPeriodicPeakSampler(
+  sample: () => Promise<number>,
+  intervalMs: number,
+): {
+  stop(): Promise<{ samples: readonly number[]; sampleCount: number; peakBytes: number }>
+} {
+  const samples: number[] = []
+  let stopped = false
+  let failure: unknown
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let sampling: Promise<void> | undefined
+  const scheduleSample = () => {
+    sampling = sample()
+      .then((bytes) => {
+        samples.push(bytes)
+      })
+      .catch((error: unknown) => {
+        failure ??= error
+      })
+      .finally(() => {
+        sampling = undefined
+        if (!stopped) timer = setTimeout(scheduleSample, intervalMs)
+      })
+  }
+  scheduleSample()
+  return {
+    stop: async () => {
+      if (!stopped) {
+        stopped = true
+        if (timer) clearTimeout(timer)
+      }
+      await sampling
+      if (failure) throw failure
+      samples.push(await sample())
+      return {
+        samples,
+        sampleCount: samples.length,
+        peakBytes: Math.max(...samples),
+      }
+    },
+  }
 }

@@ -101,6 +101,7 @@ export class ImportWorker {
     operation: ArtifactProcessOperation,
     request: ArtifactProcessRequest,
   ): Promise<ArtifactProcessResult> {
+    const deadlineAt = Date.now() + this.attemptTimeoutMs
     const abortController = new AbortController()
     const timeoutError = new ArtifactProcessingError('TIMEOUT', 'inspect')
     const abortGraceMs = Math.min(100, Math.max(1, Math.floor(this.attemptTimeoutMs / 2)))
@@ -108,17 +109,20 @@ export class ImportWorker {
       () => abortController.abort(timeoutError),
       this.attemptTimeoutMs - abortGraceMs,
     )
-    const boundedRequest = { ...request, signal: abortController.signal }
-    const operationPromise = this.options.processor[operation](boundedRequest)
-    operationPromise.catch(() => undefined)
     let hardDeadlineTimer: ReturnType<typeof setTimeout> | undefined
+    const hardDeadline = new Promise<never>((_resolve, reject) => {
+      hardDeadlineTimer = setTimeout(() => reject(timeoutError), this.attemptTimeoutMs)
+    })
+    const boundedRequest = { ...request, signal: abortController.signal, deadlineAt }
+    const operationPromise = Promise.resolve()
+      .then(() => this.options.processor[operation](boundedRequest))
+      .then((result) => {
+        if (Date.now() >= deadlineAt) throw timeoutError
+        return result
+      })
+    operationPromise.catch(() => undefined)
     try {
-      return await Promise.race([
-        operationPromise,
-        new Promise<never>((_resolve, reject) => {
-          hardDeadlineTimer = setTimeout(() => reject(timeoutError), this.attemptTimeoutMs)
-        }),
-      ])
+      return await Promise.race([operationPromise, hardDeadline])
     } finally {
       clearTimeout(abortTimer)
       if (hardDeadlineTimer) clearTimeout(hardDeadlineTimer)

@@ -5,6 +5,10 @@
 Implemented the production reliability boundary described by the Task 9 brief:
 
 - `ImportWorker` now owns the bounded queue, per-source serialization, processor dispatch, the 30-second hard attempt deadline, graceful accept-stop, and drain.
+- Every attempt carries one absolute epoch deadline. Timers are armed before processor dispatch, results returned after the deadline are rejected, and every production stage checks elapsed time after synchronous work.
+- Production Markdown parse/sanitize/text extraction and HTML parse/text extraction run in a terminate-capable worker thread. SQLite, filesystem commit, and Chromium ownership remain in the main processor so no database transaction is killed in flight.
+- Commit uses pre/post elapsed guards inside the short SQLite transaction. If the SQLite transaction wrapper itself returns after the deadline, a compensating transaction restores the previous active generation, staged generation state, search visibility, and run/item state before terminal `TIMEOUT` persistence.
+- A durable cancellation request wins the terminal summary over a simultaneous stage timeout: `TIMEOUT` remains available as diagnostics, while result, item, and run finish as `cancelled` with a `CANCELLED` summary.
 - The API depends on the worker rather than directly owning `ArtifactProcessor` or `BackgroundQueue`.
 - Production rendering and thumbnail re-encoding share one Chromium process and one global two-context limiter.
 - Source HTML/Markdown reads are bounded at 10 MiB before full-file allocation. Existing renderer limits remain 10 MiB per asset and 50 MiB total; processor and API retain the 500 KiB thumbnail ceiling.
@@ -31,14 +35,23 @@ Measured while two real Chromium contexts were blocked concurrently through the 
 
 | Measurement | Observed | Enforced smoke ceiling |
 | --- | ---: | ---: |
-| Chromium descendant peak RSS | 326.3 MiB | 4096 MiB |
-| Running-item cancel latency under two-context load | 32.4 ms | 1500 ms |
+| Chromium descendant peak RSS | 347.7 MiB | 4096 MiB |
+| Chromium descendant RSS samples | 5 | > 1 |
+| Running-item cancel latency under two-context load | 65.6 ms | 1500 ms |
 | Browser processes launched for the three-item load | 1 | 1 |
 | Peak disposable contexts | 2 | 2 |
 
-The RSS ceiling is intentionally generous for the 16 GiB target and avoids an exact, machine-sensitive assertion. The test samples the Chromium descendant process tree with `ps`, sums RSS, and records the observed value. Cancellation is requested while the current render is active; that current noninterruptible asset read is released, the next stage is prevented, and the durable run summary becomes `cancelled`.
+The RSS ceiling is intentionally generous for the 16 GiB target and avoids an exact, machine-sensitive assertion. A single-flight periodic sampler starts before the three-item workload, samples the Chromium descendant process tree with `ps` throughout render and thumbnail encoding, performs a final sample after worker idle, verifies the reported value equals `max(samples)`, and always clears its timer in `finally`. Cancellation is requested while the current render is active; that current noninterruptible asset read is released, the next stage is prevented, and the durable run summary becomes `cancelled`.
 
-Browser disconnect coverage closes the first real browser during one worker item, observes that item fail in isolation, relaunches Chromium, completes the following item, and verifies zero contexts remain. External worker deadline coverage closes a stalled real render context in 329 ms against a 1000 ms assertion.
+Browser disconnect coverage closes the first real browser during one worker item, observes that item fail in isolation, relaunches Chromium, completes the following item, and verifies zero contexts remain.
+
+## Absolute deadline and cancellation corrections
+
+- A generic injected processor that synchronously occupies the event loop past a 20 ms deadline can no longer publish a successful result. The worker rejects it with `TIMEOUT` after the synchronous call returns.
+- The production CPU-heavy extraction path is isolated in a worker thread and is terminated by the attempt abort signal, so Markdown/HTML parsing cannot block the owner event loop through the 30-second boundary.
+- The production processor checks the absolute deadline before and after inspect, source read, extraction, render, index preparation, thumbnail optimization, directory/file writes, index commit, rename, item completion, and the SQLite transaction.
+- A synchronous rename regression that crosses the deadline rolls back SQLite activation, rolls back the prepared index, removes the renamed output, retains the previous thumbnail and active generation, and durably fails the current run with commit-stage `TIMEOUT`.
+- A held-render regression requests durable cancellation first and reaches the worker deadline second. It persists both `TIMEOUT` and `CANCELLED` diagnostics, but returns `outcome: cancelled` and terminally cancels the item/run.
 
 ## RED/GREEN record
 
@@ -54,16 +67,22 @@ Browser disconnect coverage closes the first real browser during one worker item
 | Forced-stage matrix | fixture exited before `READY` | inspect/extract/render/index/commit all pass deterministic kill/restart assertions |
 | Shared re-encoder browser | `renderer.encodeWebp is not a function` | render and thumbnail encode reuse one browser and close every context |
 | Full-suite load order | run 1 stayed active because the harness released run 2's first-arriving callback | per-item deterministic gates remove ordering dependence |
+| Cancel/deadline race | held render finished as failed `TIMEOUT` despite `cancel_requested_at` | diagnostics retain `TIMEOUT`; result/item/run finish `cancelled` |
+| Synchronous CPU deadline | 45 ms busy processor published `completed` after a 20 ms deadline | late result is rejected as `TIMEOUT`; no result callback runs |
+| Commit deadline activation | synchronous rename, or transaction return, crossed the deadline and still activated the generation | transaction guard/compensation restores the prior generation, visibility, thumbnail, and terminal state |
+| CPU extraction ownership | Markdown/HTML parsing occupied the SQLite/renderer owner thread | production extraction runs in a terminate-capable worker thread |
+| RSS peak sampling | one point-in-time sample could miss the workload peak | 5 samples span the workload; reported peak is verified as `max(samples)` |
 
 ## Verification
 
 - `pnpm lint` — PASS
 - `pnpm typecheck` — PASS
 - `pnpm build` — PASS
-- `pnpm test` — PASS, 199/199
+- `pnpm test` — PASS, 206/206
 - `pnpm test:e2e` — PASS, 19/19
 
 ## Concerns
 
 - The RSS smoke measurement uses macOS/Linux `ps` process-tree data and is intentionally not an exact performance benchmark.
-- A non-cooperative dependency is hard-failed by the worker at 30 seconds. Production filesystem, renderer, index preparation, and shared thumbnail encoding all receive cooperative deadline handling so late results cannot activate a generation; synchronous SQLite transaction work remains bounded by the local operations it performs.
+- An arbitrary injected processor that synchronously blocks the owner thread cannot be forcibly preempted safely; its late success is rejected after it returns. The production CPU-heavy extraction path is therefore isolated and terminate-capable, while the SQLite/renderer/fs owner remains stable.
+- SQLite transaction work is deliberately never killed. It is kept to bounded local statements, guarded inside the transaction, and followed by a compensating nonactivation path if the transaction call itself crosses the absolute deadline.
