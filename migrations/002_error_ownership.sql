@@ -1,5 +1,14 @@
 PRAGMA defer_foreign_keys = ON;
 
+DROP TRIGGER IF EXISTS artifact_active_generation_owner_insert;
+DROP TRIGGER IF EXISTS artifact_active_generation_owner_update;
+DROP TRIGGER IF EXISTS artifact_error_generation_owner_insert;
+DROP TRIGGER IF EXISTS artifact_error_generation_owner_update;
+DROP TRIGGER IF EXISTS artifact_warning_generation_owner_insert;
+DROP TRIGGER IF EXISTS artifact_warning_generation_owner_update;
+DROP TRIGGER IF EXISTS import_item_error_owner_insert;
+DROP TRIGGER IF EXISTS import_item_error_owner_update;
+
 CREATE TABLE artifact_error_new (
   id INTEGER PRIMARY KEY,
   artifact_id INTEGER REFERENCES artifact(id) ON DELETE CASCADE,

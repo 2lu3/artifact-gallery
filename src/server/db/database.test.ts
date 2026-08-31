@@ -506,6 +506,182 @@ describe('openDatabase', () => {
     upgraded.close()
   })
 
+  it('upgrades the pre-002 ownership variant without losing rows or ownership checks', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-db-'))
+    temporaryDirectories.push(directory)
+    const filename = join(directory, 'gallery.sqlite')
+    const legacyMigrations = join(directory, 'legacy-migrations')
+    await mkdir(legacyMigrations)
+    await copyFile(
+      resolve(process.cwd(), 'tests/fixtures/migrations/001_error_ownership.sql'),
+      join(legacyMigrations, '001_initial.sql'),
+    )
+    const legacy = openDatabase({ filename, migrationsDirectory: legacyMigrations })
+    legacy.exec(`
+      CREATE TRIGGER artifact_active_generation_owner_insert
+      AFTER INSERT ON artifact BEGIN SELECT 1; END;
+      CREATE TRIGGER artifact_active_generation_owner_update
+      BEFORE UPDATE OF active_generation_id ON artifact BEGIN SELECT 1; END;
+      CREATE TRIGGER artifact_error_generation_owner_insert
+      BEFORE INSERT ON artifact_error BEGIN SELECT 1; END;
+      CREATE TRIGGER artifact_error_generation_owner_update
+      BEFORE UPDATE OF generation_id, artifact_id ON artifact_error BEGIN SELECT 1; END;
+      CREATE TRIGGER artifact_warning_generation_owner_insert
+      BEFORE INSERT ON artifact_warning BEGIN SELECT 1; END;
+      CREATE TRIGGER artifact_warning_generation_owner_update
+      BEFORE UPDATE OF generation_id, artifact_id ON artifact_warning BEGIN SELECT 1; END;
+    `)
+    const now = '2026-08-31T00:00:00.000Z'
+    const artifactId = Number(
+      legacy
+        .prepare(
+          `INSERT INTO artifact
+            (source_path, format, source_status, created_at, updated_at, registered_at, generation_counter)
+           VALUES ('/canonical/pre-002.md', 'markdown', 'available', ?, ?, ?, 1)`,
+        )
+        .run(now, now, now).lastInsertRowid,
+    )
+    const generationId = Number(
+      legacy
+        .prepare(
+          `INSERT INTO artifact_generation
+            (artifact_id, generation, job_status, content_status, render_status, index_status,
+             extracted_text, thumbnail_path, completed_at)
+           VALUES (?, 1, 'idle', 'ready', 'ready', 'ready', 'pre-002 text',
+                   '/derived/pre-002.webp', ?)`,
+        )
+        .run(artifactId, now).lastInsertRowid,
+    )
+    legacy
+      .prepare('UPDATE artifact SET active_generation_id = ? WHERE id = ?')
+      .run(generationId, artifactId)
+    const errorId = Number(
+      legacy
+        .prepare(
+          `INSERT INTO artifact_error
+            (artifact_id, generation_id, code, stage, retryable, user_message, occurred_at)
+           VALUES (?, ?, 'ASSET_BLOCKED', 'render', 0, 'Asset blocked.', ?)`,
+        )
+        .run(artifactId, generationId, now).lastInsertRowid,
+    )
+    legacy
+      .prepare(
+        `INSERT INTO artifact_warning
+          (artifact_id, generation_id, code, detail, occurred_at)
+         VALUES (?, ?, 'PAGE_CLIPPED', 'Preview clipped.', ?)`,
+      )
+      .run(artifactId, generationId, now)
+    const runId = Number(
+      legacy.prepare("INSERT INTO import_run (status) VALUES ('completed')").run().lastInsertRowid,
+    )
+    const itemId = Number(
+      legacy
+        .prepare(
+          `INSERT INTO import_item
+            (run_id, canonical_path, artifact_id, stage, status, error_id, completed_at)
+           VALUES (?, '/canonical/pre-002.md', ?, 'render', 'failed', ?, ?)`,
+        )
+        .run(runId, artifactId, errorId, now).lastInsertRowid,
+    )
+    legacy.close()
+
+    const upgraded = openDatabase({ filename })
+
+    expect(
+      upgraded.prepare('SELECT version FROM schema_migration ORDER BY version').all(),
+    ).toEqual([{ version: '001_initial.sql' }, { version: '002_error_ownership.sql' }])
+    expect(
+      upgraded
+        .prepare(
+          `SELECT artifact.active_generation_id, artifact.generation_counter,
+                  artifact_generation.extracted_text, artifact_generation.thumbnail_path
+           FROM artifact
+           JOIN artifact_generation ON artifact_generation.artifact_id = artifact.id
+           WHERE artifact.id = ?`,
+        )
+        .get(artifactId),
+    ).toEqual({
+      active_generation_id: generationId,
+      generation_counter: 1,
+      extracted_text: 'pre-002 text',
+      thumbnail_path: '/derived/pre-002.webp',
+    })
+    expect(
+      upgraded
+        .prepare(
+          `SELECT artifact_error.generation_id, artifact_warning.generation_id AS warning_generation_id,
+                  import_item.artifact_id, import_item.error_id, import_item.status
+           FROM artifact_error
+           JOIN artifact_warning ON artifact_warning.artifact_id = artifact_error.artifact_id
+           JOIN import_item ON import_item.error_id = artifact_error.id
+           WHERE artifact_error.id = ? AND import_item.id = ?`,
+        )
+        .get(errorId, itemId),
+    ).toEqual({
+      generation_id: generationId,
+      warning_generation_id: generationId,
+      artifact_id: artifactId,
+      error_id: errorId,
+      status: 'failed',
+    })
+
+    const otherArtifactId = Number(
+      upgraded
+        .prepare(
+          `INSERT INTO artifact
+            (source_path, format, source_status, created_at, updated_at, registered_at)
+           VALUES ('/canonical/other.md', 'markdown', 'available', ?, ?, ?)`,
+        )
+        .run(now, now, now).lastInsertRowid,
+    )
+    const otherGenerationId = Number(
+      upgraded
+        .prepare(
+          `INSERT INTO artifact_generation
+            (artifact_id, generation, job_status, content_status, render_status, index_status)
+           VALUES (?, 1, 'idle', 'ready', 'ready', 'ready')`,
+        )
+        .run(otherArtifactId).lastInsertRowid,
+    )
+    expect(() =>
+      upgraded
+        .prepare('UPDATE artifact SET active_generation_id = ? WHERE id = ?')
+        .run(otherGenerationId, artifactId),
+    ).toThrow()
+    expect(() =>
+      upgraded
+        .prepare(
+          `INSERT INTO artifact_error
+            (artifact_id, generation_id, code, stage, retryable, user_message, occurred_at)
+           VALUES (?, ?, 'INTERRUPTED', 'render', 1, 'Interrupted.', ?)`,
+        )
+        .run(artifactId, otherGenerationId, now),
+    ).toThrow()
+    expect(() =>
+      upgraded
+        .prepare(
+          `INSERT INTO artifact_warning
+            (artifact_id, generation_id, code, detail, occurred_at)
+           VALUES (?, ?, 'PAGE_CLIPPED', 'Clipped.', ?)`,
+        )
+        .run(artifactId, otherGenerationId, now),
+    ).toThrow()
+
+    const otherErrorId = Number(
+      upgraded
+        .prepare(
+          `INSERT INTO artifact_error
+            (artifact_id, generation_id, code, stage, retryable, user_message, occurred_at)
+           VALUES (?, ?, 'INTERRUPTED', 'render', 1, 'Interrupted.', ?)`,
+        )
+        .run(otherArtifactId, otherGenerationId, now).lastInsertRowid,
+    )
+    expect(() =>
+      upgraded.prepare('UPDATE import_item SET error_id = ? WHERE id = ?').run(otherErrorId, itemId),
+    ).toThrow()
+    upgraded.close()
+  })
+
   it('deletes an artifact catalog row while preserving unrelated rows', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-db-'))
     temporaryDirectories.push(directory)
