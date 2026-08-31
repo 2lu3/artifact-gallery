@@ -30,12 +30,18 @@ describe('openDatabase', () => {
       )
       .all()
       .map((row) => (row as { name: string }).name)
+      .filter(
+        (name) =>
+          !name.startsWith('artifact_search_fts_') || name === 'artifact_search_fts',
+      )
 
     expect(tables).toEqual([
       'allowed_root',
       'artifact',
       'artifact_error',
       'artifact_generation',
+      'artifact_search_document',
+      'artifact_search_fts',
       'artifact_search_visibility',
       'artifact_warning',
       'import_item',
@@ -96,6 +102,20 @@ describe('openDatabase', () => {
       'state',
       'updated_at',
     ])
+    expect(columnNames('artifact_search_document')).toEqual([
+      'generation_id',
+      'artifact_id',
+      'generation',
+      'user_title_normalized',
+      'derived_title_normalized',
+      'body_normalized',
+      'path_segments_normalized',
+    ])
+    const searchIndexSql = database
+      .prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'artifact_search_fts'")
+      .pluck()
+      .get() as string
+    expect(searchIndexSql).toContain("tokenize='trigram'")
     expect(columnNames('artifact_warning')).toEqual([
       'id',
       'artifact_id',
@@ -480,6 +500,7 @@ describe('openDatabase', () => {
       { version: '001_initial.sql' },
       { version: '002_error_ownership.sql' },
       { version: '003_search_visibility.sql' },
+      { version: '004_search.sql' },
     ])
     expect(
       upgraded
@@ -513,6 +534,25 @@ describe('openDatabase', () => {
         )
         .get(generationId),
     ).toEqual({ artifact_id: artifactId, generation_id: generationId, state: 'visible' })
+    expect(
+      upgraded
+        .prepare(
+          `SELECT body_normalized, path_segments_normalized
+           FROM artifact_search_document WHERE generation_id = ?`,
+        )
+        .get(generationId),
+    ).toEqual({
+      body_normalized: 'legacy text',
+      path_segments_normalized: 'canonical legacy md',
+    })
+    expect(
+      upgraded
+        .prepare(
+          `SELECT artifact_id, generation FROM artifact_search_fts
+           WHERE artifact_search_fts MATCH '"legacy"'`,
+        )
+        .get(),
+    ).toEqual({ artifact_id: artifactId, generation: 1 })
     expect(() =>
       upgraded
         .prepare(
@@ -612,6 +652,7 @@ describe('openDatabase', () => {
       { version: '001_initial.sql' },
       { version: '002_error_ownership.sql' },
       { version: '003_search_visibility.sql' },
+      { version: '004_search.sql' },
     ])
     expect(
       upgraded

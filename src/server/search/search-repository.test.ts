@@ -1,0 +1,269 @@
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { basename, join } from 'node:path'
+
+import { afterEach, describe, expect, it } from 'vitest'
+
+import { openDatabase } from '../db/database.js'
+import { ArtifactRepository, type DerivedStatus } from '../repositories/artifact-repository.js'
+import { SearchVisibilityRepository } from '../repositories/search-visibility-repository.js'
+import { SearchRepository } from './search-repository.js'
+import { SQLiteSearchIndexer } from './sqlite-search-indexer.js'
+
+const temporaryDirectories: string[] = []
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories.splice(0).map((directory) =>
+      rm(directory, { force: true, recursive: true }),
+    ),
+  )
+})
+
+describe('SearchRepository', () => {
+  it('uses trigram AND, quoted phrase, punctuation, and NFKC query semantics', async () => {
+    const harness = await makeHarness()
+    const exact = await harness.seed({
+      sourcePath: '/corpus/exact.md',
+      text: 'Alpha beta uses node.js, C++, and compatibility artifact text.',
+    })
+    await harness.seed({
+      sourcePath: '/corpus/separated.md',
+      text: 'Alpha has many unrelated words before beta.',
+    })
+    await harness.seed({ sourcePath: '/corpus/alpha-only.md', text: 'Alpha only.' })
+
+    expect(harness.search.search('alpha artifact').map(({ artifactId }) => artifactId)).toEqual([
+      exact.artifactId,
+    ])
+    expect(harness.search.search('"alpha beta"').map(({ artifactId }) => artifactId)).toEqual([
+      exact.artifactId,
+    ])
+    expect(harness.search.search('node.js').map(({ artifactId }) => artifactId)).toEqual([
+      exact.artifactId,
+    ])
+    expect(harness.search.search('C++').map(({ artifactId }) => artifactId)).toEqual([
+      exact.artifactId,
+    ])
+    expect(harness.search.search('ＡＲＴＩＦＡＣＴ').map(({ artifactId }) => artifactId)).toEqual([
+      exact.artifactId,
+    ])
+    harness.database.close()
+  })
+
+  it('ranks user title above derived title, body, and path', async () => {
+    const harness = await makeHarness()
+    const path = await harness.seed({
+      sourcePath: '/corpus/rankingtoken/path.md',
+      derivedTitle: 'Unrelated path card',
+      text: 'ordinary content',
+    })
+    const body = await harness.seed({
+      sourcePath: '/corpus/body.md',
+      derivedTitle: 'Unrelated body card',
+      text: 'rankingtoken',
+    })
+    const derived = await harness.seed({
+      sourcePath: '/corpus/derived.md',
+      derivedTitle: 'rankingtoken',
+      text: 'ordinary content',
+    })
+    const user = await harness.seed({
+      sourcePath: '/corpus/user.md',
+      userTitle: 'rankingtoken',
+      derivedTitle: 'Unrelated user card',
+      text: 'ordinary content',
+    })
+
+    expect(harness.search.search('rankingtoken').map(({ artifactId }) => artifactId)).toEqual([
+      user.artifactId,
+      derived.artifactId,
+      body.artifactId,
+      path.artifactId,
+    ])
+    harness.database.close()
+  })
+
+  it('scans normalized title and body for 1–2 character queries with a hard 100-artifact bound', async () => {
+    const harness = await makeHarness()
+    for (let index = 0; index < 101; index += 1) {
+      await harness.seed({
+        sourcePath: `/short/${index}.md`,
+        userTitle: index === 100 ? 'AI title' : null,
+        text: `猫 AI body ${index}`,
+        registeredAt: timestamp(index),
+      })
+    }
+
+    const japanese = harness.search.search('猫', { limit: 200 })
+    const ascii = harness.search.search('ＡI', { limit: 200 })
+
+    expect(japanese).toHaveLength(100)
+    expect(ascii).toHaveLength(100)
+    expect(ascii[0]?.title).toBe('AI title')
+    harness.database.close()
+  })
+
+  it('returns visible indexed artifacts newest registered first for an empty query', async () => {
+    const harness = await makeHarness()
+    const oldest = await harness.seed({
+      sourcePath: '/empty/oldest.md',
+      text: 'oldest',
+      registeredAt: timestamp(1),
+    })
+    const newest = await harness.seed({
+      sourcePath: '/empty/newest.md',
+      text: 'newest',
+      registeredAt: timestamp(3),
+    })
+    const middle = await harness.seed({
+      sourcePath: '/empty/middle.md',
+      text: 'middle',
+      registeredAt: timestamp(2),
+    })
+
+    expect(harness.search.search('').map(({ artifactId }) => artifactId)).toEqual([
+      newest.artifactId,
+      middle.artifactId,
+      oldest.artifactId,
+    ])
+    harness.database.close()
+  })
+
+  it('passes FTS, short-query, and empty-query candidates through the visibility repository', async () => {
+    const harness = await makeHarness()
+    const visible = await harness.seed({
+      sourcePath: '/visibility/visible.md',
+      userTitle: '猫 visible',
+      text: 'visiblegalaxy',
+      registeredAt: timestamp(1),
+    })
+    const quarantined = await harness.seed({
+      sourcePath: '/visibility/quarantined.md',
+      userTitle: '猫 quarantined',
+      text: 'quarantinegalaxy',
+      registeredAt: timestamp(4),
+    })
+    new SearchVisibilityRepository(harness.database).quarantineGeneration({
+      artifactId: quarantined.artifactId,
+      generationId: quarantined.generationId,
+      now: timestamp(5),
+    })
+    const failed = await harness.seed({
+      sourcePath: '/visibility/failed.md',
+      userTitle: '猫 failed',
+      text: 'failedgalaxy',
+      indexStatus: 'failed',
+      registeredAt: timestamp(3),
+    })
+    const stale = await harness.seed({
+      sourcePath: '/visibility/stale.md',
+      userTitle: '猫 stale',
+      text: 'stalegalaxy',
+      registeredAt: timestamp(2),
+    })
+    harness.database
+      .prepare('UPDATE artifact SET user_title = NULL, derived_title = ? WHERE id = ?')
+      .run('replacement title', stale.artifactId)
+    await harness.addGeneration(stale.artifactId, '/visibility/stale.md', 'replacement text')
+
+    expect(harness.search.search('visiblegalaxy').map(({ artifactId }) => artifactId)).toEqual([
+      visible.artifactId,
+    ])
+    expect(harness.search.search('quarantinegalaxy')).toEqual([])
+    expect(harness.search.search('failedgalaxy')).toEqual([])
+    expect(harness.search.search('stalegalaxy')).toEqual([])
+    expect(harness.search.search('猫').map(({ artifactId }) => artifactId)).toEqual([
+      visible.artifactId,
+    ])
+    expect(harness.search.search('').map(({ artifactId }) => artifactId)).not.toContain(
+      quarantined.artifactId,
+    )
+    expect(harness.search.search('').map(({ artifactId }) => artifactId)).not.toContain(
+      failed.artifactId,
+    )
+    harness.database.close()
+  })
+})
+
+async function makeHarness() {
+  const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-search-repository-'))
+  temporaryDirectories.push(directory)
+  const database = openDatabase({ filename: join(directory, 'gallery.sqlite') })
+  const artifacts = new ArtifactRepository(database)
+  const indexer = new SQLiteSearchIndexer(database)
+
+  const addGeneration = async (
+    artifactId: number,
+    sourcePath: string,
+    text: string,
+    indexStatus: DerivedStatus = 'ready',
+  ) => {
+    const generation = artifacts.createGeneration(artifactId, timestamp(0))
+    const prepared = await indexer.prepare({
+      artifactId,
+      generation: generation.generation,
+      sourcePath,
+      text,
+    })
+    database.transaction(() => {
+      artifacts.commitGeneration({
+        artifactId,
+        generationId: generation.id,
+        expectedGeneration: generation.generation,
+        contentStatus: 'ready',
+        renderStatus: 'ready',
+        indexStatus,
+        extractedText: text,
+        extractorVersion: 'search-test-1',
+        thumbnailPath: null,
+        previewedAt: timestamp(0),
+        completedAt: timestamp(0),
+      })
+      prepared.commit()
+    })()
+    return { artifactId, generationId: generation.id, generation: generation.generation }
+  }
+
+  const seed = async (input: {
+    sourcePath: string
+    text: string
+    userTitle?: string | null
+    derivedTitle?: string | null
+    registeredAt?: string
+    indexStatus?: DerivedStatus
+  }) => {
+    const registeredAt = input.registeredAt ?? timestamp(0)
+    const artifact = artifacts.register({
+      sourcePath: input.sourcePath,
+      format: 'markdown',
+      now: registeredAt,
+    })
+    database
+      .prepare('UPDATE artifact SET user_title = ?, derived_title = ? WHERE id = ?')
+      .run(
+        input.userTitle ?? null,
+        input.derivedTitle ?? basename(input.sourcePath),
+        artifact.id,
+      )
+    return addGeneration(
+      artifact.id,
+      input.sourcePath,
+      input.text,
+      input.indexStatus ?? 'ready',
+    )
+  }
+
+  return {
+    database,
+    artifacts,
+    indexer,
+    search: new SearchRepository(database),
+    seed,
+    addGeneration,
+  }
+}
+
+function timestamp(offset: number): string {
+  return new Date(Date.UTC(2026, 8, 1, 0, 0, offset)).toISOString()
+}

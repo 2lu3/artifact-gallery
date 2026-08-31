@@ -27,6 +27,7 @@ import {
 import { ImportRepository, type ImportItemStage } from '../repositories/import-repository.js'
 import { SearchVisibilityRepository } from '../repositories/search-visibility-repository.js'
 import type { AuthorizedFile } from '../security/path-policy.js'
+import { SQLiteSearchIndexer } from '../search/sqlite-search-indexer.js'
 import {
   MAX_THUMBNAIL_BYTES,
   ThumbnailOptimizationError,
@@ -174,14 +175,6 @@ const nodeFileSystem: ProcessorFileSystem = {
   remove: (path) => rm(path, { force: true }),
 }
 
-const noOpIndexer: ArtifactIndexer = {
-  prepare: async () => ({
-    commit: () => undefined,
-    rollback: async () => undefined,
-    quarantine: async () => undefined,
-  }),
-}
-
 export class ArtifactProcessor {
   private readonly artifacts: ArtifactRepository
   private readonly imports: ImportRepository
@@ -197,7 +190,7 @@ export class ArtifactProcessor {
     this.imports = new ImportRepository(dependencies.database)
     this.searchVisibility = new SearchVisibilityRepository(dependencies.database)
     this.markdownRenderer = dependencies.markdownRenderer ?? new MarkdownRenderer()
-    this.indexer = dependencies.indexer ?? noOpIndexer
+    this.indexer = dependencies.indexer ?? new SQLiteSearchIndexer(dependencies.database)
     this.optimizer = dependencies.thumbnailOptimizer ?? new WebpThumbnailOptimizer()
     this.fileSystem = dependencies.fileSystem ?? nodeFileSystem
     this.now = dependencies.now ?? (() => new Date().toISOString())

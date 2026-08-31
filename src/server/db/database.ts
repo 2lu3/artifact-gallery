@@ -2,6 +2,8 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import Database from 'better-sqlite3'
 
+import { normalizePathSegments, normalizeSearchText } from '../search/search-query.js'
+
 export interface OpenDatabaseOptions {
   filename: string
   migrationsDirectory?: string
@@ -14,6 +16,16 @@ export function openDatabase({
   const database = new Database(filename)
 
   try {
+    database.function(
+      'search_normalize',
+      { deterministic: true },
+      (value: string | null) => normalizeSearchText(value ?? ''),
+    )
+    database.function(
+      'search_path_segments',
+      { deterministic: true },
+      (value: string) => normalizePathSegments(value),
+    )
     database.pragma('journal_mode = WAL')
     database.pragma('foreign_keys = ON')
     database.pragma('busy_timeout = 5000')

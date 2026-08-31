@@ -31,6 +31,27 @@ afterEach(async () => {
 })
 
 describe('ArtifactProcessor staged pipeline', () => {
+  it('uses the prepared SQLite indexer by default and commits its generation row atomically', async () => {
+    const harness = await makeHarness({ useDefaultIndexer: true })
+    await writeFile(harness.sourcePath, '# Default searchable title\n\nＡＴＯＭＩＣ body.')
+
+    const result = await harness.processor.register({ sourcePath: harness.sourcePath })
+
+    expect(result.outcome).toBe('completed')
+    expect(
+      harness.database
+        .prepare(
+          `SELECT body_normalized, derived_title_normalized
+           FROM artifact_search_document WHERE generation_id = ?`,
+        )
+        .get(result.generationId),
+    ).toEqual({
+      body_normalized: 'default searchable title\natomic body.',
+      derived_title_normalized: 'default searchable title',
+    })
+    harness.database.close()
+  })
+
   it('routes register, refresh, retry, and rebuild through inspect → extract → render → index → commit', async () => {
     const harness = await makeHarness()
     await writeFile(harness.sourcePath, '# Source title\n\nBody text.')
@@ -824,6 +845,7 @@ async function makeHarness(options: {
   render?: ArtifactProcessorConstructor['render']
   indexer?: ArtifactIndexer
   optimizer?: ThumbnailOptimizer
+  useDefaultIndexer?: boolean
 } = {}) {
   const root = await temporaryDirectory()
   const sourcePath = join(root, options.sourceName ?? 'artifact.md')
@@ -871,13 +893,17 @@ async function makeHarness(options: {
         return result
       },
     },
-    indexer: {
-      prepare: async (request: Parameters<ArtifactIndexer['prepare']>[0]) => {
-        const prepared = await indexer.prepare(request)
-        controls.cancelAfterIndex?.()
-        return prepared
-      },
-    },
+    ...(options.useDefaultIndexer
+      ? {}
+      : {
+          indexer: {
+            prepare: async (request: Parameters<ArtifactIndexer['prepare']>[0]) => {
+              const prepared = await indexer.prepare(request)
+              controls.cancelAfterIndex?.()
+              return prepared
+            },
+          },
+        }),
     thumbnailDirectory: derivedDirectory,
     thumbnailOptimizer: overrides.optimizer ?? defaultOptimizer,
     fileSystem: overrides.fileSystem ?? realFileSystem,
