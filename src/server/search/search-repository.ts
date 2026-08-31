@@ -131,6 +131,15 @@ export class SearchRepository {
            JOIN artifact
              ON artifact.id = artifact_search_document.artifact_id
             AND artifact.active_generation_id = artifact_search_document.generation_id
+           JOIN artifact_generation
+             ON artifact_generation.id = artifact.active_generation_id
+            AND artifact_generation.artifact_id = artifact.id
+            AND artifact_generation.generation = artifact_search_document.generation
+            AND artifact_generation.index_status = 'ready'
+           JOIN artifact_search_visibility
+             ON artifact_search_visibility.artifact_id = artifact.id
+            AND artifact_search_visibility.generation_id = artifact_generation.id
+            AND artifact_search_visibility.state = 'visible'
            ORDER BY artifact.registered_at DESC, artifact.id DESC
            LIMIT ${SHORT_SCAN_LIMIT}
          )
@@ -169,6 +178,15 @@ export class SearchRepository {
          JOIN artifact
            ON artifact.id = artifact_search_document.artifact_id
           AND artifact.active_generation_id = artifact_search_document.generation_id
+         JOIN artifact_generation
+           ON artifact_generation.id = artifact.active_generation_id
+          AND artifact_generation.artifact_id = artifact.id
+          AND artifact_generation.generation = artifact_search_document.generation
+          AND artifact_generation.index_status = 'ready'
+         JOIN artifact_search_visibility
+           ON artifact_search_visibility.artifact_id = artifact.id
+          AND artifact_search_visibility.generation_id = artifact_generation.id
+          AND artifact_search_visibility.state = 'visible'
          ORDER BY artifact.registered_at DESC, artifact.id DESC
          LIMIT ?`,
       )

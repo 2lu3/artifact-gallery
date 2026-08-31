@@ -265,6 +265,70 @@ describe('SearchRepository', () => {
     ])
     harness.database.close()
   })
+
+  it('applies short-query eligibility before 101 newer failed or quarantined rows reach the 100-row bound', async () => {
+    const harness = await makeHarness()
+    const eligible = await harness.seed({
+      sourcePath: '/eligibility/short-visible.md',
+      derivedTitle: 'Visible short result',
+      text: '猫',
+      registeredAt: timestamp(0),
+    })
+    const visibility = new SearchVisibilityRepository(harness.database)
+    for (let index = 1; index <= 101; index += 1) {
+      const ineligible = await harness.seed({
+        sourcePath: `/eligibility/short-hidden-${index}.md`,
+        derivedTitle: `Hidden short result ${index}`,
+        text: '猫',
+        registeredAt: timestamp(index),
+        indexStatus: index % 2 === 0 ? 'failed' : 'ready',
+      })
+      if (index % 2 === 1) {
+        visibility.quarantineGeneration({
+          artifactId: ineligible.artifactId,
+          generationId: ineligible.generationId,
+          now: timestamp(index + 200),
+        })
+      }
+    }
+
+    expect(harness.search.search('猫').map(({ artifactId }) => artifactId)).toEqual([
+      eligible.artifactId,
+    ])
+    harness.database.close()
+  })
+
+  it('applies empty-query eligibility before 501 newer failed or quarantined rows reach the 500-row bound', async () => {
+    const harness = await makeHarness()
+    const eligible = await harness.seed({
+      sourcePath: '/eligibility/empty-visible.md',
+      derivedTitle: 'Visible empty result',
+      text: 'visible',
+      registeredAt: timestamp(0),
+    })
+    const visibility = new SearchVisibilityRepository(harness.database)
+    for (let index = 1; index <= 501; index += 1) {
+      const ineligible = await harness.seed({
+        sourcePath: `/eligibility/empty-hidden-${index}.md`,
+        derivedTitle: `Hidden empty result ${index}`,
+        text: 'hidden',
+        registeredAt: timestamp(index),
+        indexStatus: index % 2 === 0 ? 'failed' : 'ready',
+      })
+      if (index % 2 === 1) {
+        visibility.quarantineGeneration({
+          artifactId: ineligible.artifactId,
+          generationId: ineligible.generationId,
+          now: timestamp(index + 600),
+        })
+      }
+    }
+
+    expect(harness.search.search('').map(({ artifactId }) => artifactId)).toEqual([
+      eligible.artifactId,
+    ])
+    harness.database.close()
+  })
 })
 
 async function makeHarness() {

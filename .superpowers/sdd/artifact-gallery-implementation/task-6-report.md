@@ -36,3 +36,16 @@
 - `pnpm test`: PASS（17 files、150 tests。実 Chromium のため sandbox 外で実行）。
 - 固定 corpus: trigram 20/20 top-five、prototype bigram 20/20 top-five。10 回/query の全体 median 0.110 ms、max 5.325 ms。200 ms／400 ms gate を維持。
 - Concerns: 未解決事項なし。
+
+## Review fix round 2
+
+- Status: 完了。
+- Commit: `fix: filter short and empty candidates before limits`（この追記を含む review fix コミット）。
+- P1 short/empty starvation: short CTE と empty list の candidate SQL に active generation、`index_status=ready`、visibility `visible` JOIN を追加し、100／500 件の LIMIT より前に eligibility を適用。最終 `SearchVisibilityRepository.filterVisibleCandidates()` gate は両経路で維持。
+- RED/GREEN: short は新しい failed/quarantined 101 artifacts、empty は 501 artifacts が古い eligible candidate を押し出す実 SQLite 再現を追加。
+- `pnpm lint`: PASS。
+- `pnpm typecheck`: PASS。
+- `pnpm build`: PASS。
+- `pnpm test`: PASS（17 files、152 tests。実 Chromium のため sandbox 外で実行）。
+- 固定 corpus: trigram 20/20 top-five、prototype bigram 20/20 top-five。10 回/query の全体 median 0.112 ms、max 5.253 ms。200 ms／400 ms gate を維持。
+- Concerns: 未解決事項なし。
