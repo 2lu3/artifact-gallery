@@ -13,12 +13,13 @@ test.describe.serial('Artifact Gallery', () => {
   let baseURL: string
   let root: string
   let sourceDirectory: string
+  let thumbnailDirectory: string
   let databaseFilename: string
 
   test.beforeAll(async () => {
     root = await mkdtemp(join(tmpdir(), 'artifact-gallery-e2e-'))
     sourceDirectory = join(root, 'sources')
-    const thumbnailDirectory = join(root, 'thumbnails')
+    thumbnailDirectory = join(root, 'thumbnails')
     await mkdir(sourceDirectory)
     await mkdir(thumbnailDirectory)
     const port = await availablePort()
@@ -101,7 +102,7 @@ test.describe.serial('Artifact Gallery', () => {
   test('allows a running folder registration to be cancelled without losing completed work', async ({ page }) => {
     const folder = join(sourceDirectory, 'cancel-import')
     await mkdir(folder)
-    for (let index = 0; index < 12; index += 1) {
+    for (let index = 0; index < 24; index += 1) {
       await writeFile(
         join(folder, `${index.toString().padStart(2, '0')}.html`),
         `<title>Cancel item ${index}</title><main>${'<section>content</section>'.repeat(300)}</main>`,
@@ -114,22 +115,55 @@ test.describe.serial('Artifact Gallery', () => {
     await dialog.getByLabel('ファイルまたはフォルダーのパス').fill(folder)
     await dialog.getByRole('button', { name: '登録を開始' }).click()
 
+    await expect(dialog.getByText(/[1-9]\d*\/24件/u)).toBeVisible({ timeout: 30_000 })
     await dialog.getByRole('button', { name: 'キャンセル' }).click({ timeout: 15_000 })
 
     await expect(dialog.getByText('登録をキャンセルしました')).toBeVisible({ timeout: 30_000 })
-    await expect(dialog.getByText(/\d+\/12件/u)).toBeVisible()
+    await expect(dialog.getByText(/[1-9]\d*件登録 · [1-9]\d*件未開始/u)).toBeVisible()
+    await expect(page.getByRole('button', { name: /Cancel item 0/u })).toBeVisible()
   })
 
   test('prevents duplicate cards when a path is submitted again rapidly', async ({ page }) => {
     const sourcePath = join(sourceDirectory, 'duplicate.md')
     await writeFile(sourcePath, '# Duplicate Guard')
     await page.goto(baseURL)
-
-    await registerPath(page, sourcePath, 'file')
-    await page.getByRole('button', { name: '登録画面を閉じる' }).click()
-    await registerPath(page, sourcePath, 'file')
+    const secondPage = await page.context().newPage()
+    await secondPage.goto(baseURL)
+    for (const candidate of [page, secondPage]) {
+      await candidate.getByRole('button', { name: '生成物を登録' }).click()
+      await candidate.getByRole('dialog', { name: '生成物を登録' })
+        .getByLabel('ファイルまたはフォルダーのパス')
+        .fill(sourcePath)
+    }
+    let arrivalCount = 0
+    let markBothArrived!: () => void
+    const bothArrived = new Promise<void>((resolve) => {
+      markBothArrived = resolve
+    })
+    let releaseSubmissions!: () => void
+    const submissionsReleased = new Promise<void>((resolve) => {
+      releaseSubmissions = resolve
+    })
+    await page.context().route('**/api/registrations/file', async (route) => {
+      arrivalCount += 1
+      if (arrivalCount === 2) markBothArrived()
+      await submissionsReleased
+      await route.continue()
+    })
+    const submits = Promise.all([
+      page.getByRole('dialog', { name: '生成物を登録' }).getByRole('button', { name: '登録を開始' }).click(),
+      secondPage.getByRole('dialog', { name: '生成物を登録' }).getByRole('button', { name: '登録を開始' }).click(),
+    ])
+    await bothArrived
+    await expect(page.getByRole('dialog', { name: '生成物を登録' }).getByText('登録完了')).toHaveCount(0)
+    await expect(secondPage.getByRole('dialog', { name: '生成物を登録' }).getByText('登録完了')).toHaveCount(0)
+    releaseSubmissions()
+    await submits
+    await expect(page.getByRole('dialog', { name: '生成物を登録' }).getByText('登録完了')).toBeVisible({ timeout: 30_000 })
+    await expect(secondPage.getByRole('dialog', { name: '生成物を登録' }).getByText('登録完了')).toBeVisible({ timeout: 30_000 })
 
     await expect(page.getByRole('button', { name: /Duplicate Guard/u })).toHaveCount(1)
+    await secondPage.close()
   })
 
   test('keeps the trusted bootstrap token out of URLs, storage, DOM, and console', async ({ page }) => {
@@ -204,8 +238,13 @@ test.describe.serial('Artifact Gallery', () => {
     await page.getByRole('button', { name: 'HTML' }).click()
     await expect(salesCards.first()).toBeVisible()
     await expect(page.getByRole('button', { name: /京都旅行プラン/u })).toHaveCount(0)
+    await page.getByRole('button', { name: /^すべて/u }).click()
     await page.getByLabel('並び順').selectOption('title')
     await expect(page.getByLabel('並び順')).toHaveValue('title')
+    await expect(page.locator('.artifact-card strong').first()).toBeVisible()
+    const sortedTitles = await page.locator('.artifact-card strong').allTextContents()
+    expect(sortedTitles.length).toBeGreaterThan(1)
+    expect(sortedTitles).toEqual([...sortedTitles].sort())
 
     const searchMeasurements = await page.evaluate(() =>
       performance.getEntriesByName('artifact-gallery-search').map((entry) => entry.duration),
@@ -314,7 +353,25 @@ test.describe.serial('Artifact Gallery', () => {
     await lightbox.getByRole('button', { name: 'ギャラリーから削除' }).click()
 
     const confirmation = page.getByRole('alertdialog', { name: 'ギャラリー記録を削除' })
+    const cancelDelete = confirmation.getByRole('button', { name: 'キャンセル' })
     await expect(confirmation.getByText('元ファイルは削除されません。')).toBeVisible()
+    await expect(cancelDelete).toBeFocused()
+    await expect(page.locator('.lightbox')).toHaveAttribute('inert', '')
+    await expect(page.locator('.lightbox')).toHaveAttribute('aria-hidden', 'true')
+    await page.keyboard.press('Shift+Tab')
+    await expect(confirmation.getByRole('button', { name: '記録だけ削除' })).toBeFocused()
+    await page.keyboard.press('Tab')
+    await expect(cancelDelete).toBeFocused()
+    await page.keyboard.press('Escape')
+    await expect(confirmation).toHaveCount(0)
+    await expect(lightbox).toBeVisible()
+    await expect(lightbox.getByRole('button', { name: 'ギャラリーから削除' })).toBeFocused()
+    await page.keyboard.press('Tab')
+    await expect(lightbox.getByRole('button', { name: '詳細を閉じる' })).toBeFocused()
+    await page.keyboard.press('Shift+Tab')
+    await expect(lightbox.getByRole('button', { name: 'ギャラリーから削除' })).toBeFocused()
+
+    await lightbox.getByRole('button', { name: 'ギャラリーから削除' }).click()
     await confirmation.getByRole('button', { name: '記録だけ削除' }).click()
     await expect(page.getByRole('button', { name: /Catalog Only Delete/u })).toHaveCount(0)
     await expect(access(sourcePath)).resolves.toBeUndefined()
@@ -323,14 +380,112 @@ test.describe.serial('Artifact Gallery', () => {
   test('loads stable cursor pages of 30 cards and then the remaining cards', async ({ page }) => {
     seedReadyCards(databaseFilename, 35)
     await page.goto(baseURL)
+    await page.getByRole('searchbox', { name: '生成物を検索' }).fill('Cursor Card')
     const cards = page.locator('.artifact-card')
 
     await expect(cards).toHaveCount(30)
+    await expect(page.getByRole('button', { name: 'すべて 35' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'HTML 0' })).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Markdown 35' })).toBeVisible()
+    await page.getByRole('button', { name: 'HTML 0' }).click()
+    await expect(page.getByRole('heading', { name: '検索結果がありません' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: '最初の生成物を登録' })).toHaveCount(0)
+    await page.getByRole('button', { name: 'すべて 35' }).click()
+    const nextPageResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url())
+      return ['/api/gallery', '/api/search'].includes(url.pathname) && url.searchParams.has('cursor')
+    })
     await page.getByRole('button', { name: 'さらに読み込む' }).click()
+    expect((await nextPageResponse).status()).toBe(200)
 
     await expect(cards).toHaveCount(35)
     await expect(page.getByRole('button', { name: 'さらに読み込む' })).toHaveCount(0)
     await expect(cards.first().locator('[role="img"]')).toHaveAttribute('aria-label', /プレビューはありません/u)
+  })
+
+  test('defers authenticated thumbnail requests until a below-fold card nears the viewport', async ({ page }) => {
+    const sourcePath = join(sourceDirectory, 'lazy-thumbnail-source.html')
+    await writeFile(sourcePath, '<!doctype html><title>Lazy Thumbnail Source</title><h1>Creates a real protected WebP.</h1>')
+    await page.goto(baseURL)
+    await registerPath(page, sourcePath, 'file')
+    await page.getByRole('button', { name: '登録画面を閉じる' }).click()
+    const thumbnailPath = join(thumbnailDirectory, 'lazy-thumbnail.webp')
+    await writeFile(thumbnailPath, Buffer.from('UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEAAQAcJaQAA3AA/vuUAAA=', 'base64'))
+    seedThumbnailCards(databaseFilename, thumbnailPath, 20)
+    await page.setViewportSize({ width: 900, height: 500 })
+    const thumbnailRequests: string[] = []
+    const thumbnailStatuses: number[] = []
+    page.on('request', (request) => {
+      if (new URL(request.url()).pathname.startsWith('/api/thumbnails/')) {
+        thumbnailRequests.push(request.url())
+      }
+    })
+    page.on('response', (response) => {
+      if (new URL(response.url()).pathname.startsWith('/api/thumbnails/')) {
+        thumbnailStatuses.push(response.status())
+      }
+    })
+
+    const galleryResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url())
+      return url.pathname === '/api/gallery' && !url.searchParams.has('cursor')
+    })
+    await page.reload()
+    const galleryPage = (await (await galleryResponse).json()) as {
+      items: Array<{ title: string; thumbnailUrl: string | null }>
+    }
+    const belowFoldThumbnailUrl = galleryPage.items.find((item) => item.title === 'Lazy Thumbnail 00')?.thumbnailUrl
+    expect(belowFoldThumbnailUrl).toBeTruthy()
+    const absoluteBelowFoldThumbnailUrl = new URL(belowFoldThumbnailUrl!, baseURL).href
+    const belowFold = page.getByRole('button', { name: /Lazy Thumbnail 00/u })
+    await expect(belowFold).toBeAttached()
+    expect((await belowFold.boundingBox())?.y).toBeGreaterThan(820)
+    await page.waitForTimeout(250)
+    expect(thumbnailStatuses.every((status) => status === 200)).toBe(true)
+    expect(thumbnailRequests).not.toContain(absoluteBelowFoldThumbnailUrl)
+    expect(thumbnailRequests.length).toBeLessThan(21)
+    await expect(belowFold.locator('img')).toHaveCount(0)
+
+    await belowFold.scrollIntoViewIfNeeded()
+
+    await expect.poll(() => thumbnailRequests).toContain(absoluteBelowFoldThumbnailUrl)
+    await expect(belowFold.locator('img')).toBeVisible()
+  })
+
+  test('discards a late load-more page after the gallery context changes', async ({ page }) => {
+    seedReadyCards(databaseFilename, 35)
+    seedRecoveryCards(databaseFilename)
+    let releasePage!: () => void
+    const pageReleased = new Promise<void>((resolve) => {
+      releasePage = resolve
+    })
+    let markPageStarted!: () => void
+    const pageStarted = new Promise<void>((resolve) => {
+      markPageStarted = resolve
+    })
+    await page.route('**/api/gallery?*', async (route) => {
+      const url = new URL(route.request().url())
+      if (url.searchParams.has('cursor') && !url.searchParams.has('format')) {
+        markPageStarted()
+        await pageReleased
+      }
+      await route.continue().catch(() => undefined)
+    })
+    await page.goto(baseURL)
+
+    await page.getByRole('button', { name: 'さらに読み込む' }).click()
+    await pageStarted
+    await page.getByRole('button', { name: /^HTML \d+$/u }).click()
+    await expect(page.getByRole('button', { name: /^HTML \d+$/u })).toHaveAttribute('aria-pressed', 'true')
+    await expect(page.locator('.artifact-card').first()).toBeVisible()
+    releasePage()
+    await page.waitForTimeout(250)
+
+    await expect.poll(async () => page.locator('.artifact-card .format-label').allTextContents()).toEqual(
+      expect.arrayContaining(['HTML']),
+    )
+    expect(await page.locator('.artifact-card .format-label').allTextContents()).not.toContain('MARKDOWN')
+    await expect(page.getByRole('button', { name: 'さらに読み込む' })).toHaveCount(0)
   })
 
   test('renders processing, partial, and failed cards with safe recovery details', async ({ page }) => {
@@ -353,6 +508,7 @@ test.describe.serial('Artifact Gallery', () => {
     await page.goto(baseURL)
     await registerPath(page, sourcePath, 'file')
     await page.getByRole('button', { name: '登録画面を閉じる' }).click()
+    await page.getByLabel('並び順').selectOption('title')
     await page.getByRole('button', { name: /broken-markdown\.md/u }).click()
     const failedLightbox = page.getByRole('dialog', { name: 'broken-markdown.md' })
     await expect(failedLightbox.locator('.status-value')).toHaveText('処理失敗')
@@ -394,6 +550,7 @@ test.describe.serial('Artifact Gallery', () => {
     await page.goto(baseURL)
     await registerPath(page, sourcePath, 'file')
     await page.getByRole('button', { name: '登録画面を閉じる' }).click()
+    await page.getByRole('searchbox', { name: '生成物を検索' }).fill('Mobile Focus')
     await page.setViewportSize({ width: 390, height: 720 })
     await page.getByRole('button', { name: /Mobile Focus/u }).click()
     const lightbox = page.getByRole('dialog', { name: 'Mobile Focus' })
@@ -422,7 +579,9 @@ async function registerPath(page: Page, path: string, kind: 'file' | 'folder') {
 
 function seedReadyCards(filename: string, count: number) {
   const database = new Database(filename)
-  const existingCount = Number(database.prepare('SELECT COUNT(*) FROM artifact').pluck().get())
+  const existingCount = Number(
+    database.prepare("SELECT COUNT(*) FROM artifact WHERE source_path LIKE '/e2e/cursor-%'").pluck().get(),
+  )
   const additions = Math.max(0, count - existingCount)
   const now = '2026-09-01T00:00:00.000Z'
   const insertArtifact = database.prepare(
@@ -436,12 +595,31 @@ function seedReadyCards(filename: string, count: number) {
       (artifact_id, generation, job_status, content_status, render_status, index_status, extracted_text, extractor_version, completed_at)
      VALUES (?, 1, 'idle', 'ready', 'ready', 'ready', ?, 'e2e', ?)`,
   )
+  const generationId = database.prepare(
+    'SELECT id FROM artifact_generation WHERE artifact_id = ? AND generation = 1',
+  ).pluck()
+  const activate = database.prepare('UPDATE artifact SET active_generation_id = ? WHERE id = ?')
+  const showInSearch = database.prepare(
+    `INSERT OR IGNORE INTO artifact_search_visibility (artifact_id, generation_id, state, updated_at)
+     VALUES (?, ?, 'visible', ?)`,
+  )
+  const insertSearchDocument = database.prepare(
+    `INSERT OR IGNORE INTO artifact_search_document
+      (generation_id, artifact_id, generation, user_title_normalized, derived_title_normalized, body_normalized, path_segments_normalized)
+     VALUES (?, ?, 1, '', ?, ?, ?)`,
+  )
   database.transaction(() => {
     for (let index = 0; index < additions; index += 1) {
       const sourcePath = `/e2e/cursor-${index.toString().padStart(2, '0')}.md`
-      insertArtifact.run(sourcePath, `Cursor Card ${index.toString().padStart(2, '0')}`, now, now, now)
+      const title = `Cursor Card ${index.toString().padStart(2, '0')}`
+      insertArtifact.run(sourcePath, title, now, now, now)
       const id = artifactId.get(sourcePath) as number
-      insertGeneration.run(id, `Cursor body ${index}`, now)
+      const body = `Cursor body ${index}`
+      insertGeneration.run(id, body, now)
+      const currentGenerationId = generationId.get(id) as number
+      activate.run(currentGenerationId, id)
+      showInSearch.run(id, currentGenerationId, now)
+      insertSearchDocument.run(currentGenerationId, id, title.toLowerCase(), body.toLowerCase(), sourcePath)
     }
   })()
   database.close()
@@ -477,10 +655,39 @@ function seedRecoveryCards(filename: string) {
           .prepare(
             `INSERT INTO artifact_error
               (artifact_id, generation_id, code, stage, retryable, user_message, technical_detail, occurred_at)
-             VALUES (?, NULL, 'HTML_RENDER_FAILED', 'render', 1, ?, ?, ?)`,
+             SELECT ?, NULL, 'HTML_RENDER_FAILED', 'render', 1, ?, ?, ?
+             WHERE NOT EXISTS (
+               SELECT 1 FROM artifact_error WHERE artifact_id = ? AND code = 'HTML_RENDER_FAILED'
+             )`,
           )
-          .run(id, 'The preview could not be rendered.', '/private/internal-render-command', now)
+          .run(id, 'The preview could not be rendered.', '/private/internal-render-command', now, id)
       }
+    }
+  })()
+  database.close()
+}
+
+function seedThumbnailCards(filename: string, thumbnailPath: string, count: number) {
+  const database = new Database(filename)
+  const now = '2998-09-01T00:00:00.000Z'
+  const insertArtifact = database.prepare(
+    `INSERT INTO artifact
+      (source_path, format, derived_title, source_status, created_at, updated_at, registered_at, generation_counter)
+     VALUES (?, 'markdown', ?, 'available', ?, ?, ?, 1)`,
+  )
+  const insertGeneration = database.prepare(
+    `INSERT INTO artifact_generation
+      (artifact_id, generation, job_status, content_status, render_status, index_status, extracted_text, extractor_version, thumbnail_path, completed_at)
+     VALUES (?, 1, 'idle', 'ready', 'ready', 'ready', ?, 'e2e', ?, ?)`,
+  )
+  const activate = database.prepare('UPDATE artifact SET active_generation_id = ? WHERE id = ?')
+  database.transaction(() => {
+    for (let index = 0; index < count; index += 1) {
+      const title = `Lazy Thumbnail ${index.toString().padStart(2, '0')}`
+      const artifact = insertArtifact.run(`/e2e/lazy-thumbnail-${index}.md`, title, now, now, now)
+      const artifactId = Number(artifact.lastInsertRowid)
+      const generation = insertGeneration.run(artifactId, `${title} body`, thumbnailPath, now)
+      activate.run(Number(generation.lastInsertRowid), artifactId)
     }
   })()
   database.close()

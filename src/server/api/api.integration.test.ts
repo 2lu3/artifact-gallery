@@ -318,6 +318,11 @@ describe('local API integration', () => {
     })
     expect(first.statusCode).toBe(200)
     expect(first.json().items).toHaveLength(30)
+    expect(first.json()).toMatchObject({
+      catalogTotal: 36,
+      filteredTotal: 35,
+      formatCounts: { all: 36, html: 1, markdown: 35 },
+    })
     expect(first.json().nextCursor).toEqual(expect.any(String))
     expect(first.json().items[0]).toMatchObject({
       status: 'ready',
@@ -345,6 +350,11 @@ describe('local API integration', () => {
     expect(htmlOnly.statusCode).toBe(200)
     expect(htmlOnly.json().items).toHaveLength(1)
     expect(htmlOnly.json().items[0]).toMatchObject({ format: 'html', title: 'HTML only' })
+    expect(htmlOnly.json()).toMatchObject({
+      catalogTotal: 36,
+      filteredTotal: 1,
+      formatCounts: { all: 36, html: 1, markdown: 35 },
+    })
 
     const search = await harness.app.inject({
       method: 'GET',
@@ -353,6 +363,11 @@ describe('local API integration', () => {
     })
     expect(search.statusCode).toBe(200)
     expect(search.json().items).toHaveLength(30)
+    expect(search.json()).toMatchObject({
+      catalogTotal: 36,
+      filteredTotal: 35,
+      formatCounts: { all: 35, html: 0, markdown: 35 },
+    })
 
     const cursor = first.json().nextCursor as string
     const tamperedCursor = `${cursor.slice(0, -1)}${cursor.endsWith('x') ? 'y' : 'x'}`

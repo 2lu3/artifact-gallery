@@ -37,6 +37,16 @@ export interface GalleryPageQuery {
   readonly limit: number
 }
 
+export interface GalleryCounts {
+  readonly catalogTotal: number
+  readonly filteredTotal: number
+  readonly formatCounts: {
+    readonly all: number
+    readonly html: number
+    readonly markdown: number
+  }
+}
+
 const PRESENTATION_STATUS_SQL = `CASE
   WHEN artifact.source_status = 'missing' THEN 'missing'
   WHEN current_generation.job_status IN ('queued', 'processing') THEN 'processing'
@@ -120,5 +130,59 @@ export class GalleryRepository {
          LIMIT ?`,
       )
       .all(...parameters) as GalleryRow[]
+  }
+
+  readCounts(
+    query: Pick<GalleryPageQuery, 'format' | 'status' | 'artifactIds'>,
+  ): GalleryCounts {
+    const predicates: string[] = []
+    const parameters: number[] = []
+    if (query.status !== 'all') {
+      predicates.push('presentation_status = ?')
+    }
+    const textParameters: string[] = query.status === 'all' ? [] : [query.status]
+    if (query.artifactIds) {
+      if (query.artifactIds.length === 0) {
+        predicates.push('0')
+      } else {
+        predicates.push(`id IN (${query.artifactIds.map(() => '?').join(', ')})`)
+        parameters.push(...query.artifactIds)
+      }
+    }
+    const where = predicates.length > 0 ? `WHERE ${predicates.join(' AND ')}` : ''
+    const row = this.database
+      .prepare(
+        `WITH gallery_rows AS (
+           SELECT artifact.id,
+                  artifact.format,
+                  ${PRESENTATION_STATUS_SQL} AS presentation_status
+           FROM artifact
+           LEFT JOIN artifact_generation AS current_generation
+             ON current_generation.artifact_id = artifact.id
+            AND current_generation.generation = artifact.generation_counter
+         )
+         SELECT (SELECT COUNT(*) FROM artifact) AS catalog_total,
+                COUNT(*) AS all_count,
+                COALESCE(SUM(format = 'html'), 0) AS html_count,
+                COALESCE(SUM(format = 'markdown'), 0) AS markdown_count
+         FROM gallery_rows
+         ${where}`,
+      )
+      .get(...textParameters, ...parameters) as {
+        catalog_total: number
+        all_count: number
+        html_count: number
+        markdown_count: number
+      }
+    const formatCounts = {
+      all: row.all_count,
+      html: row.html_count,
+      markdown: row.markdown_count,
+    }
+    return {
+      catalogTotal: row.catalog_total,
+      filteredTotal: query.format === 'all' ? formatCounts.all : formatCounts[query.format],
+      formatCounts,
+    }
   }
 }

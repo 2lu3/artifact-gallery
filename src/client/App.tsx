@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { flushSync } from 'react-dom'
 
 import type {
   ArtifactCard,
@@ -27,6 +28,13 @@ interface RegistrationItem {
 
 export function App() {
   const [items, setItems] = useState<readonly ArtifactCard[]>([])
+  const [catalogTotal, setCatalogTotal] = useState(0)
+  const [filteredTotal, setFilteredTotal] = useState(0)
+  const [formatCounts, setFormatCounts] = useState<GalleryPage['formatCounts']>({
+    all: 0,
+    html: 0,
+    markdown: 0,
+  })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [nextCursor, setNextCursor] = useState<string | null>(null)
@@ -39,7 +47,14 @@ export function App() {
   const [selected, setSelected] = useState<ArtifactCard | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
   const initialListMeasured = useRef(false)
+  const requestGeneration = useRef(0)
+  const loadMoreRequest = useRef<{ controller: AbortController; generation: number; contextKey: string } | null>(null)
   const lightboxOrigin = useRef<{ element: HTMLElement; artifactId: number; scrollY: number } | null>(null)
+  const lightboxRestorePending = useRef(false)
+  const contextKey = JSON.stringify([acceptedQuery, filter, sort, reloadKey])
+  const contextKeyRef = useRef(contextKey)
+  const loadedContextKey = useRef<string | null>(null)
+  contextKeyRef.current = contextKey
 
   function openLightbox(item: ArtifactCard, element: HTMLElement) {
     lightboxOrigin.current = { element, artifactId: item.id, scrollY: window.scrollY }
@@ -47,17 +62,40 @@ export function App() {
   }
 
   const closeLightbox = useCallback(() => {
+    lightboxRestorePending.current = true
+    flushSync(() => setSelected(null))
+    if (loading || loadedContextKey.current !== contextKey) return
     const origin = lightboxOrigin.current
-    setSelected(null)
-    window.requestAnimationFrame(() => {
+    if (!origin) return
+    const focusTarget = origin.element.isConnected
+      ? origin.element
+      : document.querySelector<HTMLElement>(`[data-artifact-id="${origin.artifactId}"]`)
+    if (!focusTarget) return
+    window.scrollTo({ top: origin.scrollY })
+    focusTarget.focus({ preventScroll: true })
+    lightboxRestorePending.current = false
+  }, [contextKey, loading])
+
+  useEffect(() => {
+    if (
+      selected ||
+      loading ||
+      loadedContextKey.current !== contextKey ||
+      !lightboxRestorePending.current
+    ) return
+    const origin = lightboxOrigin.current
+    const frame = window.requestAnimationFrame(() => {
       if (!origin) return
-      window.scrollTo({ top: origin.scrollY })
       const focusTarget = origin.element.isConnected
         ? origin.element
         : document.querySelector<HTMLElement>(`[data-artifact-id="${origin.artifactId}"]`)
+      if (!focusTarget) return
+      window.scrollTo({ top: origin.scrollY })
       focusTarget?.focus({ preventScroll: true })
+      lightboxRestorePending.current = false
     })
-  }, [])
+    return () => window.cancelAnimationFrame(frame)
+  }, [contextKey, items, loading, selected])
 
   useEffect(() => {
     const timeout = window.setTimeout(() => {
@@ -71,7 +109,11 @@ export function App() {
   }, [acceptedQuery, query])
 
   useEffect(() => {
+    const generation = ++requestGeneration.current
+    loadMoreRequest.current?.controller.abort()
+    loadMoreRequest.current = null
     const controller = new AbortController()
+    setLoadingMore(false)
     setLoading(true)
     setError(null)
     api
@@ -79,8 +121,13 @@ export function App() {
         signal: controller.signal,
       })
       .then((page) => {
+        if (generation !== requestGeneration.current || contextKey !== contextKeyRef.current) return
+        loadedContextKey.current = contextKey
         setItems(page.items)
         setNextCursor(page.nextCursor)
+        setCatalogTotal(page.catalogTotal)
+        setFilteredTotal(page.filteredTotal)
+        setFormatCounts(page.formatCounts)
         window.requestAnimationFrame(() => {
           if (acceptedQuery) {
             performance.mark('artifact-gallery-search-rendered')
@@ -107,35 +154,47 @@ export function App() {
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false)
       })
-    return () => controller.abort()
-  }, [acceptedQuery, filter, reloadKey, sort])
-
-  const counts = useMemo(
-    () => ({
-      all: items.length,
-      html: items.filter(({ format }) => format === 'html').length,
-      markdown: items.filter(({ format }) => format === 'markdown').length,
-    }),
-    [items],
-  )
+    return () => {
+      controller.abort()
+      if (loadMoreRequest.current?.generation === generation) {
+        loadMoreRequest.current.controller.abort()
+        loadMoreRequest.current = null
+      }
+    }
+  }, [acceptedQuery, contextKey, filter, reloadKey, sort])
 
   async function loadMore() {
-    if (!nextCursor || loadingMore) return
+    if (!nextCursor || loadingMore || loadMoreRequest.current) return
+    const controller = new AbortController()
+    const generation = requestGeneration.current
+    const requestContextKey = contextKey
+    loadMoreRequest.current = { controller, generation, contextKey: requestContextKey }
     setLoadingMore(true)
     setError(null)
     try {
       const page = await api.get<GalleryPage>(
         resultsUrl({ filter, query: acceptedQuery, sort, cursor: nextCursor }),
+        { signal: controller.signal },
       )
+      if (
+        controller.signal.aborted ||
+        requestGeneration.current !== generation ||
+        contextKeyRef.current !== requestContextKey
+      ) return
       setItems((existing) => {
         const known = new Set(existing.map(({ id }) => id))
         return [...existing, ...page.items.filter(({ id }) => !known.has(id))]
       })
       setNextCursor(page.nextCursor)
     } catch (cause) {
-      setError(safeErrorMessage(cause))
+      if (!controller.signal.aborted && contextKeyRef.current === requestContextKey) {
+        setError(safeErrorMessage(cause))
+      }
     } finally {
-      setLoadingMore(false)
+      if (loadMoreRequest.current?.controller === controller) {
+        loadMoreRequest.current = null
+        setLoadingMore(false)
+      }
     }
   }
 
@@ -168,8 +227,7 @@ export function App() {
                 aria-pressed={filter === value}
                 onClick={() => setFilter(value)}
               >
-                {filterLabel(value)}
-                {filter === 'all' && !loading ? ` ${counts[value]}` : ''}
+                {filterLabel(value)} {!loading ? formatCounts[value] : ''}
               </button>
             ))}
           </div>
@@ -180,22 +238,29 @@ export function App() {
               <option value="title">タイトル順</option>
             </select>
           </label>
+          <span className="result-count" aria-live="polite">{loading ? '読み込み中' : `${filteredTotal}件`}</span>
         </section>
 
         {loading ? <GalleryStatus title="ギャラリーを読み込み中" message="少しお待ちください。" /> : null}
         {!loading && error ? (
           <GalleryStatus title="ギャラリーを読み込めませんでした" message={error} tone="error" />
         ) : null}
-        {!loading && !error && items.length === 0 && acceptedQuery ? (
+        {!loading && !error && items.length === 0 && catalogTotal === 0 ? (
+          <GalleryStatus
+            title="最初の生成物を登録"
+            message="HTML または Markdown のファイルかフォルダーを登録できます。"
+          />
+        ) : null}
+        {!loading && !error && items.length === 0 && catalogTotal > 0 && acceptedQuery ? (
           <GalleryStatus
             title="検索結果がありません"
             message="検索語や形式フィルターを変えてお試しください。"
           />
         ) : null}
-        {!loading && !error && items.length === 0 && !acceptedQuery ? (
+        {!loading && !error && items.length === 0 && catalogTotal > 0 && !acceptedQuery ? (
           <GalleryStatus
-            title="最初の生成物を登録"
-            message="HTML または Markdown のファイルかフォルダーを登録できます。"
+            title="該当する生成物がありません"
+            message="形式フィルターを変えてお試しください。"
           />
         ) : null}
         {!loading && !error && items.length > 0 ? (
@@ -400,6 +465,9 @@ function ArtifactLightbox({
 }) {
   const dialog = useRef<HTMLElement>(null)
   const closeButton = useRef<HTMLButtonElement>(null)
+  const deleteButton = useRef<HTMLButtonElement>(null)
+  const confirmationDialog = useRef<HTMLElement>(null)
+  const cancelDeleteButton = useRef<HTMLButtonElement>(null)
   const [detail, setDetail] = useState<ArtifactDetail | null>(null)
   const [title, setTitle] = useState(item.title)
   const titleDirty = useRef(false)
@@ -407,6 +475,13 @@ function ArtifactLightbox({
   const [busyAction, setBusyAction] = useState<string | null>(null)
   const [alert, setAlert] = useState<string | null>(null)
   const [deleteConfirmation, setDeleteConfirmation] = useState(false)
+  const deleteConfirmationOpen = useRef(deleteConfirmation)
+  deleteConfirmationOpen.current = deleteConfirmation
+
+  const closeDeleteConfirmation = useCallback(() => {
+    setDeleteConfirmation(false)
+    window.requestAnimationFrame(() => deleteButton.current?.focus())
+  }, [])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -504,7 +579,7 @@ function ArtifactLightbox({
       onGalleryChanged()
       onClose()
     } catch (cause) {
-      setDeleteConfirmation(false)
+      closeDeleteConfirmation()
       setAlert(safeErrorMessage(cause))
       setBusyAction(null)
     }
@@ -515,6 +590,7 @@ function ArtifactLightbox({
     document.body.style.overflow = 'hidden'
     closeButton.current?.focus()
     const onKeyDown = (event: KeyboardEvent) => {
+      if (deleteConfirmationOpen.current) return
       if (event.key === 'Escape') {
         event.preventDefault()
         onClose()
@@ -543,6 +619,32 @@ function ArtifactLightbox({
     }
   }, [onClose])
 
+  useEffect(() => {
+    if (!deleteConfirmation) return
+    cancelDeleteButton.current?.focus()
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        closeDeleteConfirmation()
+        return
+      }
+      if (event.key !== 'Tab' || !confirmationDialog.current) return
+      const focusable = [...confirmationDialog.current.querySelectorAll<HTMLElement>('button:not([disabled])')]
+      const first = focusable[0]
+      const last = focusable.at(-1)
+      if (!first || !last) return
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [closeDeleteConfirmation, deleteConfirmation])
+
   return (
     <div className="lightbox-layer" role="presentation" onMouseDown={onClose}>
       <section
@@ -550,6 +652,8 @@ function ArtifactLightbox({
         className="lightbox"
         role="dialog"
         aria-modal="true"
+        aria-hidden={deleteConfirmation ? true : undefined}
+        inert={deleteConfirmation ? true : undefined}
         aria-labelledby="lightbox-title"
         onMouseDown={(event) => event.stopPropagation()}
       >
@@ -624,6 +728,7 @@ function ArtifactLightbox({
               </form>
             ) : null}
             <button
+              ref={deleteButton}
               className="danger-button"
               type="button"
               disabled={Boolean(busyAction)}
@@ -642,59 +747,95 @@ function ArtifactLightbox({
             {alert ? <p className="inline-error" role="alert">{alert}</p> : null}
           </aside>
         </div>
-        {deleteConfirmation ? (
-          <div className="confirmation-layer" role="presentation">
-            <section className="confirmation" role="alertdialog" aria-labelledby="delete-title" aria-modal="true">
-              <h3 id="delete-title">ギャラリー記録を削除</h3>
-              <p>プレビュー、検索データ、ギャラリー記録を削除します。</p>
-              <p><strong>元ファイルは削除されません。</strong></p>
-              <div className="confirmation__actions">
-                <button type="button" disabled={Boolean(busyAction)} onClick={() => setDeleteConfirmation(false)}>
-                  キャンセル
-                </button>
-                <button className="danger-button" type="button" disabled={Boolean(busyAction)} onClick={deleteCatalogRecord}>
-                  記録だけ削除
-                </button>
-              </div>
-            </section>
-          </div>
-        ) : null}
       </section>
+      {deleteConfirmation ? (
+        <div className="confirmation-layer" role="presentation" onMouseDown={(event) => event.stopPropagation()}>
+          <section
+            ref={confirmationDialog}
+            className="confirmation"
+            role="alertdialog"
+            aria-labelledby="delete-title"
+            aria-modal="true"
+          >
+            <h3 id="delete-title">ギャラリー記録を削除</h3>
+            <p>プレビュー、検索データ、ギャラリー記録を削除します。</p>
+            <p><strong>元ファイルは削除されません。</strong></p>
+            <div className="confirmation__actions">
+              <button
+                ref={cancelDeleteButton}
+                type="button"
+                disabled={Boolean(busyAction)}
+                onClick={closeDeleteConfirmation}
+              >
+                キャンセル
+              </button>
+              <button className="danger-button" type="button" disabled={Boolean(busyAction)} onClick={deleteCatalogRecord}>
+                記録だけ削除
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </div>
   )
 }
 
 function ProtectedThumbnail({ item }: { item: ArtifactCard }) {
-  const [source, setSource] = useState<string | null>(null)
+  const previewRef = useRef<HTMLSpanElement>(null)
+  const [source, setSource] = useState<{ readonly thumbnailUrl: string; readonly objectUrl: string } | null>(null)
   useEffect(() => {
     if (!item.thumbnailUrl) return
-    const controller = new AbortController()
+    const preview = previewRef.current
+    if (!preview) return
+    let controller: AbortController | null = null
+    let observer: IntersectionObserver | null = null
     let objectUrl: string | null = null
-    api
-      .blob(item.thumbnailUrl, { signal: controller.signal })
-      .then((blob) => {
-        objectUrl = URL.createObjectURL(blob)
-        setSource(objectUrl)
-      })
-      .catch(() => {
-        if (!controller.signal.aborted) setSource(null)
-      })
+    let disposed = false
+    const load = () => {
+      if (controller) return
+      controller = new AbortController()
+      api
+        .blob(item.thumbnailUrl!, { signal: controller.signal })
+        .then((blob) => {
+          if (disposed) return
+          objectUrl = URL.createObjectURL(blob)
+          setSource({ thumbnailUrl: item.thumbnailUrl!, objectUrl })
+        })
+        .catch(() => {
+          if (!controller?.signal.aborted) setSource(null)
+        })
+    }
+    if (typeof IntersectionObserver === 'undefined') {
+      load()
+    } else {
+      observer = new IntersectionObserver(
+        (entries) => {
+          if (!entries.some((entry) => entry.isIntersecting)) return
+          observer?.disconnect()
+          load()
+        },
+        { rootMargin: '320px 0px' },
+      )
+      observer.observe(preview)
+    }
     return () => {
-      controller.abort()
+      disposed = true
+      observer?.disconnect()
+      controller?.abort()
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
   }, [item.thumbnailUrl])
 
-  if (source) {
+  if (source?.thumbnailUrl === item.thumbnailUrl) {
     return (
-      <span className="artifact-preview">
-        <img src={source} loading="lazy" alt={`${item.title}のプレビュー`} />
+      <span ref={previewRef} className="artifact-preview">
+        <img src={source.objectUrl} loading="lazy" alt={`${item.title}のプレビュー`} />
         {item.status !== 'ready' ? <span className="state-banner">{statusLabel(item.status)}</span> : null}
       </span>
     )
   }
   return (
-    <span className="artifact-preview artifact-preview--fallback" role="img" aria-label={`${item.title}のプレビューはありません`}>
+    <span ref={previewRef} className="artifact-preview artifact-preview--fallback" role="img" aria-label={`${item.title}のプレビューはありません`}>
       <span>{statusDescription(item.status)}</span>
       <code aria-hidden="true">{item.diagram}</code>
     </span>
@@ -715,9 +856,17 @@ async function pollImport(
 
 function registrationProgress(run: RegistrationRun): string {
   if (run.items.length === 0) return run.status === 'queued' ? 'ファイルを確認しています…' : '対象を列挙しています…'
-  const completed = run.items.filter((item) => ['completed', 'failed', 'cancelled'].includes(item.status)).length
+  const completed = run.items.filter((item) => item.status === 'completed').length
+  const failed = run.items.filter((item) => item.status === 'failed').length
+  const cancelled = run.items.filter((item) => item.status === 'cancelled')
+  const unstarted = cancelled.filter((item) => item.stage === 'queued').length
+  if (run.status === 'cancelled') {
+    const interrupted = cancelled.length - unstarted
+    return `${completed}件登録 · ${unstarted}件未開始${interrupted > 0 ? ` · ${interrupted}件中断` : ''}`
+  }
+  const settled = completed + failed + cancelled.length
   const active = run.items.find((item) => item.status === 'processing')
-  return `${completed}/${run.items.length}件${active ? ` · ${stageLabel(active.stage)}` : ''}`
+  return `${settled}/${run.items.length}件${active ? ` · ${stageLabel(active.stage)}` : ''}`
 }
 
 function registrationResultLabel(status: RegistrationRun['status']): string {

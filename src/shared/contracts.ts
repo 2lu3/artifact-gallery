@@ -43,6 +43,13 @@ export interface ArtifactCard {
 export interface GalleryPage {
   readonly items: readonly ArtifactCard[]
   readonly nextCursor: string | null
+  readonly catalogTotal: number
+  readonly filteredTotal: number
+  readonly formatCounts: {
+    readonly all: number
+    readonly html: number
+    readonly markdown: number
+  }
 }
 
 export interface ArtifactDetail extends ArtifactCard {

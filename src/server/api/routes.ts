@@ -731,6 +731,11 @@ function pageResponse(
   })
   const page = rows.slice(0, GALLERY_PAGE_SIZE)
   const last = page.at(-1)
+  const counts = gallery.readCounts({
+    format: query.filter,
+    status: query.status,
+    artifactIds,
+  })
   return {
     items: page.map((row) => toArtifactCard(row, thumbnailCodec)),
     nextCursor:
@@ -742,6 +747,7 @@ function pageResponse(
             lastId: last.id,
           })
         : null,
+    ...counts,
   }
 }
 
