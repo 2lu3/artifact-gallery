@@ -15,12 +15,7 @@ describe('BackgroundQueue', () => {
       active -= 1
     }
 
-    expect(Array.from({ length: 4 }, () => queue.enqueue(task))).toEqual([
-      true,
-      true,
-      true,
-      true,
-    ])
+    expect(Array.from({ length: 4 }, () => queue.enqueue(task))).toEqual([true, true, true, true])
     expect(queue.enqueue(task)).toBe(false)
     expect(active).toBe(0)
 

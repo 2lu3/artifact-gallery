@@ -1,4 +1,7 @@
-import type { ArtifactFormat, CardPresentation } from '../server/repositories/artifact-repository.js'
+import type {
+  ArtifactFormat,
+  CardPresentation,
+} from '../server/repositories/artifact-repository.js'
 import type { PublicProcessingError } from './errors.js'
 
 /** Sent by the trusted bootstrap document on every local API request. */

@@ -14,9 +14,9 @@ const temporaryDirectories: string[] = []
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { force: true, recursive: true }),
-    ),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { force: true, recursive: true })),
   )
 })
 
@@ -386,17 +386,8 @@ async function makeHarness() {
     })
     database
       .prepare('UPDATE artifact SET user_title = ?, derived_title = ? WHERE id = ?')
-      .run(
-        input.userTitle ?? null,
-        input.derivedTitle ?? basename(input.sourcePath),
-        artifact.id,
-      )
-    return addGeneration(
-      artifact.id,
-      input.sourcePath,
-      input.text,
-      input.indexStatus ?? 'ready',
-    )
+      .run(input.userTitle ?? null, input.derivedTitle ?? basename(input.sourcePath), artifact.id)
+    return addGeneration(artifact.id, input.sourcePath, input.text, input.indexStatus ?? 'ready')
   }
 
   return {

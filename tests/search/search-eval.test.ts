@@ -30,9 +30,9 @@ interface BigramDocument {
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { force: true, recursive: true }),
-    ),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { force: true, recursive: true })),
   )
 })
 
@@ -137,9 +137,7 @@ describe('fixed search quality evaluation', () => {
     expect(trigramHits).toBeGreaterThanOrEqual(18)
     expect(queryStats.every(({ medianMs }) => medianMs <= 200)).toBe(true)
     expect(trigramMaxMs).toBeLessThanOrEqual(400)
-    expect(trigramHits >= 18 && trigramMedianMs <= 200 ? 'trigram' : 'bigram').toBe(
-      'trigram',
-    )
+    expect(trigramHits >= 18 && trigramMedianMs <= 200 ? 'trigram' : 'bigram').toBe('trigram')
     database.close()
   })
 })
@@ -165,9 +163,7 @@ function prototypeBigramSearch(query: string, documents: BigramDocument[]): numb
 }
 
 function bigramFieldScore(field: string, terms: string[], weight: number): number {
-  return terms.every((term) => bigrams(term).every((bigram) => field.includes(bigram)))
-    ? weight
-    : 0
+  return terms.every((term) => bigrams(term).every((bigram) => field.includes(bigram))) ? weight : 0
 }
 
 function bigrams(term: string): string[] {

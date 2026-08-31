@@ -13,9 +13,9 @@ const temporaryDirectories: string[] = []
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { force: true, recursive: true }),
-    ),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { force: true, recursive: true })),
   )
 })
 
@@ -45,7 +45,13 @@ describe('reconcileStartup', () => {
     const fixture = fileURLToPath(
       new URL('../../../tests/fixtures/forced-termination.ts', import.meta.url),
     )
-    const child = spawn(process.execPath, ['--import', 'tsx', fixture, filename, permanentThumbnail])
+    const child = spawn(process.execPath, [
+      '--import',
+      'tsx',
+      fixture,
+      filename,
+      permanentThumbnail,
+    ])
     const [chunk] = (await once(child.stdout, 'data')) as [Buffer]
     const output = chunk.toString('utf8').trim()
     expect(output.startsWith('READY ')).toBe(true)

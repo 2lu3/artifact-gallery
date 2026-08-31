@@ -148,9 +148,7 @@ describe('buildApp', () => {
 
     for (const response of responses) {
       expect(response.headers['cache-control']).toBe('no-store')
-      expect(response.headers.vary?.toLowerCase().split(/\s*,\s*/u)).toContain(
-        SESSION_TOKEN_HEADER,
-      )
+      expect(response.headers.vary?.toLowerCase().split(/\s*,\s*/u)).toContain(SESSION_TOKEN_HEADER)
     }
     await app.close()
   })

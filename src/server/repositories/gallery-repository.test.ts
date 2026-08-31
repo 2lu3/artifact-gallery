@@ -11,9 +11,9 @@ const temporaryDirectories: string[] = []
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { force: true, recursive: true }),
-    ),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { force: true, recursive: true })),
   )
 })
 
@@ -92,13 +92,20 @@ function seedArtifacts(database: ReturnType<typeof openDatabase>): void {
       const state = format === 'markdown' ? 'ready' : 'failed'
       const timestamp = `2026-08-31T00:00:${index.toString().padStart(2, '0')}.000Z`
       const artifactId = Number(
-        insertArtifact.run(`/catalog/${index}.${format === 'markdown' ? 'md' : 'html'}`, format, timestamp, timestamp, timestamp)
-          .lastInsertRowid,
+        insertArtifact.run(
+          `/catalog/${index}.${format === 'markdown' ? 'md' : 'html'}`,
+          format,
+          timestamp,
+          timestamp,
+          timestamp,
+        ).lastInsertRowid,
       )
       const generationId = Number(
         insertGeneration.run(artifactId, state, state, state).lastInsertRowid,
       )
-      database.prepare('UPDATE artifact SET active_generation_id = ? WHERE id = ?').run(generationId, artifactId)
+      database
+        .prepare('UPDATE artifact SET active_generation_id = ? WHERE id = ?')
+        .run(generationId, artifactId)
     }
   })()
 }

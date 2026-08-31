@@ -23,9 +23,9 @@ const execFileAsync = promisify(execFile)
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { force: true, recursive: true }),
-    ),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { force: true, recursive: true })),
   )
 })
 
@@ -87,8 +87,7 @@ describe('production crash recovery matrix', () => {
         expect.objectContaining({
           interruptedRunIds: [state.runId],
           interruptedItemIds: [state.itemId],
-          interruptedGenerationIds:
-            stage === 'inspect' ? [] : [expect.any(Number)],
+          interruptedGenerationIds: stage === 'inspect' ? [] : [expect.any(Number)],
         }),
       ])
       await app.close()
@@ -98,207 +97,196 @@ describe('production crash recovery matrix', () => {
 })
 
 describe('production worker with real Chromium', () => {
-  it(
-    'uses one browser and at most two contexts while measuring RSS and cancellation latency under load',
-    async () => {
-      const root = await mkdtemp(join(tmpdir(), 'artifact-gallery-worker-load-'))
-      temporaryDirectories.push(root)
-      const thumbnailDirectory = join(root, 'derived')
-      await mkdir(thumbnailDirectory)
-      const sourcePaths = await Promise.all(
-        [1, 2, 3].map(async (id) => {
-          const sourcePath = join(root, `source-${id}.html`)
-          await writeFile(join(root, `gate-${id}.css`), 'body { color: teal }')
-          await writeFile(
-            sourcePath,
-            `<link rel="stylesheet" href="./gate-${id}.css"><h1>Item ${id}</h1>`,
-          )
-          return sourcePath
-        }),
-      )
-      const database = openDatabase({ filename: join(root, 'gallery.sqlite') })
-      const realPolicy = await PathPolicy.create([root])
-      const releases = new Map<number, () => void>()
-      let readsStarted = 0
-      let resolveFirstTwo!: () => void
-      let resolveThird!: () => void
-      const firstTwoStarted = new Promise<void>((resolve) => {
-        resolveFirstTwo = resolve
-      })
-      const thirdStarted = new Promise<void>((resolve) => {
-        resolveThird = resolve
-      })
-      const launchedBrowsers: Browser[] = []
-      const commitCriticalSectionMs: number[] = []
-      let peakContexts = 0
-      const renderer = new HtmlRenderer(
-        {
-          authorizeAsset: async (requestedPath) => {
-            const asset = await realPolicy.authorizeAsset(requestedPath)
-            const itemId = Number(/gate-(\d+)\.css$/u.exec(requestedPath)?.[1])
-            return {
-              canonicalPath: asset.canonicalPath,
-              mimeType: asset.mimeType,
-              read: async (maxBytes?: number) => {
-                readsStarted += 1
-                peakContexts = Math.max(
-                  peakContexts,
-                  ...launchedBrowsers.map((browser) => browser.contexts().length),
-                )
-                if (readsStarted === 2) resolveFirstTwo()
-                if (readsStarted === 3) resolveThird()
-                await new Promise<void>((resolve) => releases.set(itemId, resolve))
-                return asset.read(maxBytes)
-              },
-            }
-          },
+  it('uses one browser and at most two contexts while measuring RSS and cancellation latency under load', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'artifact-gallery-worker-load-'))
+    temporaryDirectories.push(root)
+    const thumbnailDirectory = join(root, 'derived')
+    await mkdir(thumbnailDirectory)
+    const sourcePaths = await Promise.all(
+      [1, 2, 3].map(async (id) => {
+        const sourcePath = join(root, `source-${id}.html`)
+        await writeFile(join(root, `gate-${id}.css`), 'body { color: teal }')
+        await writeFile(
+          sourcePath,
+          `<link rel="stylesheet" href="./gate-${id}.css"><h1>Item ${id}</h1>`,
+        )
+        return sourcePath
+      }),
+    )
+    const database = openDatabase({ filename: join(root, 'gallery.sqlite') })
+    const realPolicy = await PathPolicy.create([root])
+    const releases = new Map<number, () => void>()
+    let readsStarted = 0
+    let resolveFirstTwo!: () => void
+    let resolveThird!: () => void
+    const firstTwoStarted = new Promise<void>((resolve) => {
+      resolveFirstTwo = resolve
+    })
+    const thirdStarted = new Promise<void>((resolve) => {
+      resolveThird = resolve
+    })
+    const launchedBrowsers: Browser[] = []
+    const commitCriticalSectionMs: number[] = []
+    let peakContexts = 0
+    const renderer = new HtmlRenderer(
+      {
+        authorizeAsset: async (requestedPath) => {
+          const asset = await realPolicy.authorizeAsset(requestedPath)
+          const itemId = Number(/gate-(\d+)\.css$/u.exec(requestedPath)?.[1])
+          return {
+            canonicalPath: asset.canonicalPath,
+            mimeType: asset.mimeType,
+            read: async (maxBytes?: number) => {
+              readsStarted += 1
+              peakContexts = Math.max(
+                peakContexts,
+                ...launchedBrowsers.map((browser) => browser.contexts().length),
+              )
+              if (readsStarted === 2) resolveFirstTwo()
+              if (readsStarted === 3) resolveThird()
+              await new Promise<void>((resolve) => releases.set(itemId, resolve))
+              return asset.read(maxBytes)
+            },
+          }
         },
-        {
-          launchBrowser: async () => {
-            const browser = await chromium.launch({ headless: true })
-            launchedBrowsers.push(browser)
-            return browser
-          },
+      },
+      {
+        launchBrowser: async () => {
+          const browser = await chromium.launch({ headless: true })
+          launchedBrowsers.push(browser)
+          return browser
         },
-      )
-      const processor = new ArtifactProcessor({
-        database,
-        pathPolicy: realPolicy,
-        htmlRenderer: renderer,
-        thumbnailDirectory,
-        reportCommitCriticalSection: ({ durationMs }) => {
-          commitCriticalSectionMs.push(durationMs)
-        },
-      })
-      const worker = new ImportWorker({ processor, concurrency: 2, capacity: 4 })
-      const imports = new ImportRepository(database)
-      const runs = sourcePaths.map((sourcePath) => imports.createRun([sourcePath]))
-      const rssSampler = startPeriodicPeakSampler(
-        () => chromiumDescendantRssBytes(process.pid),
-        100,
-      )
-      let rssMeasurement!: Awaited<ReturnType<typeof rssSampler.stop>>
-      let cancelLatencyMs = 0
-      try {
-        runs.forEach((run, index) => {
-          worker.enqueue('register', {
-            sourcePath: sourcePaths[index] as string,
-            runId: run.id,
-            itemId: run.itemIds[0],
-          })
+      },
+    )
+    const processor = new ArtifactProcessor({
+      database,
+      pathPolicy: realPolicy,
+      htmlRenderer: renderer,
+      thumbnailDirectory,
+      reportCommitCriticalSection: ({ durationMs }) => {
+        commitCriticalSectionMs.push(durationMs)
+      },
+    })
+    const worker = new ImportWorker({ processor, concurrency: 2, capacity: 4 })
+    const imports = new ImportRepository(database)
+    const runs = sourcePaths.map((sourcePath) => imports.createRun([sourcePath]))
+    const rssSampler = startPeriodicPeakSampler(() => chromiumDescendantRssBytes(process.pid), 100)
+    let rssMeasurement!: Awaited<ReturnType<typeof rssSampler.stop>>
+    let cancelLatencyMs = 0
+    try {
+      runs.forEach((run, index) => {
+        worker.enqueue('register', {
+          sourcePath: sourcePaths[index] as string,
+          runId: run.id,
+          itemId: run.itemIds[0],
         })
+      })
 
-        await firstTwoStarted
-        expect(launchedBrowsers).toHaveLength(1)
-        expect(launchedBrowsers[0]?.contexts()).toHaveLength(2)
-        expect(imports.getItem(runs[2]!.itemIds[0]).status).toBe('queued')
-
-        const cancelStartedAt = performance.now()
-        imports.requestCancellation(runs[0]!.id, new Date().toISOString())
-        releases.get(1)?.()
-        await waitForTerminal(imports, runs[0]!.id)
-        cancelLatencyMs = performance.now() - cancelStartedAt
-        expect(imports.getRun(runs[0]!.id).status).toBe('cancelled')
-        expect(cancelLatencyMs).toBeLessThan(1_500)
-
-        releases.get(2)?.()
-        await thirdStarted
-        releases.get(3)?.()
-        await worker.onIdle()
-      } finally {
-        rssMeasurement = await rssSampler.stop()
-      }
-      expect(rssMeasurement.sampleCount).toBeGreaterThan(1)
-      expect(rssMeasurement.peakBytes).toBe(Math.max(...rssMeasurement.samples))
-      expect(rssMeasurement.peakBytes).toBeGreaterThan(0)
-      expect(rssMeasurement.peakBytes).toBeLessThan(4 * 1024 * 1024 * 1024)
-      expect(commitCriticalSectionMs.length).toBeGreaterThan(1)
-      const maxCommitCriticalSectionMs = Math.max(...commitCriticalSectionMs)
-      expect(maxCommitCriticalSectionMs).toBeLessThan(250)
-      expect(peakContexts).toBe(2)
+      await firstTwoStarted
       expect(launchedBrowsers).toHaveLength(1)
-      expect(launchedBrowsers[0]?.contexts()).toHaveLength(0)
-      expect(imports.getRun(runs[1]!.id).status).toBe('completed')
-      expect(imports.getRun(runs[2]!.id).status).toBe('completed')
-      console.info(
-        `task9-reliability chromiumPeakRssMiB=${(rssMeasurement.peakBytes / 1024 / 1024).toFixed(1)} rssSamples=${rssMeasurement.sampleCount} cancelLatencyMs=${cancelLatencyMs.toFixed(1)} commitCriticalMaxMs=${maxCommitCriticalSectionMs.toFixed(2)}`,
-      )
+      expect(launchedBrowsers[0]?.contexts()).toHaveLength(2)
+      expect(imports.getItem(runs[2]!.itemIds[0]).status).toBe('queued')
 
-      await worker.close()
-      await renderer.close()
-      database.close()
-    },
-    20_000,
-  )
+      const cancelStartedAt = performance.now()
+      imports.requestCancellation(runs[0]!.id, new Date().toISOString())
+      releases.get(1)?.()
+      await waitForTerminal(imports, runs[0]!.id)
+      cancelLatencyMs = performance.now() - cancelStartedAt
+      expect(imports.getRun(runs[0]!.id).status).toBe('cancelled')
+      expect(cancelLatencyMs).toBeLessThan(1_500)
 
-  it(
-    'relaunches after an isolated browser crash and lets the worker complete the next item',
-    async () => {
-      const root = await mkdtemp(join(tmpdir(), 'artifact-gallery-worker-crash-'))
-      temporaryDirectories.push(root)
-      const thumbnailDirectory = join(root, 'derived')
-      await mkdir(thumbnailDirectory)
-      const crashSource = join(root, 'crash.html')
-      const recoverySource = join(root, 'recovery.html')
-      await writeFile(join(root, 'crash.css'), 'body { color: red }')
-      await writeFile(crashSource, '<link rel="stylesheet" href="./crash.css"><h1>Crash</h1>')
-      await writeFile(recoverySource, '<h1>Recovered</h1>')
-      const database = openDatabase({ filename: join(root, 'gallery.sqlite') })
-      const realPolicy = await PathPolicy.create([root])
-      const launchedBrowsers: Browser[] = []
-      let crashed = false
-      const renderer = new HtmlRenderer(
-        {
-          authorizeAsset: async (requestedPath) => {
-            const asset = await realPolicy.authorizeAsset(requestedPath)
-            if (!crashed) {
-              crashed = true
-              await launchedBrowsers[0]?.close()
-            }
-            return asset
-          },
-        },
-        {
-          launchBrowser: async () => {
-            const browser = await chromium.launch({ headless: true })
-            launchedBrowsers.push(browser)
-            return browser
-          },
-        },
-      )
-      const processor = new ArtifactProcessor({
-        database,
-        pathPolicy: realPolicy,
-        htmlRenderer: renderer,
-        thumbnailDirectory,
-      })
-      const worker = new ImportWorker({ processor, concurrency: 1 })
-      const imports = new ImportRepository(database)
-      const crashRun = imports.createRun([crashSource])
-      const recoveryRun = imports.createRun([recoverySource])
-
-      worker.enqueue('register', {
-        sourcePath: crashSource,
-        runId: crashRun.id,
-        itemId: crashRun.itemIds[0],
-      })
-      worker.enqueue('register', {
-        sourcePath: recoverySource,
-        runId: recoveryRun.id,
-        itemId: recoveryRun.itemIds[0],
-      })
+      releases.get(2)?.()
+      await thirdStarted
+      releases.get(3)?.()
       await worker.onIdle()
+    } finally {
+      rssMeasurement = await rssSampler.stop()
+    }
+    expect(rssMeasurement.sampleCount).toBeGreaterThan(1)
+    expect(rssMeasurement.peakBytes).toBe(Math.max(...rssMeasurement.samples))
+    expect(rssMeasurement.peakBytes).toBeGreaterThan(0)
+    expect(rssMeasurement.peakBytes).toBeLessThan(4 * 1024 * 1024 * 1024)
+    expect(commitCriticalSectionMs.length).toBeGreaterThan(1)
+    const maxCommitCriticalSectionMs = Math.max(...commitCriticalSectionMs)
+    expect(maxCommitCriticalSectionMs).toBeLessThan(250)
+    expect(peakContexts).toBe(2)
+    expect(launchedBrowsers).toHaveLength(1)
+    expect(launchedBrowsers[0]?.contexts()).toHaveLength(0)
+    expect(imports.getRun(runs[1]!.id).status).toBe('completed')
+    expect(imports.getRun(runs[2]!.id).status).toBe('completed')
+    console.info(
+      `task9-reliability chromiumPeakRssMiB=${(rssMeasurement.peakBytes / 1024 / 1024).toFixed(1)} rssSamples=${rssMeasurement.sampleCount} cancelLatencyMs=${cancelLatencyMs.toFixed(1)} commitCriticalMaxMs=${maxCommitCriticalSectionMs.toFixed(2)}`,
+    )
 
-      expect(imports.getRun(crashRun.id).status).toBe('failed')
-      expect(imports.getRun(recoveryRun.id).status).toBe('completed')
-      expect(launchedBrowsers).toHaveLength(2)
-      expect(launchedBrowsers[1]?.contexts()).toHaveLength(0)
-      await worker.close()
-      await renderer.close()
-      database.close()
-    },
-    20_000,
-  )
+    await worker.close()
+    await renderer.close()
+    database.close()
+  }, 20_000)
+
+  it('relaunches after an isolated browser crash and lets the worker complete the next item', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'artifact-gallery-worker-crash-'))
+    temporaryDirectories.push(root)
+    const thumbnailDirectory = join(root, 'derived')
+    await mkdir(thumbnailDirectory)
+    const crashSource = join(root, 'crash.html')
+    const recoverySource = join(root, 'recovery.html')
+    await writeFile(join(root, 'crash.css'), 'body { color: red }')
+    await writeFile(crashSource, '<link rel="stylesheet" href="./crash.css"><h1>Crash</h1>')
+    await writeFile(recoverySource, '<h1>Recovered</h1>')
+    const database = openDatabase({ filename: join(root, 'gallery.sqlite') })
+    const realPolicy = await PathPolicy.create([root])
+    const launchedBrowsers: Browser[] = []
+    let crashed = false
+    const renderer = new HtmlRenderer(
+      {
+        authorizeAsset: async (requestedPath) => {
+          const asset = await realPolicy.authorizeAsset(requestedPath)
+          if (!crashed) {
+            crashed = true
+            await launchedBrowsers[0]?.close()
+          }
+          return asset
+        },
+      },
+      {
+        launchBrowser: async () => {
+          const browser = await chromium.launch({ headless: true })
+          launchedBrowsers.push(browser)
+          return browser
+        },
+      },
+    )
+    const processor = new ArtifactProcessor({
+      database,
+      pathPolicy: realPolicy,
+      htmlRenderer: renderer,
+      thumbnailDirectory,
+    })
+    const worker = new ImportWorker({ processor, concurrency: 1 })
+    const imports = new ImportRepository(database)
+    const crashRun = imports.createRun([crashSource])
+    const recoveryRun = imports.createRun([recoverySource])
+
+    worker.enqueue('register', {
+      sourcePath: crashSource,
+      runId: crashRun.id,
+      itemId: crashRun.itemIds[0],
+    })
+    worker.enqueue('register', {
+      sourcePath: recoverySource,
+      runId: recoveryRun.id,
+      itemId: recoveryRun.itemIds[0],
+    })
+    await worker.onIdle()
+
+    expect(imports.getRun(crashRun.id).status).toBe('failed')
+    expect(imports.getRun(recoveryRun.id).status).toBe('completed')
+    expect(launchedBrowsers).toHaveLength(2)
+    expect(launchedBrowsers[1]?.contexts()).toHaveLength(0)
+    await worker.close()
+    await renderer.close()
+    database.close()
+  }, 20_000)
 })
 
 async function readReadyState(
@@ -329,7 +317,9 @@ async function readReadyState(
 
 async function waitForTerminal(imports: ImportRepository, runId: number): Promise<void> {
   for (let attempt = 0; attempt < 150; attempt += 1) {
-    if (['completed', 'failed', 'cancelled', 'interrupted'].includes(imports.getRun(runId).status)) {
+    if (
+      ['completed', 'failed', 'cancelled', 'interrupted'].includes(imports.getRun(runId).status)
+    ) {
       return
     }
     await new Promise((resolve) => setTimeout(resolve, 10))

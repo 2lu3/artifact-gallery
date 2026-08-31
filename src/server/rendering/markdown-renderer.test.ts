@@ -67,9 +67,7 @@ const fenced = "safe";
     expect(result.html).toContain(
       '<pre><code class="language-js">const fenced = "safe";\n</code></pre>',
     )
-    expect(result.html).toContain(
-      '<pre><code>const indented = true;\n</code></pre>',
-    )
+    expect(result.html).toContain('<pre><code>const indented = true;\n</code></pre>')
     expect(result.text).toContain('first line\ncontinued line')
     expect(result.text).toContain('const fenced = "safe";')
     expect(result.text).toContain('const indented = true;')

@@ -1,10 +1,6 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 
-import type {
-  GalleryFilter,
-  GallerySortMode,
-  GalleryStatusFilter,
-} from '../../shared/contracts.js'
+import type { GalleryFilter, GallerySortMode, GalleryStatusFilter } from '../../shared/contracts.js'
 
 export interface CursorContext {
   readonly sort: GallerySortMode
@@ -73,7 +69,9 @@ function isCursorPayload(value: unknown): value is CursorPayload {
     typeof candidate.lastId === 'number' &&
     Number.isSafeInteger(candidate.lastId) &&
     (candidate.sort === 'newest' || candidate.sort === 'title') &&
-    (candidate.filter === 'all' || candidate.filter === 'html' || candidate.filter === 'markdown') &&
+    (candidate.filter === 'all' ||
+      candidate.filter === 'html' ||
+      candidate.filter === 'markdown') &&
     (candidate.status === 'all' ||
       candidate.status === 'missing' ||
       candidate.status === 'processing' ||

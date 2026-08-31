@@ -10,9 +10,9 @@ const temporaryDirectories: string[] = []
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { force: true, recursive: true }),
-    ),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { force: true, recursive: true })),
   )
 })
 
@@ -321,9 +321,7 @@ describe('ImportRepository', () => {
       /import item transition/i,
     )
     expect(() => imports.cancelItem(completed.itemIds[0], now)).toThrow(/import item transition/i)
-    expect(() => imports.completeItem(completed.itemIds[0], now)).toThrow(
-      /import item transition/i,
-    )
+    expect(() => imports.completeItem(completed.itemIds[0], now)).toThrow(/import item transition/i)
 
     const interrupted = imports.createRun(['/canonical/interrupted.md'])
     database

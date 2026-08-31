@@ -70,7 +70,10 @@ export class ApiClient {
     const response = await fetch(url, { ...init, headers })
     if (!response.ok) {
       const body = await readErrorResponse(response)
-      throw new ApiRequestError(response.status, body?.error.message ?? '操作を完了できませんでした。')
+      throw new ApiRequestError(
+        response.status,
+        body?.error.message ?? '操作を完了できませんでした。',
+      )
     }
     return response
   }

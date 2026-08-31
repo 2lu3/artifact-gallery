@@ -48,8 +48,13 @@ test.describe.serial('Artifact Gallery', () => {
     await expect(page.getByRole('searchbox', { name: '生成物を検索' })).toBeVisible()
     await expect(page.getByRole('button', { name: '生成物を登録' })).toBeVisible()
     await expect(page.getByRole('heading', { name: '最初の生成物を登録' })).toBeVisible()
-    await expect(page.getByText('HTML または Markdown のファイルかフォルダーを登録できます。')).toBeVisible()
-    await expect(page.getByRole('button', { name: 'すべて' })).toHaveAttribute('aria-pressed', 'true')
+    await expect(
+      page.getByText('HTML または Markdown のファイルかフォルダーを登録できます。'),
+    ).toBeVisible()
+    await expect(page.getByRole('button', { name: 'すべて' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
   })
 
   test('registers a Markdown file and renders its gallery card', async ({ page }) => {
@@ -83,7 +88,9 @@ test.describe.serial('Artifact Gallery', () => {
     await expect(card.getByText('HTML', { exact: true })).toBeVisible()
   })
 
-  test('registers a folder recursively and reports an item-level symlink failure', async ({ page }) => {
+  test('registers a folder recursively and reports an item-level symlink failure', async ({
+    page,
+  }) => {
     const folder = join(sourceDirectory, 'folder-import')
     await mkdir(join(folder, 'notes'), { recursive: true })
     await writeFile(join(folder, 'landing.html'), '<title>Folder Landing</title><p>from folder</p>')
@@ -93,13 +100,17 @@ test.describe.serial('Artifact Gallery', () => {
 
     const dialog = await registerPath(page, folder, 'folder')
 
-    await expect(page.getByRole('button', { name: /Folder Landing/u })).toBeVisible({ timeout: 30_000 })
+    await expect(page.getByRole('button', { name: /Folder Landing/u })).toBeVisible({
+      timeout: 30_000,
+    })
     await expect(page.getByRole('button', { name: /Folder Notes/u })).toBeVisible()
     await expect(dialog.getByText(/linked\.md:/u)).toBeVisible()
     await expect(dialog.getByText(/symbolic link/i)).toBeVisible()
   })
 
-  test('allows a running folder registration to be cancelled without losing completed work', async ({ page }) => {
+  test('allows a running folder registration to be cancelled without losing completed work', async ({
+    page,
+  }) => {
     const folder = join(sourceDirectory, 'cancel-import')
     await mkdir(folder)
     for (let index = 0; index < 24; index += 1) {
@@ -131,7 +142,8 @@ test.describe.serial('Artifact Gallery', () => {
     await secondPage.goto(baseURL)
     for (const candidate of [page, secondPage]) {
       await candidate.getByRole('button', { name: '生成物を登録' }).click()
-      await candidate.getByRole('dialog', { name: '生成物を登録' })
+      await candidate
+        .getByRole('dialog', { name: '生成物を登録' })
         .getByLabel('ファイルまたはフォルダーのパス')
         .fill(sourcePath)
     }
@@ -151,22 +163,38 @@ test.describe.serial('Artifact Gallery', () => {
       await route.continue()
     })
     const submits = Promise.all([
-      page.getByRole('dialog', { name: '生成物を登録' }).getByRole('button', { name: '登録を開始' }).click(),
-      secondPage.getByRole('dialog', { name: '生成物を登録' }).getByRole('button', { name: '登録を開始' }).click(),
+      page
+        .getByRole('dialog', { name: '生成物を登録' })
+        .getByRole('button', { name: '登録を開始' })
+        .click(),
+      secondPage
+        .getByRole('dialog', { name: '生成物を登録' })
+        .getByRole('button', { name: '登録を開始' })
+        .click(),
     ])
     await bothArrived
-    await expect(page.getByRole('dialog', { name: '生成物を登録' }).getByText('登録完了')).toHaveCount(0)
-    await expect(secondPage.getByRole('dialog', { name: '生成物を登録' }).getByText('登録完了')).toHaveCount(0)
+    await expect(
+      page.getByRole('dialog', { name: '生成物を登録' }).getByText('登録完了'),
+    ).toHaveCount(0)
+    await expect(
+      secondPage.getByRole('dialog', { name: '生成物を登録' }).getByText('登録完了'),
+    ).toHaveCount(0)
     releaseSubmissions()
     await submits
-    await expect(page.getByRole('dialog', { name: '生成物を登録' }).getByText('登録完了')).toBeVisible({ timeout: 30_000 })
-    await expect(secondPage.getByRole('dialog', { name: '生成物を登録' }).getByText('登録完了')).toBeVisible({ timeout: 30_000 })
+    await expect(
+      page.getByRole('dialog', { name: '生成物を登録' }).getByText('登録完了'),
+    ).toBeVisible({ timeout: 30_000 })
+    await expect(
+      secondPage.getByRole('dialog', { name: '生成物を登録' }).getByText('登録完了'),
+    ).toBeVisible({ timeout: 30_000 })
 
     await expect(page.getByRole('button', { name: /Duplicate Guard/u })).toHaveCount(1)
     await secondPage.close()
   })
 
-  test('keeps the trusted bootstrap token out of URLs, storage, DOM, and console', async ({ page }) => {
+  test('keeps the trusted bootstrap token out of URLs, storage, DOM, and console', async ({
+    page,
+  }) => {
     const apiRequests: Array<{ url: string; token: string | undefined }> = []
     const consoleMessages: string[] = []
     page.on('request', (request) => {
@@ -186,15 +214,19 @@ test.describe.serial('Artifact Gallery', () => {
     expect(request?.token).toMatch(/^[A-Za-z0-9_-]{40,}$/u)
     expect(request?.url).not.toContain(request?.token ?? 'missing-token')
     expect(new URL(page.url()).search).toBe('')
-    expect(await page.evaluate(() => ({
-      local: Object.keys(localStorage),
-      session: Object.keys(sessionStorage),
-      bootstrap: document.getElementById('artifact-gallery-bootstrap'),
-    }))).toEqual({ local: [], session: [], bootstrap: null })
+    expect(
+      await page.evaluate(() => ({
+        local: Object.keys(localStorage),
+        session: Object.keys(sessionStorage),
+        bootstrap: document.getElementById('artifact-gallery-bootstrap'),
+      })),
+    ).toEqual({ local: [], session: [], bootstrap: null })
     expect(consoleMessages.join('\n')).not.toContain(request?.token ?? 'missing-token')
   })
 
-  test('debounces search, cancels obsolete results, filters, sorts, and shows no results', async ({ page }) => {
+  test('debounces search, cancels obsolete results, filters, sorts, and shows no results', async ({
+    page,
+  }) => {
     const kyotoPath = join(sourceDirectory, 'search-kyoto.md')
     const salesPath = join(sourceDirectory, 'search-sales.html')
     await writeFile(kyotoPath, '# 京都旅行プラン\n\n建築と喫茶店')
@@ -252,7 +284,9 @@ test.describe.serial('Artifact Gallery', () => {
     expect(searchMeasurements.length).toBeGreaterThan(0)
   })
 
-  test('opens a no-navigation lightbox and restores query, filter, sort, scroll, and focus', async ({ page }) => {
+  test('opens a no-navigation lightbox and restores query, filter, sort, scroll, and focus', async ({
+    page,
+  }) => {
     const sourcePath = join(sourceDirectory, 'restorable-card.md')
     await writeFile(sourcePath, '# Restorable Card\n\nLightbox state anchor.')
     await page.goto(baseURL)
@@ -275,7 +309,10 @@ test.describe.serial('Artifact Gallery', () => {
     await expect(lightbox).toBeVisible()
     expect(page.url()).toBe(before.url)
     await expect(search).toHaveValue('Restorable')
-    await expect(page.getByRole('button', { name: 'Markdown' })).toHaveAttribute('aria-pressed', 'true')
+    await expect(page.getByRole('button', { name: 'Markdown' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
     await expect(page.getByLabel('並び順')).toHaveValue('title')
     await page.keyboard.press('Escape')
     await expect(lightbox).toHaveCount(0)
@@ -283,7 +320,9 @@ test.describe.serial('Artifact Gallery', () => {
     expect(Math.abs((await page.evaluate(() => scrollY)) - before.scrollY)).toBeLessThanOrEqual(1)
   })
 
-  test('updates title and preview and exposes safe source actions from the lightbox', async ({ page }) => {
+  test('updates title and preview and exposes safe source actions from the lightbox', async ({
+    page,
+  }) => {
     const sourcePath = join(sourceDirectory, 'lightbox-actions.md')
     await writeFile(sourcePath, '# Action Card\n\nVersion one.')
     await page.goto(baseURL)
@@ -302,12 +341,18 @@ test.describe.serial('Artifact Gallery', () => {
     await expect(renamedLightbox.getByRole('heading', { name: 'Renamed Artifact' })).toBeVisible()
 
     await renamedLightbox.getByRole('button', { name: '元ファイルを開く' }).click()
-    await expect(renamedLightbox.getByRole('alert')).toHaveText('This action is not supported on the current platform.')
+    await expect(renamedLightbox.getByRole('alert')).toHaveText(
+      'This action is not supported on the current platform.',
+    )
     await renamedLightbox.getByRole('button', { name: 'Finderで表示' }).click()
-    await expect(renamedLightbox.getByRole('alert')).toHaveText('This action is not supported on the current platform.')
+    await expect(renamedLightbox.getByRole('alert')).toHaveText(
+      'This action is not supported on the current platform.',
+    )
   })
 
-  test('keeps the last preview while missing and validates relink before retrying', async ({ page }) => {
+  test('keeps the last preview while missing and validates relink before retrying', async ({
+    page,
+  }) => {
     const sourcePath = join(sourceDirectory, 'missing-original.md')
     const wrongFormatPath = join(sourceDirectory, 'wrong-format.html')
     const replacementPath = join(sourceDirectory, 'missing-replacement.md')
@@ -336,7 +381,9 @@ test.describe.serial('Artifact Gallery', () => {
     await expect(lightbox.locator('.status-value')).toHaveText('登録済み')
     await expect(lightbox.getByText(replacementPath)).toBeVisible()
     await lightbox.getByRole('button', { name: '再試行' }).click()
-    await expect(page.getByRole('dialog', { name: 'Relinked Content' }).getByText('世代 2')).toBeVisible({
+    await expect(
+      page.getByRole('dialog', { name: 'Relinked Content' }).getByText('世代 2'),
+    ).toBeVisible({
       timeout: 30_000,
     })
   })
@@ -393,24 +440,37 @@ test.describe.serial('Artifact Gallery', () => {
     await page.getByRole('button', { name: 'すべて 35' }).click()
     const nextPageResponse = page.waitForResponse((response) => {
       const url = new URL(response.url())
-      return ['/api/gallery', '/api/search'].includes(url.pathname) && url.searchParams.has('cursor')
+      return (
+        ['/api/gallery', '/api/search'].includes(url.pathname) && url.searchParams.has('cursor')
+      )
     })
     await page.getByRole('button', { name: 'さらに読み込む' }).click()
     expect((await nextPageResponse).status()).toBe(200)
 
     await expect(cards).toHaveCount(35)
     await expect(page.getByRole('button', { name: 'さらに読み込む' })).toHaveCount(0)
-    await expect(cards.first().locator('[role="img"]')).toHaveAttribute('aria-label', /プレビューはありません/u)
+    await expect(cards.first().locator('[role="img"]')).toHaveAttribute(
+      'aria-label',
+      /プレビューはありません/u,
+    )
   })
 
-  test('defers authenticated thumbnail requests until a below-fold card nears the viewport', async ({ page }) => {
+  test('defers authenticated thumbnail requests until a below-fold card nears the viewport', async ({
+    page,
+  }) => {
     const sourcePath = join(sourceDirectory, 'lazy-thumbnail-source.html')
-    await writeFile(sourcePath, '<!doctype html><title>Lazy Thumbnail Source</title><h1>Creates a real protected WebP.</h1>')
+    await writeFile(
+      sourcePath,
+      '<!doctype html><title>Lazy Thumbnail Source</title><h1>Creates a real protected WebP.</h1>',
+    )
     await page.goto(baseURL)
     await registerPath(page, sourcePath, 'file')
     await page.getByRole('button', { name: '登録画面を閉じる' }).click()
     const thumbnailPath = join(thumbnailDirectory, 'lazy-thumbnail.webp')
-    await writeFile(thumbnailPath, Buffer.from('UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEAAQAcJaQAA3AA/vuUAAA=', 'base64'))
+    await writeFile(
+      thumbnailPath,
+      Buffer.from('UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEAAQAcJaQAA3AA/vuUAAA=', 'base64'),
+    )
     seedThumbnailCards(databaseFilename, thumbnailPath, 20)
     await page.setViewportSize({ width: 900, height: 500 })
     const thumbnailRequests: string[] = []
@@ -434,7 +494,9 @@ test.describe.serial('Artifact Gallery', () => {
     const galleryPage = (await (await galleryResponse).json()) as {
       items: Array<{ title: string; thumbnailUrl: string | null }>
     }
-    const belowFoldThumbnailUrl = galleryPage.items.find((item) => item.title === 'Lazy Thumbnail 00')?.thumbnailUrl
+    const belowFoldThumbnailUrl = galleryPage.items.find(
+      (item) => item.title === 'Lazy Thumbnail 00',
+    )?.thumbnailUrl
     expect(belowFoldThumbnailUrl).toBeTruthy()
     const absoluteBelowFoldThumbnailUrl = new URL(belowFoldThumbnailUrl!, baseURL).href
     const belowFold = page.getByRole('button', { name: /Lazy Thumbnail 00/u })
@@ -476,24 +538,35 @@ test.describe.serial('Artifact Gallery', () => {
     await page.getByRole('button', { name: 'さらに読み込む' }).click()
     await pageStarted
     await page.getByRole('button', { name: /^HTML \d+$/u }).click()
-    await expect(page.getByRole('button', { name: /^HTML \d+$/u })).toHaveAttribute('aria-pressed', 'true')
+    await expect(page.getByRole('button', { name: /^HTML \d+$/u })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
     await expect(page.locator('.artifact-card').first()).toBeVisible()
     releasePage()
     await page.waitForTimeout(250)
 
-    await expect.poll(async () => page.locator('.artifact-card .format-label').allTextContents()).toEqual(
-      expect.arrayContaining(['HTML']),
+    await expect
+      .poll(async () => page.locator('.artifact-card .format-label').allTextContents())
+      .toEqual(expect.arrayContaining(['HTML']))
+    expect(await page.locator('.artifact-card .format-label').allTextContents()).not.toContain(
+      'MARKDOWN',
     )
-    expect(await page.locator('.artifact-card .format-label').allTextContents()).not.toContain('MARKDOWN')
     await expect(page.getByRole('button', { name: 'さらに読み込む' })).toHaveCount(0)
   })
 
-  test('renders processing, partial, and failed cards with safe recovery details', async ({ page }) => {
+  test('renders processing, partial, and failed cards with safe recovery details', async ({
+    page,
+  }) => {
     seedRecoveryCards(databaseFilename)
     await page.goto(baseURL)
 
-    await expect(page.getByRole('button', { name: /State Processing/u }).getByText('描画中')).toBeVisible()
-    await expect(page.getByRole('button', { name: /State Partial/u }).getByText('一部失敗')).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: /State Processing/u }).getByText('描画中'),
+    ).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: /State Partial/u }).getByText('一部失敗'),
+    ).toBeVisible()
     const failed = page.getByRole('button', { name: /State Failed/u })
     await expect(failed.getByText('処理失敗')).toBeVisible()
     await failed.click()
@@ -539,7 +612,9 @@ test.describe.serial('Artifact Gallery', () => {
     })
     await page.goto(baseURL)
 
-    await expect(page.getByRole('heading', { name: 'ギャラリーを読み込めませんでした' })).toBeVisible()
+    await expect(
+      page.getByRole('heading', { name: 'ギャラリーを読み込めませんでした' }),
+    ).toBeVisible()
     await expect(page.getByText('The gallery is temporarily busy.')).toBeVisible()
     await expect(page.getByRole('heading', { name: 'Artifact Gallery' })).toBeVisible()
   })
@@ -580,7 +655,10 @@ async function registerPath(page: Page, path: string, kind: 'file' | 'folder') {
 function seedReadyCards(filename: string, count: number) {
   const database = new Database(filename)
   const existingCount = Number(
-    database.prepare("SELECT COUNT(*) FROM artifact WHERE source_path LIKE '/e2e/cursor-%'").pluck().get(),
+    database
+      .prepare("SELECT COUNT(*) FROM artifact WHERE source_path LIKE '/e2e/cursor-%'")
+      .pluck()
+      .get(),
   )
   const additions = Math.max(0, count - existingCount)
   const now = '2026-09-01T00:00:00.000Z'
@@ -595,9 +673,9 @@ function seedReadyCards(filename: string, count: number) {
       (artifact_id, generation, job_status, content_status, render_status, index_status, extracted_text, extractor_version, completed_at)
      VALUES (?, 1, 'idle', 'ready', 'ready', 'ready', ?, 'e2e', ?)`,
   )
-  const generationId = database.prepare(
-    'SELECT id FROM artifact_generation WHERE artifact_id = ? AND generation = 1',
-  ).pluck()
+  const generationId = database
+    .prepare('SELECT id FROM artifact_generation WHERE artifact_id = ? AND generation = 1')
+    .pluck()
   const activate = database.prepare('UPDATE artifact SET active_generation_id = ? WHERE id = ?')
   const showInSearch = database.prepare(
     `INSERT OR IGNORE INTO artifact_search_visibility (artifact_id, generation_id, state, updated_at)
@@ -619,7 +697,13 @@ function seedReadyCards(filename: string, count: number) {
       const currentGenerationId = generationId.get(id) as number
       activate.run(currentGenerationId, id)
       showInSearch.run(id, currentGenerationId, now)
-      insertSearchDocument.run(currentGenerationId, id, title.toLowerCase(), body.toLowerCase(), sourcePath)
+      insertSearchDocument.run(
+        currentGenerationId,
+        id,
+        title.toLowerCase(),
+        body.toLowerCase(),
+        sourcePath,
+      )
     }
   })()
   database.close()
@@ -660,7 +744,13 @@ function seedRecoveryCards(filename: string) {
                SELECT 1 FROM artifact_error WHERE artifact_id = ? AND code = 'HTML_RENDER_FAILED'
              )`,
           )
-          .run(id, 'The preview could not be rendered.', '/private/internal-render-command', now, id)
+          .run(
+            id,
+            'The preview could not be rendered.',
+            '/private/internal-render-command',
+            now,
+            id,
+          )
       }
     }
   })()

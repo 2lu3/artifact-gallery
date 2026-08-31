@@ -76,10 +76,7 @@ export class SearchRepository {
       .map((candidate) => ({
         artifactId: candidate.artifactId,
         generation: candidate.generation,
-        title:
-          candidate.userTitle ??
-          candidate.derivedTitle ??
-          basename(candidate.sourcePath),
+        title: candidate.userTitle ?? candidate.derivedTitle ?? basename(candidate.sourcePath),
         sourcePath: candidate.sourcePath,
       }))
   }
@@ -202,11 +199,7 @@ function shortCandidateRank(
   parts: readonly SearchQueryPart[],
 ): ShortCandidateRank | null {
   const counts = [0, 0, 0] as [number, number, number]
-  const fields = [
-    row.user_title_normalized,
-    row.derived_title_normalized,
-    row.body_normalized,
-  ]
+  const fields = [row.user_title_normalized, row.derived_title_normalized, row.body_normalized]
   for (const part of parts) {
     const fieldIndex = fields.findIndex((field) => field.includes(part.value))
     if (fieldIndex === -1) return null

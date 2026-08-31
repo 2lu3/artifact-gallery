@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Format, lint, and typecheck
+            command: pnpm format:check && pnpm lint && pnpm typecheck
+            chromium: false
+            artifact: none
+          - name: Unit and integration
+            command: pnpm test:unit
+            chromium: false
+            artifact: none
+          - name: Chromium isolation
+            command: pnpm test:isolation
+            chromium: true
+            artifact: none
+          - name: Reliability integration
+            command: pnpm test:reliability
+            chromium: true
+            artifact: none
+          - name: Search evaluation
+            command: pnpm test:search
+            chromium: false
+            artifact: none
+          - name: Performance smoke
+            command: pnpm perf:smoke
+            chromium: true
+            artifact: performance
+          - name: End to end
+            command: pnpm test:e2e
+            chromium: true
+            artifact: playwright
+          - name: Production build and smoke
+            command: pnpm build && pnpm smoke:prod
+            chromium: false
+            artifact: none
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install pnpm 11.21.0
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.21.0
+          run_install: false
+
+      - name: Install Node.js 24.14.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.14.0
+
+      - name: Locate pnpm store
+        id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-${{ runner.os }}-node-24.14.0-pnpm-11.21.0-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install dependencies from lockfile
+        run: pnpm install --frozen-lockfile
+
+      - name: Cache Playwright Chromium 1.58.2
+        if: matrix.chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-1.58.2-${{ hashFiles('pnpm-lock.yaml') }}
+
+      - name: Install Chromium 1.58.2 and system dependencies
+        if: matrix.chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run ${{ matrix.name }}
+        run: ${{ matrix.command }}
+
+      - name: Upload metrics after performance failure
+        if: failure() && matrix.artifact == 'performance'
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-metrics-${{ github.run_id }}
+          path: test-results/performance/results.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload token-free Playwright report after E2E failure
+        if: failure() && matrix.artifact == 'playwright'
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ github.run_id }}
+          path: playwright-report/
+          if-no-files-found: ignore
+          retention-days: 7

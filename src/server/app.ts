@@ -182,10 +182,10 @@ function tokensEqual(expected: string, supplied: string): boolean {
 function hasApiDependencies(options: BuildAppOptions): options is ApiRouteDependencies {
   return Boolean(
     options.database &&
-      options.pathPolicy &&
-      options.derivativePathPolicy &&
-      options.importWorker &&
-      options.thumbnailDirectory,
+    options.pathPolicy &&
+    options.derivativePathPolicy &&
+    options.importWorker &&
+    options.thumbnailDirectory,
   )
 }
 

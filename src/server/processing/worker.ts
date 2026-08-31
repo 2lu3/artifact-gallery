@@ -59,13 +59,10 @@ export class ImportWorker {
     request: ArtifactProcessRequest,
     callbacks: ImportWorkerCallbacks = {},
   ): boolean {
-    return this.enqueueTask(
-      async (context) => {
-        const result = await context.process(operation, request)
-        await callbacks.onResult?.(result)
-      },
-      callbacks.onError,
-    )
+    return this.enqueueTask(async (context) => {
+      const result = await context.process(operation, request)
+      await callbacks.onResult?.(result)
+    }, callbacks.onError)
   }
 
   enqueueTask(

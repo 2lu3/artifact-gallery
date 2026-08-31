@@ -1,14 +1,12 @@
 import { mkdir } from 'node:fs/promises'
-import { delimiter, dirname, resolve } from 'node:path'
+import { homedir } from 'node:os'
+import { delimiter, dirname, join, resolve } from 'node:path'
 
 import { buildApp, DEFAULT_LISTEN_OPTIONS, type LocalApiApp } from './app.js'
 import { openDatabase } from './db/database.js'
 import { ArtifactProcessor } from './processing/artifact-processor.js'
 import { WebpThumbnailOptimizer } from './processing/thumbnail-optimizer.js'
-import {
-  reconcileStartup,
-  type StartupReconciliationReport,
-} from './processing/recovery.js'
+import { reconcileStartup, type StartupReconciliationReport } from './processing/recovery.js'
 import { ImportWorker } from './processing/worker.js'
 import { HtmlRenderer } from './rendering/html-renderer.js'
 import { PathPolicy } from './security/path-policy.js'
@@ -91,7 +89,9 @@ async function reportRecovery(
 export function runtimeOptionsFromEnvironment(
   environment: NodeJS.ProcessEnv = process.env,
 ): ServerRuntimeOptions {
-  const stateDirectory = resolve(environment.ARTIFACT_GALLERY_STATE_DIRECTORY ?? '.artifact-gallery')
+  const stateDirectory = resolve(
+    environment.ARTIFACT_GALLERY_STATE_DIRECTORY ?? defaultStateDirectory(environment),
+  )
   const configuredRoots = environment.ARTIFACT_GALLERY_ALLOWED_ROOTS
   const configuredPort = Number(environment.PORT)
   return {
@@ -117,4 +117,21 @@ export function runtimeOptionsFromEnvironment(
         ? configuredPort
         : DEFAULT_LISTEN_OPTIONS.port,
   }
+}
+
+function defaultStateDirectory(environment: NodeJS.ProcessEnv): string {
+  const homeDirectory = environment.HOME ?? homedir()
+  if (process.platform === 'darwin') {
+    return join(homeDirectory, 'Library', 'Application Support', 'Artifact Gallery')
+  }
+  if (process.platform === 'win32') {
+    return join(
+      environment.LOCALAPPDATA ?? environment.APPDATA ?? join(homeDirectory, 'AppData', 'Local'),
+      'Artifact Gallery',
+    )
+  }
+  return join(
+    environment.XDG_STATE_HOME ?? join(homeDirectory, '.local', 'state'),
+    'artifact-gallery',
+  )
 }

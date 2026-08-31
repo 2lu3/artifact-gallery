@@ -48,8 +48,16 @@ export function App() {
   const [reloadKey, setReloadKey] = useState(0)
   const initialListMeasured = useRef(false)
   const requestGeneration = useRef(0)
-  const loadMoreRequest = useRef<{ controller: AbortController; generation: number; contextKey: string } | null>(null)
-  const lightboxOrigin = useRef<{ element: HTMLElement; artifactId: number; scrollY: number } | null>(null)
+  const loadMoreRequest = useRef<{
+    controller: AbortController
+    generation: number
+    contextKey: string
+  } | null>(null)
+  const lightboxOrigin = useRef<{
+    element: HTMLElement
+    artifactId: number
+    scrollY: number
+  } | null>(null)
   const lightboxRestorePending = useRef(false)
   const contextKey = JSON.stringify([acceptedQuery, filter, sort, reloadKey])
   const contextKeyRef = useRef(contextKey)
@@ -82,7 +90,8 @@ export function App() {
       loading ||
       loadedContextKey.current !== contextKey ||
       !lightboxRestorePending.current
-    ) return
+    )
+      return
     const origin = lightboxOrigin.current
     const frame = window.requestAnimationFrame(() => {
       if (!origin) return
@@ -180,7 +189,8 @@ export function App() {
         controller.signal.aborted ||
         requestGeneration.current !== generation ||
         contextKeyRef.current !== requestContextKey
-      ) return
+      )
+        return
       setItems((existing) => {
         const known = new Set(existing.map(({ id }) => id))
         return [...existing, ...page.items.filter(({ id }) => !known.has(id))]
@@ -233,15 +243,22 @@ export function App() {
           </div>
           <label className="sort-control">
             <span className="sr-only">並び順</span>
-            <select value={sort} onChange={(event) => setSort(event.target.value as GallerySortMode)}>
+            <select
+              value={sort}
+              onChange={(event) => setSort(event.target.value as GallerySortMode)}
+            >
               <option value="newest">新しい順</option>
               <option value="title">タイトル順</option>
             </select>
           </label>
-          <span className="result-count" aria-live="polite">{loading ? '読み込み中' : `${filteredTotal}件`}</span>
+          <span className="result-count" aria-live="polite">
+            {loading ? '読み込み中' : `${filteredTotal}件`}
+          </span>
         </section>
 
-        {loading ? <GalleryStatus title="ギャラリーを読み込み中" message="少しお待ちください。" /> : null}
+        {loading ? (
+          <GalleryStatus title="ギャラリーを読み込み中" message="少しお待ちください。" />
+        ) : null}
         {!loading && error ? (
           <GalleryStatus title="ギャラリーを読み込めませんでした" message={error} tone="error" />
         ) : null}
@@ -280,7 +297,11 @@ export function App() {
       </main>
 
       {registrationOpen ? (
-        <div className="modal-layer" role="presentation" onMouseDown={() => setRegistrationOpen(false)}>
+        <div
+          className="modal-layer"
+          role="presentation"
+          onMouseDown={() => setRegistrationOpen(false)}
+        >
           <RegistrationDialog
             onClose={() => setRegistrationOpen(false)}
             onGalleryChanged={() => setReloadKey((value) => value + 1)}
@@ -404,7 +425,9 @@ function RegistrationDialog({
           <strong>登録中</strong>
           <span>{run ? registrationProgress(run) : '受付中…'}</span>
           {run && (run.status === 'queued' || run.status === 'running') ? (
-            <button type="button" onClick={cancel}>キャンセル</button>
+            <button type="button" onClick={cancel}>
+              キャンセル
+            </button>
           ) : null}
         </section>
       ) : null}
@@ -412,14 +435,20 @@ function RegistrationDialog({
         <section className="registration-progress" aria-live="polite">
           <strong>{registrationResultLabel(run.status)}</strong>
           <span>{registrationProgress(run)}</span>
-          {run.items.filter((item) => item.error).map((item) => (
-            <p className="item-error" key={item.id}>
-              {item.name}: {item.error?.message}
-            </p>
-          ))}
+          {run.items
+            .filter((item) => item.error)
+            .map((item) => (
+              <p className="item-error" key={item.id}>
+                {item.name}: {item.error?.message}
+              </p>
+            ))}
         </section>
       ) : null}
-      {error ? <p className="inline-error" role="alert">{error}</p> : null}
+      {error ? (
+        <p className="inline-error" role="alert">
+          {error}
+        </p>
+      ) : null}
     </section>
   )
 }
@@ -445,8 +474,10 @@ function ArtifactCardView({
           <span className="format-label">{item.format.toUpperCase()}</span>
           <strong>{item.title}</strong>
           <span>
-            {parentName(item.sourcePath)} · <time dateTime={item.registeredAt}>{formatDate(item.registeredAt)}</time>
-            {' · '}{statusLabel(item.status)}
+            {parentName(item.sourcePath)} ·{' '}
+            <time dateTime={item.registeredAt}>{formatDate(item.registeredAt)}</time>
+            {' · '}
+            {statusLabel(item.status)}
           </span>
         </span>
       </button>
@@ -597,9 +628,11 @@ function ArtifactLightbox({
         return
       }
       if (event.key !== 'Tab' || !dialog.current) return
-      const focusable = [...dialog.current.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), input:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
-      )]
+      const focusable = [
+        ...dialog.current.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), input:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+        ),
+      ]
       if (focusable.length === 0) return
       const first = focusable[0]
       const last = focusable.at(-1)
@@ -629,7 +662,9 @@ function ArtifactLightbox({
         return
       }
       if (event.key !== 'Tab' || !confirmationDialog.current) return
-      const focusable = [...confirmationDialog.current.querySelectorAll<HTMLElement>('button:not([disabled])')]
+      const focusable = [
+        ...confirmationDialog.current.querySelectorAll<HTMLElement>('button:not([disabled])'),
+      ]
       const first = focusable[0]
       const last = focusable.at(-1)
       if (!first || !last) return
@@ -673,14 +708,21 @@ function ArtifactLightbox({
           </button>
         </header>
         <div className="lightbox__content">
-          <div className="lightbox__preview"><ProtectedThumbnail item={current} /></div>
+          <div className="lightbox__preview">
+            <ProtectedThumbnail item={current} />
+          </div>
           <aside className="lightbox__details">
             <p>
-              <strong>状態</strong><br />
+              <strong>状態</strong>
+              <br />
               <span className="status-value">{statusLabel(current.status)}</span>
               {detail ? <span className="generation-label">世代 {detail.generation}</span> : null}
             </p>
-            <p><strong>選択した元ファイル</strong><br /><span className="source-path">{current.sourcePath}</span></p>
+            <p>
+              <strong>選択した元ファイル</strong>
+              <br />
+              <span className="source-path">{current.sourcePath}</span>
+            </p>
             <form className="title-form" onSubmit={saveTitle}>
               <label>
                 <span>タイトル</span>
@@ -693,22 +735,40 @@ function ArtifactLightbox({
                   }}
                 />
               </label>
-              <button type="submit" disabled={Boolean(busyAction)}>タイトルを保存</button>
+              <button type="submit" disabled={Boolean(busyAction)}>
+                タイトルを保存
+              </button>
             </form>
             <div className="action-grid" aria-label="生成物の操作">
-              <button type="button" disabled={Boolean(busyAction)} onClick={() => platformAction('open-source')}>
+              <button
+                type="button"
+                disabled={Boolean(busyAction)}
+                onClick={() => platformAction('open-source')}
+              >
                 元ファイルを開く
               </button>
-              <button type="button" disabled={Boolean(busyAction)} onClick={() => platformAction('reveal')}>
+              <button
+                type="button"
+                disabled={Boolean(busyAction)}
+                onClick={() => platformAction('reveal')}
+              >
                 Finderで表示
               </button>
-              <button type="button" disabled={Boolean(busyAction)} onClick={() => process('refresh')}>
+              <button
+                type="button"
+                disabled={Boolean(busyAction)}
+                onClick={() => process('refresh')}
+              >
                 更新
               </button>
               <button type="button" disabled={Boolean(busyAction)} onClick={() => process('retry')}>
                 再試行
               </button>
-              <button type="button" disabled={Boolean(busyAction)} onClick={() => process('rebuild')}>
+              <button
+                type="button"
+                disabled={Boolean(busyAction)}
+                onClick={() => process('rebuild')}
+              >
                 再構築
               </button>
             </div>
@@ -736,7 +796,11 @@ function ArtifactLightbox({
             >
               ギャラリーから削除
             </button>
-            {busyAction ? <p className="busy-message" aria-live="polite">処理中…</p> : null}
+            {busyAction ? (
+              <p className="busy-message" aria-live="polite">
+                処理中…
+              </p>
+            ) : null}
             {detail?.errors.length ? (
               <section className="detail-errors" aria-label="処理エラー">
                 {detail.errors.map((error, index) => (
@@ -744,12 +808,20 @@ function ArtifactLightbox({
                 ))}
               </section>
             ) : null}
-            {alert ? <p className="inline-error" role="alert">{alert}</p> : null}
+            {alert ? (
+              <p className="inline-error" role="alert">
+                {alert}
+              </p>
+            ) : null}
           </aside>
         </div>
       </section>
       {deleteConfirmation ? (
-        <div className="confirmation-layer" role="presentation" onMouseDown={(event) => event.stopPropagation()}>
+        <div
+          className="confirmation-layer"
+          role="presentation"
+          onMouseDown={(event) => event.stopPropagation()}
+        >
           <section
             ref={confirmationDialog}
             className="confirmation"
@@ -759,7 +831,9 @@ function ArtifactLightbox({
           >
             <h3 id="delete-title">ギャラリー記録を削除</h3>
             <p>プレビュー、検索データ、ギャラリー記録を削除します。</p>
-            <p><strong>元ファイルは削除されません。</strong></p>
+            <p>
+              <strong>元ファイルは削除されません。</strong>
+            </p>
             <div className="confirmation__actions">
               <button
                 ref={cancelDeleteButton}
@@ -769,7 +843,12 @@ function ArtifactLightbox({
               >
                 キャンセル
               </button>
-              <button className="danger-button" type="button" disabled={Boolean(busyAction)} onClick={deleteCatalogRecord}>
+              <button
+                className="danger-button"
+                type="button"
+                disabled={Boolean(busyAction)}
+                onClick={deleteCatalogRecord}
+              >
                 記録だけ削除
               </button>
             </div>
@@ -782,7 +861,10 @@ function ArtifactLightbox({
 
 function ProtectedThumbnail({ item }: { item: ArtifactCard }) {
   const previewRef = useRef<HTMLSpanElement>(null)
-  const [source, setSource] = useState<{ readonly thumbnailUrl: string; readonly objectUrl: string } | null>(null)
+  const [source, setSource] = useState<{
+    readonly thumbnailUrl: string
+    readonly objectUrl: string
+  } | null>(null)
   useEffect(() => {
     if (!item.thumbnailUrl) return
     const preview = previewRef.current
@@ -830,12 +912,19 @@ function ProtectedThumbnail({ item }: { item: ArtifactCard }) {
     return (
       <span ref={previewRef} className="artifact-preview">
         <img src={source.objectUrl} loading="lazy" alt={`${item.title}のプレビュー`} />
-        {item.status !== 'ready' ? <span className="state-banner">{statusLabel(item.status)}</span> : null}
+        {item.status !== 'ready' ? (
+          <span className="state-banner">{statusLabel(item.status)}</span>
+        ) : null}
       </span>
     )
   }
   return (
-    <span ref={previewRef} className="artifact-preview artifact-preview--fallback" role="img" aria-label={`${item.title}のプレビューはありません`}>
+    <span
+      ref={previewRef}
+      className="artifact-preview artifact-preview--fallback"
+      role="img"
+      aria-label={`${item.title}のプレビューはありません`}
+    >
       <span>{statusDescription(item.status)}</span>
       <code aria-hidden="true">{item.diagram}</code>
     </span>
@@ -855,7 +944,8 @@ async function pollImport(
 }
 
 function registrationProgress(run: RegistrationRun): string {
-  if (run.items.length === 0) return run.status === 'queued' ? 'ファイルを確認しています…' : '対象を列挙しています…'
+  if (run.items.length === 0)
+    return run.status === 'queued' ? 'ファイルを確認しています…' : '対象を列挙しています…'
   const completed = run.items.filter((item) => item.status === 'completed').length
   const failed = run.items.filter((item) => item.status === 'failed').length
   const cancelled = run.items.filter((item) => item.status === 'cancelled')
@@ -877,7 +967,12 @@ function registrationResultLabel(status: RegistrationRun['status']): string {
 
 function stageLabel(stage: string): string {
   const labels: Record<string, string> = {
-    queued: '待機中', inspect: '確認中', extract: 'テキスト抽出中', render: '描画中', index: '検索準備中', commit: '保存中',
+    queued: '待機中',
+    inspect: '確認中',
+    extract: 'テキスト抽出中',
+    render: '描画中',
+    index: '検索準備中',
+    commit: '保存中',
   }
   return labels[stage] ?? '処理中'
 }
@@ -895,12 +990,22 @@ function formatDate(value: string): string {
 }
 
 function statusLabel(status: ArtifactCard['status']): string {
-  return { missing: '参照切れ', processing: '描画中', ready: '登録済み', partial: '一部失敗', failed: '処理失敗' }[status]
+  return {
+    missing: '参照切れ',
+    processing: '描画中',
+    ready: '登録済み',
+    partial: '一部失敗',
+    failed: '処理失敗',
+  }[status]
 }
 
 function statusDescription(status: ArtifactCard['status']): string {
   return {
-    missing: '元ファイルが見つかりません', processing: 'プレビューを作成中…', ready: 'プレビューを読み込めません', partial: '利用できる情報を表示しています', failed: 'プレビューを作成できませんでした',
+    missing: '元ファイルが見つかりません',
+    processing: 'プレビューを作成中…',
+    ready: 'プレビューを読み込めません',
+    partial: '利用できる情報を表示しています',
+    failed: 'プレビューを作成できませんでした',
   }[status]
 }
 

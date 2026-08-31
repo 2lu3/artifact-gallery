@@ -13,9 +13,9 @@ const temporaryDirectories: string[] = []
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { force: true, recursive: true }),
-    ),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { force: true, recursive: true })),
   )
 })
 
@@ -112,5 +112,14 @@ describe('server composition root', () => {
       port: 4173,
     })
     expect(options).not.toHaveProperty('host')
+  })
+
+  it('keeps the default runtime database and derivatives outside the repository', () => {
+    const options = runtimeOptionsFromEnvironment({ HOME: '/tmp/artifact-gallery-user' })
+
+    expect(options.databaseFilename).toMatch(/^\/tmp\/artifact-gallery-user\//u)
+    expect(options.thumbnailDirectory).toMatch(/^\/tmp\/artifact-gallery-user\//u)
+    expect(options.databaseFilename).not.toContain(process.cwd())
+    expect(options.thumbnailDirectory).not.toContain(process.cwd())
   })
 })

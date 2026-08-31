@@ -9,9 +9,9 @@ const temporaryDirectories: string[] = []
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { force: true, recursive: true }),
-    ),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { force: true, recursive: true })),
   )
 })
 
@@ -243,7 +243,9 @@ describe('ArtifactRepository', () => {
     ).toEqual({ active_generation_id: successful.id })
     expect(
       database
-        .prepare('SELECT job_status, content_status, render_status, index_status FROM artifact_generation WHERE id = ?')
+        .prepare(
+          'SELECT job_status, content_status, render_status, index_status FROM artifact_generation WHERE id = ?',
+        )
         .get(failed.id),
     ).toEqual({
       job_status: 'idle',

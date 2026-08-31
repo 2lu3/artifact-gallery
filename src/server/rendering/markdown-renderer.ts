@@ -1,9 +1,5 @@
 import MarkdownIt from 'markdown-it'
-import {
-  parseFragment,
-  serialize,
-  type DefaultTreeAdapterTypes,
-} from 'parse5'
+import { parseFragment, serialize, type DefaultTreeAdapterTypes } from 'parse5'
 
 export interface MarkdownRenderResult {
   readonly html: string

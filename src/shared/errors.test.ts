@@ -1,10 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import {
-  ArtifactProcessingError,
-  mapProcessingError,
-  toPublicProcessingError,
-} from './errors.js'
+import { ArtifactProcessingError, mapProcessingError, toPublicProcessingError } from './errors.js'
 
 describe('processing error boundary', () => {
   it('maps a known boundary code without exposing its technical cause publicly', () => {

@@ -145,3 +145,6 @@ vite.config.ts.timestamp-*
 # Playwright output
 test-results/
 playwright-report/
+
+# Local runtime state (the default lives outside the repository)
+.artifact-gallery/

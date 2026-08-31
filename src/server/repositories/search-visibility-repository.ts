@@ -75,13 +75,7 @@ export class SearchVisibilityRepository {
          updated_at = ?
          WHERE artifact_id = ? AND generation_id = ? AND state = 'quarantined'`,
       )
-      .run(
-        input.artifactId,
-        input.generationId,
-        input.now,
-        input.artifactId,
-        input.generationId,
-      )
+      .run(input.artifactId, input.generationId, input.now, input.artifactId, input.generationId)
     if (result.changes !== 1) throw new SearchVisibilityTransitionError('repair')
   }
 }

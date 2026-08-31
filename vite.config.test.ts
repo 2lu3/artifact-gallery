@@ -29,13 +29,9 @@ describe('trusted bootstrap Vite middleware', () => {
       const response = new TestResponse()
       let passedThrough = false
 
-      await middleware(
-        { url, headers: {} },
-        response,
-        () => {
-          passedThrough = true
-        },
-      )
+      await middleware({ url, headers: {} }, response, () => {
+        passedThrough = true
+      })
 
       expect(passedThrough, url).toBe(false)
       expect(response.statusCode, url).toBe(200)

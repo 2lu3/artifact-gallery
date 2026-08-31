@@ -138,9 +138,8 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
     )
 
   const cancelRunOnAbort = (request: IncomingMessage, reply: FastifyReply, runId: number) => {
-    const remove = observeRequestAbort(
-      { request, response: reply.raw },
-      () => requestCancellationIfActive(imports, dependencies.database, runId, now()),
+    const remove = observeRequestAbort({ request, response: reply.raw }, () =>
+      requestCancellationIfActive(imports, dependencies.database, runId, now()),
     )
     reply.raw.once('finish', remove)
   }
@@ -240,7 +239,11 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
           new ArtifactProcessingError('DATABASE_BUSY', 'inspect'),
           now(),
         )
-        return sendError(reply, 503, toPublicProcessingError(new ArtifactProcessingError('DATABASE_BUSY', 'inspect')))
+        return sendError(
+          reply,
+          503,
+          toPublicProcessingError(new ArtifactProcessingError('DATABASE_BUSY', 'inspect')),
+        )
       }
       cancelRunOnAbort(request.raw, reply, run.id)
       return reply.code(202).send({ runId: run.id } satisfies RegistrationResponse)
@@ -283,7 +286,11 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
       if (!accepted) {
         imports.requestCancellation(run.id, now())
         imports.cancelRun(run.id, now())
-        return sendError(reply, 503, toPublicProcessingError(new ArtifactProcessingError('DATABASE_BUSY', 'inspect')))
+        return sendError(
+          reply,
+          503,
+          toPublicProcessingError(new ArtifactProcessingError('DATABASE_BUSY', 'inspect')),
+        )
       }
       cancelRunOnAbort(request.raw, reply, run.id)
       return reply.code(202).send({ runId: run.id } satisfies RegistrationResponse)
@@ -308,10 +315,7 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
       const runId = readPositiveId(request.params)
       const run = readImportRun(dependencies.database, runId)
       if (!run) return sendNotFound(reply)
-      if (
-        (run.status === 'queued' || run.status === 'running') &&
-        run.cancelRequestedAt === null
-      ) {
+      if ((run.status === 'queued' || run.status === 'running') && run.cancelRequestedAt === null) {
         imports.requestCancellation(runId, now())
       }
       return readImportRun(dependencies.database, runId)
@@ -336,7 +340,9 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
             const missingError = result.errors.find(({ code }) => code === 'SOURCE_MISSING')
             if (missingError) {
               dependencies.database
-                .prepare("UPDATE artifact SET source_status = 'missing', updated_at = ? WHERE id = ?")
+                .prepare(
+                  "UPDATE artifact SET source_status = 'missing', updated_at = ? WHERE id = ?",
+                )
                 .run(now(), artifactId)
               artifacts.recordError({
                 artifactId,
@@ -361,7 +367,11 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
             new ArtifactProcessingError('DATABASE_BUSY', 'inspect'),
             now(),
           )
-          return sendError(reply, 503, toPublicProcessingError(new ArtifactProcessingError('DATABASE_BUSY', 'inspect')))
+          return sendError(
+            reply,
+            503,
+            toPublicProcessingError(new ArtifactProcessingError('DATABASE_BUSY', 'inspect')),
+          )
         }
         cancelRunOnAbort(request.raw, reply, run.id)
         return reply.code(202).send({ runId: run.id } satisfies RegistrationResponse)
@@ -503,8 +513,7 @@ interface FolderRunDependencies {
 }
 
 async function processFolderRun(dependencies: FolderRunDependencies): Promise<void> {
-  const { database, imports, artifacts, process, runId, folderPath, now } =
-    dependencies
+  const { database, imports, artifacts, process, runId, folderPath, now } = dependencies
   if (imports.getRun(runId).cancelRequestedAt !== null) {
     imports.cancelRun(runId, now())
     return
@@ -529,9 +538,7 @@ async function processFolderRun(dependencies: FolderRunDependencies): Promise<vo
     cancelOutstandingRun(database, imports, runId, now())
     return
   }
-  const files = [
-    ...new Map(enumeration.files.map((file) => [file.canonicalPath, file])).values(),
-  ]
+  const files = [...new Map(enumeration.files.map((file) => [file.canonicalPath, file])).values()]
   if (files.length + enumeration.errors.length > MAX_FOLDER_FILES) {
     const [itemId] = imports.addItems(runId, [folderPath])
     persistItemFailure(
@@ -691,7 +698,9 @@ function finishImportRun(
     imports.cancelRun(runId, completedAt)
   } else if (statuses.some((status) => status === 'failed' || status === 'interrupted')) {
     database
-      .prepare("UPDATE import_run SET status = 'failed', completed_at = ? WHERE id = ? AND status = 'running'")
+      .prepare(
+        "UPDATE import_run SET status = 'failed', completed_at = ? WHERE id = ? AND status = 'running'",
+      )
       .run(completedAt, runId)
   } else {
     imports.completeRun(runId, completedAt)
@@ -761,10 +770,7 @@ function readPageQuery(value: unknown, requiresQuery: boolean): PageQuery {
   const searchQuery = query.q ?? ''
   const cursor = query.cursor ?? null
   if (sort !== 'newest' && sort !== 'title') throw invalidRequest()
-  if (
-    typeof filter !== 'string' ||
-    !['all', 'html', 'markdown'].includes(filter)
-  ) {
+  if (typeof filter !== 'string' || !['all', 'html', 'markdown'].includes(filter)) {
     throw invalidRequest()
   }
   if (
@@ -892,7 +898,10 @@ function statusDiagram(status: CardPresentation): string {
   }
 }
 
-function readPublicErrors(database: Database.Database, artifactId: number): PublicProcessingError[] {
+function readPublicErrors(
+  database: Database.Database,
+  artifactId: number,
+): PublicProcessingError[] {
   const rows = database
     .prepare(
       `SELECT code, stage, retryable, user_message

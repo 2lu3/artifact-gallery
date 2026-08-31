@@ -8,9 +8,9 @@ const temporaryDirectories: string[] = []
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { force: true, recursive: true }),
-    ),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { force: true, recursive: true })),
   )
 })
 
@@ -30,10 +30,7 @@ describe('openDatabase', () => {
       )
       .all()
       .map((row) => (row as { name: string }).name)
-      .filter(
-        (name) =>
-          !name.startsWith('artifact_search_fts_') || name === 'artifact_search_fts',
-      )
+      .filter((name) => !name.startsWith('artifact_search_fts_') || name === 'artifact_search_fts')
 
     expect(tables).toEqual([
       'allowed_root',
@@ -112,7 +109,9 @@ describe('openDatabase', () => {
       'path_segments_normalized',
     ])
     const searchIndexSql = database
-      .prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'artifact_search_fts'")
+      .prepare(
+        "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'artifact_search_fts'",
+      )
       .pluck()
       .get() as string
     expect(searchIndexSql).toContain("tokenize='trigram'")
@@ -179,10 +178,9 @@ describe('openDatabase', () => {
     insertGeneration.run(artifact.lastInsertRowid)
     expect(() => insertGeneration.run(artifact.lastInsertRowid)).toThrow()
 
-    database.prepare('INSERT INTO allowed_root (canonical_path, created_at) VALUES (?, ?)').run(
-      '/canonical',
-      now,
-    )
+    database
+      .prepare('INSERT INTO allowed_root (canonical_path, created_at) VALUES (?, ?)')
+      .run('/canonical', now)
     expect(() =>
       database
         .prepare('INSERT INTO allowed_root (canonical_path, created_at) VALUES (?, ?)')
@@ -273,7 +271,9 @@ describe('openDatabase', () => {
           .run(artifact.lastInsertRowid, ...statusValues),
       ).toThrow()
     }
-    expect(() => database.prepare("INSERT INTO import_run (status) VALUES ('active')").run()).toThrow()
+    expect(() =>
+      database.prepare("INSERT INTO import_run (status) VALUES ('active')").run(),
+    ).toThrow()
 
     const run = database.prepare("INSERT INTO import_run (status) VALUES ('queued')").run()
     expect(() =>
@@ -365,7 +365,9 @@ describe('openDatabase', () => {
         .run(runId, firstArtifactId).lastInsertRowid,
     )
     expect(() =>
-      database.prepare('UPDATE import_item SET error_id = ? WHERE id = ?').run(secondErrorId, itemId),
+      database
+        .prepare('UPDATE import_item SET error_id = ? WHERE id = ?')
+        .run(secondErrorId, itemId),
     ).toThrow()
 
     database.close()
@@ -494,14 +496,14 @@ describe('openDatabase', () => {
 
     const upgraded = openDatabase({ filename })
 
-    expect(
-      upgraded.prepare('SELECT version FROM schema_migration ORDER BY version').all(),
-    ).toEqual([
-      { version: '001_initial.sql' },
-      { version: '002_error_ownership.sql' },
-      { version: '003_search_visibility.sql' },
-      { version: '004_search.sql' },
-    ])
+    expect(upgraded.prepare('SELECT version FROM schema_migration ORDER BY version').all()).toEqual(
+      [
+        { version: '001_initial.sql' },
+        { version: '002_error_ownership.sql' },
+        { version: '003_search_visibility.sql' },
+        { version: '004_search.sql' },
+      ],
+    )
     expect(
       upgraded
         .prepare(
@@ -523,9 +525,9 @@ describe('openDatabase', () => {
         .prepare('SELECT artifact_id, error_id, status FROM import_item WHERE id = ?')
         .get(itemId),
     ).toEqual({ artifact_id: artifactId, error_id: errorId, status: 'failed' })
-    expect(
-      upgraded.prepare('SELECT COUNT(*) AS count FROM artifact_warning').get(),
-    ).toEqual({ count: 1 })
+    expect(upgraded.prepare('SELECT COUNT(*) AS count FROM artifact_warning').get()).toEqual({
+      count: 1,
+    })
     expect(
       upgraded
         .prepare(
@@ -646,14 +648,14 @@ describe('openDatabase', () => {
 
     const upgraded = openDatabase({ filename })
 
-    expect(
-      upgraded.prepare('SELECT version FROM schema_migration ORDER BY version').all(),
-    ).toEqual([
-      { version: '001_initial.sql' },
-      { version: '002_error_ownership.sql' },
-      { version: '003_search_visibility.sql' },
-      { version: '004_search.sql' },
-    ])
+    expect(upgraded.prepare('SELECT version FROM schema_migration ORDER BY version').all()).toEqual(
+      [
+        { version: '001_initial.sql' },
+        { version: '002_error_ownership.sql' },
+        { version: '003_search_visibility.sql' },
+        { version: '004_search.sql' },
+      ],
+    )
     expect(
       upgraded
         .prepare(
@@ -741,7 +743,9 @@ describe('openDatabase', () => {
         .run(otherArtifactId, otherGenerationId, now).lastInsertRowid,
     )
     expect(() =>
-      upgraded.prepare('UPDATE import_item SET error_id = ? WHERE id = ?').run(otherErrorId, itemId),
+      upgraded
+        .prepare('UPDATE import_item SET error_id = ? WHERE id = ?')
+        .run(otherErrorId, itemId),
     ).toThrow()
     upgraded.close()
   })
@@ -770,7 +774,8 @@ describe('openDatabase', () => {
     const deletedErrorId = Number(insertError.run(deletedArtifactId, now).lastInsertRowid)
     const preservedErrorId = Number(insertError.run(preservedArtifactId, now).lastInsertRowid)
     const runId = Number(
-      database.prepare("INSERT INTO import_run (status) VALUES ('completed')").run().lastInsertRowid,
+      database.prepare("INSERT INTO import_run (status) VALUES ('completed')").run()
+        .lastInsertRowid,
     )
     const insertItem = database.prepare(
       `INSERT INTO import_item
@@ -778,13 +783,11 @@ describe('openDatabase', () => {
        VALUES (?, ?, ?, 'render', 'failed', ?, ?)`,
     )
     const clearedItemId = Number(
-      insertItem
-        .run(runId, '/canonical/delete.md', deletedArtifactId, deletedErrorId, now)
+      insertItem.run(runId, '/canonical/delete.md', deletedArtifactId, deletedErrorId, now)
         .lastInsertRowid,
     )
     const preservedItemId = Number(
-      insertItem
-        .run(runId, '/canonical/preserve.md', preservedArtifactId, preservedErrorId, now)
+      insertItem.run(runId, '/canonical/preserve.md', preservedArtifactId, preservedErrorId, now)
         .lastInsertRowid,
     )
 
@@ -792,15 +795,35 @@ describe('openDatabase', () => {
       database.prepare('DELETE FROM artifact WHERE id = ?').run(deletedArtifactId),
     ).not.toThrow()
     expect(
-      database.prepare('SELECT artifact_id, error_id FROM import_item WHERE id = ?').get(clearedItemId),
+      database
+        .prepare('SELECT artifact_id, error_id FROM import_item WHERE id = ?')
+        .get(clearedItemId),
     ).toEqual({ artifact_id: null, error_id: null })
     expect(
-      database.prepare('SELECT artifact_id, error_id FROM import_item WHERE id = ?').get(preservedItemId),
+      database
+        .prepare('SELECT artifact_id, error_id FROM import_item WHERE id = ?')
+        .get(preservedItemId),
     ).toEqual({ artifact_id: preservedArtifactId, error_id: preservedErrorId })
-    expect(database.prepare('SELECT COUNT(*) AS count FROM artifact WHERE id = ?').get(deletedArtifactId)).toEqual({ count: 0 })
-    expect(database.prepare('SELECT COUNT(*) AS count FROM artifact_error WHERE id = ?').get(deletedErrorId)).toEqual({ count: 0 })
-    expect(database.prepare('SELECT COUNT(*) AS count FROM artifact WHERE id = ?').get(preservedArtifactId)).toEqual({ count: 1 })
-    expect(database.prepare('SELECT COUNT(*) AS count FROM artifact_error WHERE id = ?').get(preservedErrorId)).toEqual({ count: 1 })
+    expect(
+      database
+        .prepare('SELECT COUNT(*) AS count FROM artifact WHERE id = ?')
+        .get(deletedArtifactId),
+    ).toEqual({ count: 0 })
+    expect(
+      database
+        .prepare('SELECT COUNT(*) AS count FROM artifact_error WHERE id = ?')
+        .get(deletedErrorId),
+    ).toEqual({ count: 0 })
+    expect(
+      database
+        .prepare('SELECT COUNT(*) AS count FROM artifact WHERE id = ?')
+        .get(preservedArtifactId),
+    ).toEqual({ count: 1 })
+    expect(
+      database
+        .prepare('SELECT COUNT(*) AS count FROM artifact_error WHERE id = ?')
+        .get(preservedErrorId),
+    ).toEqual({ count: 1 })
 
     database.close()
   })

@@ -214,7 +214,9 @@ export class ImportRepository {
   }
 
   getRun(runId: number): ImportRunRecord {
-    const row = this.database.prepare('SELECT * FROM import_run WHERE id = ?').get(runId) as ImportRunRow
+    const row = this.database
+      .prepare('SELECT * FROM import_run WHERE id = ?')
+      .get(runId) as ImportRunRow
     return {
       id: row.id,
       status: row.status,
@@ -225,7 +227,9 @@ export class ImportRepository {
   }
 
   getItem(itemId: number): ImportItemRecord {
-    const row = this.database.prepare('SELECT * FROM import_item WHERE id = ?').get(itemId) as ImportItemRow
+    const row = this.database
+      .prepare('SELECT * FROM import_item WHERE id = ?')
+      .get(itemId) as ImportItemRow
     return {
       id: row.id,
       runId: row.run_id,

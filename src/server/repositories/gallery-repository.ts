@@ -132,9 +132,7 @@ export class GalleryRepository {
       .all(...parameters) as GalleryRow[]
   }
 
-  readCounts(
-    query: Pick<GalleryPageQuery, 'format' | 'status' | 'artifactIds'>,
-  ): GalleryCounts {
+  readCounts(query: Pick<GalleryPageQuery, 'format' | 'status' | 'artifactIds'>): GalleryCounts {
     const predicates: string[] = []
     const parameters: number[] = []
     if (query.status !== 'all') {
@@ -169,11 +167,11 @@ export class GalleryRepository {
          ${where}`,
       )
       .get(...textParameters, ...parameters) as {
-        catalog_total: number
-        all_count: number
-        html_count: number
-        markdown_count: number
-      }
+      catalog_total: number
+      all_count: number
+      html_count: number
+      markdown_count: number
+    }
     const formatCounts = {
       all: row.all_count,
       html: row.html_count,

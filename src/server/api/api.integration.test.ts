@@ -16,9 +16,9 @@ const temporaryDirectories: string[] = []
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { force: true, recursive: true }),
-    ),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { force: true, recursive: true })),
   )
 })
 
@@ -62,10 +62,7 @@ describe('local API integration', () => {
     expect(responses.map(({ statusCode }) => statusCode)).toEqual([202, 202])
     expect(runs.map(({ status }) => status)).toEqual(['completed', 'completed'])
     expect(
-      harness.database
-        .prepare('SELECT canonical_path FROM import_item ORDER BY id')
-        .pluck()
-        .all(),
+      harness.database.prepare('SELECT canonical_path FROM import_item ORDER BY id').pluck().all(),
     ).toEqual([await realpath(canonicalPath), await realpath(canonicalPath)])
     expect(harness.database.prepare('SELECT COUNT(*) AS count FROM artifact').get()).toEqual({
       count: 1,
@@ -337,10 +334,9 @@ describe('local API integration', () => {
     expect(second.statusCode).toBe(200)
     expect(second.json().items).toHaveLength(5)
     expect(second.json().nextCursor).toBeNull()
-    expect(new Set([...first.json().items, ...second.json().items].map((item) => item.id))).toHaveProperty(
-      'size',
-      35,
-    )
+    expect(
+      new Set([...first.json().items, ...second.json().items].map((item) => item.id)),
+    ).toHaveProperty('size', 35)
 
     const htmlOnly = await harness.app.inject({
       method: 'GET',
@@ -502,7 +498,9 @@ describe('local API integration', () => {
     })
     expect(JSON.stringify(rejectedRelink.json())).not.toContain(invalidPath)
     expect(
-      harness.database.prepare('SELECT generation_counter FROM artifact WHERE id = ?').get(artifactId),
+      harness.database
+        .prepare('SELECT generation_counter FROM artifact WHERE id = ?')
+        .get(artifactId),
     ).toEqual(before)
 
     await rm(sourcePath)
@@ -695,10 +693,11 @@ describe('local API integration', () => {
 
     await harness.close()
   })
-
 })
 
-function expectCursorStale(response: Awaited<ReturnType<ReturnType<typeof buildApp>['inject']>>): void {
+function expectCursorStale(
+  response: Awaited<ReturnType<ReturnType<typeof buildApp>['inject']>>,
+): void {
   expect(response.statusCode).toBe(409)
   expect(response.json()).toEqual({
     error: {
@@ -784,7 +783,10 @@ async function makeHarness(
   }
 }
 
-async function artifactDetail(harness: Awaited<ReturnType<typeof makeHarness>>, artifactId: number) {
+async function artifactDetail(
+  harness: Awaited<ReturnType<typeof makeHarness>>,
+  artifactId: number,
+) {
   const response = await harness.app.inject({
     method: 'GET',
     url: `/api/artifacts/${artifactId}`,

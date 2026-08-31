@@ -25,9 +25,9 @@ const NOW = '2026-09-01T00:00:00.000Z'
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { force: true, recursive: true }),
-    ),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { force: true, recursive: true })),
   )
 })
 
@@ -226,10 +226,14 @@ describe('ArtifactProcessor staged pipeline', () => {
       const requestCancellation = () => imports.requestCancellation(run.id, NOW)
 
       if (cancelledStage === 'inspect') requestCancellation()
-      harness.controls.cancelAfterInspect = cancelledStage === 'extract' ? requestCancellation : undefined
-      harness.controls.cancelAfterExtract = cancelledStage === 'render' ? requestCancellation : undefined
-      harness.controls.cancelAfterRender = cancelledStage === 'index' ? requestCancellation : undefined
-      harness.controls.cancelAfterIndex = cancelledStage === 'commit' ? requestCancellation : undefined
+      harness.controls.cancelAfterInspect =
+        cancelledStage === 'extract' ? requestCancellation : undefined
+      harness.controls.cancelAfterExtract =
+        cancelledStage === 'render' ? requestCancellation : undefined
+      harness.controls.cancelAfterRender =
+        cancelledStage === 'index' ? requestCancellation : undefined
+      harness.controls.cancelAfterIndex =
+        cancelledStage === 'commit' ? requestCancellation : undefined
 
       const result = await harness.processor.register({
         sourcePath: harness.sourcePath,
@@ -241,7 +245,9 @@ describe('ArtifactProcessor staged pipeline', () => {
       expect(result.errors.at(-1)).toMatchObject({ code: 'CANCELLED', stage: cancelledStage })
       expect(imports.getItem(run.itemIds[0])).toMatchObject({ status: 'cancelled' })
       expect(imports.getRun(run.id)).toMatchObject({ status: 'cancelled' })
-      expect((await readdir(harness.derivedDirectory)).filter((name) => name.includes('.tmp'))).toEqual([])
+      expect(
+        (await readdir(harness.derivedDirectory)).filter((name) => name.includes('.tmp')),
+      ).toEqual([])
       harness.database.close()
     },
   )
@@ -284,11 +290,9 @@ describe('ArtifactProcessor staged pipeline', () => {
       render: async (request) => {
         markRenderStarted()
         return new Promise((resolve, reject) => {
-          request.signal?.addEventListener(
-            'abort',
-            () => reject(request.signal?.reason),
-            { once: true },
-          )
+          request.signal?.addEventListener('abort', () => reject(request.signal?.reason), {
+            once: true,
+          })
         })
       },
       indexer: {
@@ -338,11 +342,9 @@ describe('ArtifactProcessor staged pipeline', () => {
       render: async (request) => {
         markRenderStarted()
         return new Promise((resolve, reject) => {
-          request.signal?.addEventListener(
-            'abort',
-            () => reject(request.signal?.reason),
-            { once: true },
-          )
+          request.signal?.addEventListener('abort', () => reject(request.signal?.reason), {
+            once: true,
+          })
         })
       },
     })
@@ -408,9 +410,9 @@ describe('ArtifactProcessor staged pipeline', () => {
     expect(cancelled.errors.at(-1)).toMatchObject({ code: 'CANCELLED', stage: 'commit' })
     expect(activeGenerationId(harness.database, artifactId)).toBe(first.generationId)
     expect(existsSync(oldThumbnail)).toBe(true)
-    expect((await readdir(harness.derivedDirectory)).filter((name) => name.endsWith('.webp'))).toEqual([
-      oldThumbnail.split('/').at(-1),
-    ])
+    expect(
+      (await readdir(harness.derivedDirectory)).filter((name) => name.endsWith('.webp')),
+    ).toEqual([oldThumbnail.split('/').at(-1)])
     harness.database.close()
   })
 
@@ -442,9 +444,9 @@ describe('ArtifactProcessor staged pipeline', () => {
     expect(cancelled.outcome).toBe('cancelled')
     expect(activeGenerationId(harness.database, artifactId)).toBe(first.generationId)
     expect(existsSync(oldThumbnail)).toBe(true)
-    expect((await readdir(harness.derivedDirectory)).filter((name) => name.endsWith('.webp'))).toEqual([
-      oldThumbnail.split('/').at(-1),
-    ])
+    expect(
+      (await readdir(harness.derivedDirectory)).filter((name) => name.endsWith('.webp')),
+    ).toEqual([oldThumbnail.split('/').at(-1)])
     expect(imports.getItem(run.itemIds[0]).status).toBe('cancelled')
     expect(imports.getRun(run.id).status).toBe('cancelled')
     harness.database.close()
@@ -486,7 +488,9 @@ describe('ArtifactProcessor staged pipeline', () => {
     expect(existsSync(oldThumbnail)).toBe(true)
     expect(imports.getItem(run.itemIds[0]).status).toBe('failed')
     expect(imports.getRun(run.id).status).toBe('failed')
-    expect((await readdir(harness.derivedDirectory)).filter((name) => name.includes('.tmp'))).toEqual([])
+    expect(
+      (await readdir(harness.derivedDirectory)).filter((name) => name.includes('.tmp')),
+    ).toEqual([])
     harness.database.close()
   })
 
@@ -567,9 +571,7 @@ describe('ArtifactProcessor staged pipeline', () => {
     expect(result.outcome).toBe('completed')
     expect(observedBusyTimeoutMs).toBeGreaterThan(0)
     expect(observedBusyTimeoutMs).toBeLessThanOrEqual(1_000)
-    expect(harness.database.pragma('busy_timeout', { simple: true })).toBe(
-      configuredBusyTimeoutMs,
-    )
+    expect(harness.database.pragma('busy_timeout', { simple: true })).toBe(configuredBusyTimeoutMs)
     harness.database.close()
   })
 
@@ -627,8 +629,7 @@ describe('ArtifactProcessor staged pipeline', () => {
 
   it('restores prior diagnostics and item error relations after post-commit expiry', async () => {
     const harness = await makeHarness({
-      render: async () =>
-        rendered(Buffer.from('RIFF-warning-WEBP'), [{ code: 'CONTENT_CLIPPED' }]),
+      render: async () => rendered(Buffer.from('RIFF-warning-WEBP'), [{ code: 'CONTENT_CLIPPED' }]),
     })
     await writeFile(harness.sourcePath, '# Diagnostic baseline')
     const first = await harness.processor.register({ sourcePath: harness.sourcePath })
@@ -671,10 +672,7 @@ describe('ArtifactProcessor staged pipeline', () => {
       .get(generationId)
     const imports = new ImportRepository(harness.database)
     const run = imports.createRun([harness.sourcePath])
-    const delayTransactionReturn = installDelayedTransactionReturn(
-      harness.database,
-      250,
-    )
+    const delayTransactionReturn = installDelayedTransactionReturn(harness.database, 250)
     const processor = harness.createProcessor({
       fileSystem: {
         ...realFileSystem,
@@ -706,7 +704,10 @@ describe('ArtifactProcessor staged pipeline', () => {
         .all(artifactId),
     ).toEqual(priorWarnings)
     expect(
-      harness.database.prepare('SELECT error_id FROM import_item WHERE id = ?').pluck().get(previousItemId),
+      harness.database
+        .prepare('SELECT error_id FROM import_item WHERE id = ?')
+        .pluck()
+        .get(previousItemId),
     ).toBe(oldErrorId)
     expect(
       harness.database
@@ -759,10 +760,12 @@ describe('ArtifactProcessor staged pipeline', () => {
     expect(stale.errors.at(-1)).toMatchObject({ code: 'STALE_GENERATION', stage: 'commit' })
     expect(activeGenerationId(harness.database, artifactId)).toBe(first.generationId)
     expect(existsSync(oldThumbnail)).toBe(true)
-    expect((await readdir(harness.derivedDirectory)).filter((name) => name.includes('.tmp'))).toEqual([])
-    expect((await readdir(harness.derivedDirectory)).filter((name) => name.endsWith('.webp'))).toEqual([
-      oldThumbnail.split('/').at(-1),
-    ])
+    expect(
+      (await readdir(harness.derivedDirectory)).filter((name) => name.includes('.tmp')),
+    ).toEqual([])
+    expect(
+      (await readdir(harness.derivedDirectory)).filter((name) => name.endsWith('.webp')),
+    ).toEqual([oldThumbnail.split('/').at(-1)])
     harness.database.close()
   })
 
@@ -867,7 +870,9 @@ describe('ArtifactProcessor staged pipeline', () => {
         rollback: async () => {
           if (generation > 1) throw new Error('external rollback failed')
           externalRows.splice(
-            externalRows.findIndex((row) => row.artifactId === artifactId && row.generation === generation),
+            externalRows.findIndex(
+              (row) => row.artifactId === artifactId && row.generation === generation,
+            ),
             1,
           )
         },
@@ -897,9 +902,9 @@ describe('ArtifactProcessor staged pipeline', () => {
       generation: failed.generation,
       text: 'Leaked external text',
     })
-    expect(new SearchVisibilityRepository(harness.database).filterVisibleCandidates(externalRows)).toEqual([
-      { artifactId, generation: first.generation, text: 'Previous indexed text' },
-    ])
+    expect(
+      new SearchVisibilityRepository(harness.database).filterVisibleCandidates(externalRows),
+    ).toEqual([{ artifactId, generation: first.generation, text: 'Previous indexed text' }])
     expect(
       harness.database
         .prepare(
@@ -947,9 +952,9 @@ describe('ArtifactProcessor staged pipeline', () => {
         .get(failed.generationId),
     )
     expect(failed.indexStatus).toBe('failed')
-    expect(new ArtifactRepository(harness.database).listErrors(requireResultNumber(failed.artifactId))).toContainEqual(
-      expect.objectContaining({ code: 'INDEX_UPDATE_FAILED', stage: 'index' }),
-    )
+    expect(
+      new ArtifactRepository(harness.database).listErrors(requireResultNumber(failed.artifactId)),
+    ).toContainEqual(expect.objectContaining({ code: 'INDEX_UPDATE_FAILED', stage: 'index' }))
     harness.database.close()
   })
 
@@ -973,7 +978,9 @@ describe('ArtifactProcessor staged pipeline', () => {
     expect(failed.errors.at(-1)).toMatchObject({ code: 'DERIVED_WRITE_FAILED', stage: 'commit' })
     expect(activeGenerationId(harness.database, artifactId)).toBe(first.generationId)
     expect(await readFile(oldThumbnail, 'utf8')).toBe('RIFF-small-preview-WEBP')
-    expect((await readdir(harness.derivedDirectory)).filter((name) => name.includes('.tmp'))).toEqual([])
+    expect(
+      (await readdir(harness.derivedDirectory)).filter((name) => name.includes('.tmp')),
+    ).toEqual([])
 
     const successful = await harness.processor.refresh({ sourcePath: harness.sourcePath })
     expect(successful.outcome).toBe('completed')
@@ -1003,7 +1010,9 @@ describe('ArtifactProcessor staged pipeline', () => {
     expect(failed.errors.at(-1)).toMatchObject({ code: 'DERIVED_WRITE_FAILED', stage: 'commit' })
     expect(activeGenerationId(harness.database, artifactId)).toBe(first.generationId)
     expect(existsSync(oldThumbnail)).toBe(true)
-    expect((await readdir(harness.derivedDirectory)).filter((name) => name.includes('.tmp'))).toEqual([])
+    expect(
+      (await readdir(harness.derivedDirectory)).filter((name) => name.includes('.tmp')),
+    ).toEqual([])
     harness.database.close()
   })
 
@@ -1028,10 +1037,12 @@ describe('ArtifactProcessor staged pipeline', () => {
     expect(failed.outcome).toBe('failed')
     expect(activeGenerationId(harness.database, artifactId)).toBe(first.generationId)
     expect(await readFile(oldThumbnail, 'utf8')).toBe('RIFF-small-preview-WEBP')
-    expect((await readdir(harness.derivedDirectory)).filter((name) => name.endsWith('.webp'))).toEqual([
-      oldThumbnail.split('/').at(-1),
-    ])
-    expect((await readdir(harness.derivedDirectory)).filter((name) => name.includes('.tmp'))).toEqual([])
+    expect(
+      (await readdir(harness.derivedDirectory)).filter((name) => name.endsWith('.webp')),
+    ).toEqual([oldThumbnail.split('/').at(-1)])
+    expect(
+      (await readdir(harness.derivedDirectory)).filter((name) => name.includes('.tmp')),
+    ).toEqual([])
     harness.database.close()
   })
 
@@ -1045,7 +1056,8 @@ describe('ArtifactProcessor staged pipeline', () => {
       fileSystem: {
         ...realFileSystem,
         remove: async (path) => {
-          if (path === oldThumbnail) throw Object.assign(new Error(`denied: ${path}`), { code: 'EACCES' })
+          if (path === oldThumbnail)
+            throw Object.assign(new Error(`denied: ${path}`), { code: 'EACCES' })
           return realFileSystem.remove(path)
         },
       },
@@ -1231,13 +1243,15 @@ const realFileSystem: ProcessorFileSystem = {
   remove: (path) => rm(path, { force: true }),
 }
 
-async function makeHarness(options: {
-  sourceName?: string
-  render?: ArtifactProcessorConstructor['render']
-  indexer?: ArtifactIndexer
-  optimizer?: ThumbnailOptimizer
-  useDefaultIndexer?: boolean
-} = {}) {
+async function makeHarness(
+  options: {
+    sourceName?: string
+    render?: ArtifactProcessorConstructor['render']
+    indexer?: ArtifactIndexer
+    optimizer?: ThumbnailOptimizer
+    useDefaultIndexer?: boolean
+  } = {},
+) {
   const root = await temporaryDirectory()
   const sourcePath = join(root, options.sourceName ?? 'artifact.md')
   const derivedDirectory = join(root, 'derived')
@@ -1258,10 +1272,12 @@ async function makeHarness(options: {
       quality: 80,
     }),
   }
-  const dependencies = (overrides: {
-    fileSystem?: ProcessorFileSystem
-    optimizer?: ThumbnailOptimizer
-  } = {}) => ({
+  const dependencies = (
+    overrides: {
+      fileSystem?: ProcessorFileSystem
+      optimizer?: ThumbnailOptimizer
+    } = {},
+  ) => ({
     database,
     pathPolicy: {
       authorizeFile: async (path: string) => {
@@ -1352,9 +1368,9 @@ async function temporaryDirectory(): Promise<string> {
 
 function activeGenerationId(database: ReturnType<typeof openDatabase>, artifactId: number): number {
   return (
-    database
-      .prepare('SELECT active_generation_id FROM artifact WHERE id = ?')
-      .get(artifactId) as { active_generation_id: number }
+    database.prepare('SELECT active_generation_id FROM artifact WHERE id = ?').get(artifactId) as {
+      active_generation_id: number
+    }
   ).active_generation_id
 }
 

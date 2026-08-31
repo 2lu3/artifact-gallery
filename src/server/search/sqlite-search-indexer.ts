@@ -2,10 +2,7 @@ import { basename } from 'node:path'
 
 import type Database from 'better-sqlite3'
 
-import type {
-  ArtifactIndexer,
-  PreparedArtifactIndex,
-} from '../processing/artifact-processor.js'
+import type { ArtifactIndexer, PreparedArtifactIndex } from '../processing/artifact-processor.js'
 import { SearchVisibilityRepository } from '../repositories/search-visibility-repository.js'
 import { normalizeSearchIndexBody } from './search-index-normalizer.js'
 import { normalizePathSegments, normalizeSearchText } from './search-query.js'
@@ -106,7 +103,10 @@ export class SQLiteSearchIndexer implements ArtifactIndexer {
     return generationId
   }
 
-  private readRepairSource(artifactId: number, generation: number): {
+  private readRepairSource(
+    artifactId: number,
+    generation: number,
+  ): {
     readonly generationId: number
     readonly artifactId: number
     readonly generation: number
@@ -147,9 +147,7 @@ export class SQLiteSearchIndexer implements ArtifactIndexer {
   private readMetadata(artifactId: number): ArtifactIndexMetadata {
     const metadata = this.database
       .prepare('SELECT source_path, user_title, derived_title FROM artifact WHERE id = ?')
-      .get(artifactId) as
-      | ArtifactIndexMetadata
-      | undefined
+      .get(artifactId) as ArtifactIndexMetadata | undefined
     if (!metadata) throw new Error('The indexed artifact does not exist.')
     return metadata
   }

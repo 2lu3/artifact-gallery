@@ -16,15 +16,11 @@ export function openDatabase({
   const database = new Database(filename)
 
   try {
-    database.function(
-      'search_normalize',
-      { deterministic: true },
-      (value: string | null) => normalizeSearchText(value ?? ''),
+    database.function('search_normalize', { deterministic: true }, (value: string | null) =>
+      normalizeSearchText(value ?? ''),
     )
-    database.function(
-      'search_path_segments',
-      { deterministic: true },
-      (value: string) => normalizePathSegments(value),
+    database.function('search_path_segments', { deterministic: true }, (value: string) =>
+      normalizePathSegments(value),
     )
     database.function('path_basename', { deterministic: true }, (value: string) => basename(value))
     database.pragma('journal_mode = WAL')
@@ -51,7 +47,9 @@ function applyMigrations(database: Database.Database, migrationsDirectory: strin
     'INSERT INTO schema_migration (version, applied_at) VALUES (?, ?)',
   )
 
-  for (const version of readdirSync(migrationsDirectory).filter((name) => name.endsWith('.sql')).sort()) {
+  for (const version of readdirSync(migrationsDirectory)
+    .filter((name) => name.endsWith('.sql'))
+    .sort()) {
     if (applied.get(version)) {
       continue
     }

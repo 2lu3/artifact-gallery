@@ -13,10 +13,7 @@ import {
   type PublicProcessingError,
 } from '../../shared/errors.js'
 import type { HtmlRenderResult } from '../rendering/html-renderer.js'
-import {
-  MarkdownRenderer,
-  type MarkdownRenderResult,
-} from '../rendering/markdown-renderer.js'
+import { MarkdownRenderer, type MarkdownRenderResult } from '../rendering/markdown-renderer.js'
 import {
   ArtifactRepository,
   StaleGenerationError,
@@ -181,12 +178,8 @@ export interface ArtifactProcessorDependencies {
   readonly thumbnailOptimizer?: ThumbnailOptimizer
   readonly fileSystem?: ProcessorFileSystem
   readonly now?: () => string
-  readonly reportOperationalError?: (
-    error: ProcessingOperationalError,
-  ) => void | Promise<void>
-  readonly reportCommitCriticalSection?: (
-    measurement: CommitCriticalSectionMeasurement,
-  ) => void
+  readonly reportOperationalError?: (error: ProcessingOperationalError) => void | Promise<void>
+  readonly reportCommitCriticalSection?: (measurement: CommitCriticalSectionMeasurement) => void
 }
 
 export interface ArtifactProcessRequest {
@@ -398,7 +391,12 @@ export class ArtifactProcessor {
       )
       this.assertWithinDeadline(request.deadlineAt, 'extract')
       attempt.contentStatus = 'ready'
-      attempt.title = this.resolveTitle(attempt.artifactId, request.userTitle, attempt.extraction, authorizedFile)
+      attempt.title = this.resolveTitle(
+        attempt.artifactId,
+        request.userTitle,
+        attempt.extraction,
+        authorizedFile,
+      )
     } catch (error) {
       const mapped =
         error instanceof AssetReadLimitError
@@ -503,10 +501,7 @@ export class ArtifactProcessor {
         this.assertWithinDeadline(deadlineAt, 'commit')
         const base = `artifact-${artifactId}-generation-${generation}.webp`
         finalPath = join(this.dependencies.thumbnailDirectory, base)
-        temporaryPath = join(
-          this.dependencies.thumbnailDirectory,
-          `.${base}.${randomUUID()}.tmp`,
-        )
+        temporaryPath = join(this.dependencies.thumbnailDirectory, `.${base}.${randomUUID()}.tmp`)
         await this.waitForAttempt(
           this.fileSystem.writeFile(temporaryPath, optimized.bytes),
           signal,
@@ -633,10 +628,10 @@ export class ArtifactProcessor {
         (error instanceof IndexCommitError
           ? mapProcessingError(error.originalError, 'index', 'INDEX_UPDATE_FAILED')
           : error instanceof StaleGenerationError
-          ? new ArtifactProcessingError('STALE_GENERATION', 'commit', error.message, {
-              cause: error,
-            })
-          : mapProcessingError(error, 'commit', 'DERIVED_WRITE_FAILED'))
+            ? new ArtifactProcessingError('STALE_GENERATION', 'commit', error.message, {
+                cause: error,
+              })
+            : mapProcessingError(error, 'commit', 'DERIVED_WRITE_FAILED'))
       if (mapped.code === 'TIMEOUT') {
         return this.timeout(run, attempt, 'commit', false)
       }
@@ -766,10 +761,7 @@ export class ArtifactProcessor {
     return this.result('failed', attempt)
   }
 
-  private assertWithinDeadline(
-    deadlineAt: number | undefined,
-    stage: ProcessingStage,
-  ): void {
+  private assertWithinDeadline(deadlineAt: number | undefined, stage: ProcessingStage): void {
     if (this.deadlineExceeded(deadlineAt)) {
       throw new ArtifactProcessingError('TIMEOUT', stage)
     }

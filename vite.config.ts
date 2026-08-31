@@ -35,7 +35,12 @@ export default defineConfig({
               await upstream.text(),
             )
             response.statusCode = 200
-            for (const header of ['content-type', 'content-security-policy', 'cache-control', 'pragma']) {
+            for (const header of [
+              'content-type',
+              'content-security-policy',
+              'cache-control',
+              'pragma',
+            ]) {
               const value = upstream.headers.get(header)
               if (value) response.setHeader(header, value)
             }
@@ -49,6 +54,7 @@ export default defineConfig({
     },
   ],
   server: {
+    host: '127.0.0.1',
     proxy: {
       '/api': { target: apiOrigin },
     },

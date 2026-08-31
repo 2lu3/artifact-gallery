@@ -1,75 +1,78 @@
-import { randomUUID } from 'node:crypto';
-import { dirname, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto'
+import { dirname, resolve } from 'node:path'
 
-import * as cssTree from 'css-tree';
+import * as cssTree from 'css-tree'
 import {
   parse as parseHtml,
   serialize as serializeHtml,
   type DefaultTreeAdapterTypes,
-} from 'parse5';
-import { chromium, type Browser, type BrowserContext, type Page, type Route } from 'playwright';
+} from 'parse5'
+import { chromium, type Browser, type BrowserContext, type Page, type Route } from 'playwright'
 
 import {
   AssetReadLimitError,
   type AuthorizedAsset,
   type PathPolicy,
-} from '../security/path-policy.js';
+} from '../security/path-policy.js'
 
 export type HtmlRenderErrorCode =
   | 'HTML_RENDER_FAILED'
   | 'ASSET_BLOCKED'
   | 'ASSET_TOO_LARGE'
   | 'INPUT_TOO_LARGE'
-  | 'TIMEOUT';
+  | 'TIMEOUT'
 
 export class HtmlRenderError extends Error {
-  constructor(readonly code: HtmlRenderErrorCode, options?: ErrorOptions) {
-    super(code, options);
-    this.name = 'HtmlRenderError';
+  constructor(
+    readonly code: HtmlRenderErrorCode,
+    options?: ErrorOptions,
+  ) {
+    super(code, options)
+    this.name = 'HtmlRenderError'
   }
 }
 
 export interface HtmlRenderRequest {
-  readonly html: string;
-  readonly sourcePath: string;
-  readonly signal?: AbortSignal;
+  readonly html: string
+  readonly sourcePath: string
+  readonly signal?: AbortSignal
 }
 
-export type HtmlRenderWarningCode = 'ASSET_BLOCKED' | 'CONTENT_CLIPPED';
+export type HtmlRenderWarningCode = 'ASSET_BLOCKED' | 'CONTENT_CLIPPED'
 
 export interface HtmlRenderWarning {
-  readonly code: HtmlRenderWarningCode;
+  readonly code: HtmlRenderWarningCode
 }
 
 export interface HtmlRenderResult {
-  readonly screenshot: Buffer;
-  readonly width: number;
-  readonly height: number;
-  readonly warnings: readonly HtmlRenderWarning[];
+  readonly screenshot: Buffer
+  readonly width: number
+  readonly height: number
+  readonly warnings: readonly HtmlRenderWarning[]
 }
 
 export interface HtmlRendererWebpEncodeRequest {
-  readonly bytes: Buffer;
-  readonly width: number;
-  readonly height: number;
-  readonly quality: number;
-  readonly signal?: AbortSignal;
+  readonly bytes: Buffer
+  readonly width: number
+  readonly height: number
+  readonly quality: number
+  readonly signal?: AbortSignal
 }
 
-type AssetPathPolicy = Pick<PathPolicy, 'authorizeAsset'>;
+type AssetPathPolicy = Pick<PathPolicy, 'authorizeAsset'>
 
 export interface HtmlRendererOptions {
-  readonly launchBrowser?: () => Promise<Browser>;
-  readonly renderTimeoutMs?: number;
+  readonly launchBrowser?: () => Promise<Browser>
+  readonly renderTimeoutMs?: number
 }
 
-const RENDER_TIMEOUT_MS = 30_000;
-const MAX_HTML_BYTES = 10 * 1024 * 1024;
-const MAX_ASSET_BYTES = 10 * 1024 * 1024;
-const MAX_TOTAL_ASSET_BYTES = 50 * 1024 * 1024;
-const SCREENSHOT_WIDTH = 1200;
-const SCREENSHOT_MAX_HEIGHT = 2400;
-const VIRTUAL_ASSET_ORIGIN = 'https://artifact.invalid';
+const RENDER_TIMEOUT_MS = 30_000
+const MAX_HTML_BYTES = 10 * 1024 * 1024
+const MAX_ASSET_BYTES = 10 * 1024 * 1024
+const MAX_TOTAL_ASSET_BYTES = 50 * 1024 * 1024
+const SCREENSHOT_WIDTH = 1200
+const SCREENSHOT_MAX_HEIGHT = 2400
+const VIRTUAL_ASSET_ORIGIN = 'https://artifact.invalid'
 
 const HTML_URL_ATTRIBUTES = new Set([
   'action',
@@ -83,7 +86,7 @@ const HTML_URL_ATTRIBUTES = new Set([
   'poster',
   'src',
   'xlink:href',
-]);
+])
 
 const SVG_CSS_URL_ATTRIBUTES = new Set([
   'clip-path',
@@ -96,7 +99,7 @@ const SVG_CSS_URL_ATTRIBUTES = new Set([
   'marker-start',
   'mask',
   'stroke',
-]);
+])
 
 const CONTENT_SECURITY_POLICY = [
   "default-src 'none'",
@@ -111,182 +114,179 @@ const CONTENT_SECURITY_POLICY = [
   "media-src 'none'",
   "form-action 'none'",
   'base-uri https://artifact.invalid',
-].join('; ');
+].join('; ')
 
 interface RenderState {
-  readonly warnings: Set<HtmlRenderWarningCode>;
-  readonly assetBudget: AssetBudget;
-  blockedNavigation: boolean;
-  error?: HtmlRenderError;
+  readonly warnings: Set<HtmlRenderWarningCode>
+  readonly assetBudget: AssetBudget
+  blockedNavigation: boolean
+  error?: HtmlRenderError
 }
 
 class AssetBudget {
-  private remainingBytes = MAX_TOTAL_ASSET_BYTES;
-  private failed = false;
-  private tail: Promise<void> = Promise.resolve();
+  private remainingBytes = MAX_TOTAL_ASSET_BYTES
+  private failed = false
+  private tail: Promise<void> = Promise.resolve()
 
   read(asset: AuthorizedAsset): Promise<Buffer> {
-    const operation = this.tail.then(() => this.readNext(asset));
+    const operation = this.tail.then(() => this.readNext(asset))
     this.tail = operation.then(
       () => undefined,
       () => undefined,
-    );
-    return operation;
+    )
+    return operation
   }
 
   private async readNext(asset: AuthorizedAsset): Promise<Buffer> {
     if (this.failed || this.remainingBytes <= 0) {
-      this.failed = true;
-      throw new AssetReadLimitError(Math.max(0, this.remainingBytes));
+      this.failed = true
+      throw new AssetReadLimitError(Math.max(0, this.remainingBytes))
     }
-    const reservedBytes = Math.min(MAX_ASSET_BYTES, this.remainingBytes);
+    const reservedBytes = Math.min(MAX_ASSET_BYTES, this.remainingBytes)
     try {
-      const bytes = await asset.read(reservedBytes);
+      const bytes = await asset.read(reservedBytes)
       if (bytes.byteLength > reservedBytes) {
-        throw new AssetReadLimitError(reservedBytes);
+        throw new AssetReadLimitError(reservedBytes)
       }
-      this.remainingBytes -= bytes.byteLength;
-      return bytes;
+      this.remainingBytes -= bytes.byteLength
+      return bytes
     } catch (error) {
-      if (error instanceof AssetReadLimitError) this.failed = true;
-      throw error;
+      if (error instanceof AssetReadLimitError) this.failed = true
+      throw error
     }
   }
 }
 
 interface RenderAttemptHandle {
-  context?: BrowserContext;
+  context?: BrowserContext
 }
 
 interface ContextWaiter {
-  readonly signal: AbortSignal;
-  readonly resolve: (release: () => void) => void;
-  readonly reject: (error: HtmlRenderError) => void;
-  readonly onAbort: () => void;
+  readonly signal: AbortSignal
+  readonly resolve: (release: () => void) => void
+  readonly reject: (error: HtmlRenderError) => void
+  readonly onAbort: () => void
 }
 
 class ContextLimiter {
-  private active = 0;
-  private readonly waiters: ContextWaiter[] = [];
+  private active = 0
+  private readonly waiters: ContextWaiter[] = []
 
   constructor(private readonly maximum: number) {}
 
   acquire(signal: AbortSignal): Promise<() => void> {
     if (signal.aborted) {
-      return Promise.reject(new HtmlRenderError('TIMEOUT'));
+      return Promise.reject(new HtmlRenderError('TIMEOUT'))
     }
     if (this.active < this.maximum) {
-      this.active += 1;
-      return Promise.resolve(this.releaseFunction());
+      this.active += 1
+      return Promise.resolve(this.releaseFunction())
     }
     return new Promise((resolve, reject) => {
       const onAbort = () => {
-        const index = this.waiters.indexOf(waiter);
-        if (index >= 0) this.waiters.splice(index, 1);
-        reject(new HtmlRenderError('TIMEOUT'));
-      };
-      const waiter: ContextWaiter = { signal, resolve, reject, onAbort };
-      signal.addEventListener('abort', onAbort, { once: true });
-      this.waiters.push(waiter);
-    });
+        const index = this.waiters.indexOf(waiter)
+        if (index >= 0) this.waiters.splice(index, 1)
+        reject(new HtmlRenderError('TIMEOUT'))
+      }
+      const waiter: ContextWaiter = { signal, resolve, reject, onAbort }
+      signal.addEventListener('abort', onAbort, { once: true })
+      this.waiters.push(waiter)
+    })
   }
 
   private releaseFunction(): () => void {
-    let released = false;
+    let released = false
     return () => {
-      if (released) return;
-      released = true;
-      this.active -= 1;
-      this.grantNext();
-    };
+      if (released) return
+      released = true
+      this.active -= 1
+      this.grantNext()
+    }
   }
 
   private grantNext(): void {
-    const waiter = this.waiters.shift();
-    if (!waiter) return;
-    waiter.signal.removeEventListener('abort', waiter.onAbort);
+    const waiter = this.waiters.shift()
+    if (!waiter) return
+    waiter.signal.removeEventListener('abort', waiter.onAbort)
     if (waiter.signal.aborted) {
-      waiter.reject(new HtmlRenderError('TIMEOUT'));
-      this.grantNext();
-      return;
+      waiter.reject(new HtmlRenderError('TIMEOUT'))
+      this.grantNext()
+      return
     }
-    this.active += 1;
-    waiter.resolve(this.releaseFunction());
+    this.active += 1
+    waiter.resolve(this.releaseFunction())
   }
 }
 
 export class HtmlRenderer {
-  private browser: Browser | null = null;
-  private browserLaunch: Promise<Browser> | null = null;
-  private readonly launchBrowser: () => Promise<Browser>;
-  private readonly renderTimeoutMs: number;
-  private readonly contextLimiter = new ContextLimiter(2);
+  private browser: Browser | null = null
+  private browserLaunch: Promise<Browser> | null = null
+  private readonly launchBrowser: () => Promise<Browser>
+  private readonly renderTimeoutMs: number
+  private readonly contextLimiter = new ContextLimiter(2)
 
   constructor(
     private readonly pathPolicy: AssetPathPolicy,
     options: HtmlRendererOptions = {},
   ) {
-    this.launchBrowser = options.launchBrowser ?? (() => chromium.launch({ headless: true }));
+    this.launchBrowser = options.launchBrowser ?? (() => chromium.launch({ headless: true }))
     this.renderTimeoutMs = Math.min(
       Math.max(1, options.renderTimeoutMs ?? RENDER_TIMEOUT_MS),
       RENDER_TIMEOUT_MS,
-    );
+    )
   }
 
   async render(request: HtmlRenderRequest): Promise<HtmlRenderResult> {
     if (Buffer.byteLength(request.html, 'utf8') > MAX_HTML_BYTES) {
-      throw new HtmlRenderError('INPUT_TOO_LARGE');
+      throw new HtmlRenderError('INPUT_TOO_LARGE')
     }
 
-    const handle: RenderAttemptHandle = {};
-    const abortController = new AbortController();
-    const attempt = this.renderAttempt(request, handle, abortController.signal);
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    let rejectExternalAbort: (() => void) | undefined;
+    const handle: RenderAttemptHandle = {}
+    const abortController = new AbortController()
+    const attempt = this.renderAttempt(request, handle, abortController.signal)
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    let rejectExternalAbort: (() => void) | undefined
     const externalAbort = new Promise<never>((_resolve, reject) => {
-      rejectExternalAbort = () => reject(new HtmlRenderError('TIMEOUT'));
-      if (request.signal?.aborted) rejectExternalAbort();
-      else request.signal?.addEventListener('abort', rejectExternalAbort, { once: true });
-    });
+      rejectExternalAbort = () => reject(new HtmlRenderError('TIMEOUT'))
+      if (request.signal?.aborted) rejectExternalAbort()
+      else request.signal?.addEventListener('abort', rejectExternalAbort, { once: true })
+    })
     try {
       return await Promise.race([
         attempt,
         externalAbort,
         new Promise<never>((_resolve, reject) => {
-          timeout = setTimeout(
-            () => reject(new HtmlRenderError('TIMEOUT')),
-            this.renderTimeoutMs,
-          );
+          timeout = setTimeout(() => reject(new HtmlRenderError('TIMEOUT')), this.renderTimeoutMs)
         }),
-      ]);
+      ])
     } catch (error) {
       if (error instanceof HtmlRenderError && error.code === 'TIMEOUT') {
-        abortController.abort();
-        void attempt.catch(() => undefined);
-        await handle.context?.close().catch(() => undefined);
+        abortController.abort()
+        void attempt.catch(() => undefined)
+        await handle.context?.close().catch(() => undefined)
       }
-      throw error;
+      throw error
     } finally {
       if (timeout) {
-        clearTimeout(timeout);
+        clearTimeout(timeout)
       }
       if (rejectExternalAbort) {
-        request.signal?.removeEventListener('abort', rejectExternalAbort);
+        request.signal?.removeEventListener('abort', rejectExternalAbort)
       }
     }
   }
 
   async encodeWebp(request: HtmlRendererWebpEncodeRequest): Promise<Buffer> {
-    const abortController = new AbortController();
-    const abortFromWorker = () => abortController.abort(request.signal?.reason);
-    if (request.signal?.aborted) abortFromWorker();
-    else request.signal?.addEventListener('abort', abortFromWorker, { once: true });
-    const timeout = setTimeout(() => abortController.abort(), this.renderTimeoutMs);
-    let context: BrowserContext | undefined;
-    let releaseContextSlot: (() => void) | undefined;
+    const abortController = new AbortController()
+    const abortFromWorker = () => abortController.abort(request.signal?.reason)
+    if (request.signal?.aborted) abortFromWorker()
+    else request.signal?.addEventListener('abort', abortFromWorker, { once: true })
+    const timeout = setTimeout(() => abortController.abort(), this.renderTimeoutMs)
+    let context: BrowserContext | undefined
+    let releaseContextSlot: (() => void) | undefined
     try {
-      releaseContextSlot = await this.contextLimiter.acquire(abortController.signal);
-      const browser = await this.awaitAttempt(this.ensureBrowser(), abortController.signal);
+      releaseContextSlot = await this.contextLimiter.acquire(abortController.signal)
+      const browser = await this.awaitAttempt(this.ensureBrowser(), abortController.signal)
       context = await this.awaitAttempt(
         browser.newContext({
           acceptDownloads: false,
@@ -296,9 +296,9 @@ export class HtmlRenderer {
         }),
         abortController.signal,
         (lateContext) => lateContext.close(),
-      );
-      const page = await this.awaitAttempt(context.newPage(), abortController.signal);
-      const source = `data:image/webp;base64,${request.bytes.toString('base64')}`;
+      )
+      const page = await this.awaitAttempt(context.newPage(), abortController.signal)
+      const source = `data:image/webp;base64,${request.bytes.toString('base64')}`
       await this.awaitAttempt(
         page.setContent(
           `<style>html,body{margin:0;width:${request.width}px;height:${request.height}px;overflow:hidden}` +
@@ -307,16 +307,16 @@ export class HtmlRenderer {
           { waitUntil: 'load' },
         ),
         abortController.signal,
-      );
+      )
       return await this.awaitAttempt(
         this.capturePageWebp(page, request.width, request.height, request.quality),
         abortController.signal,
-      );
+      )
     } finally {
-      clearTimeout(timeout);
-      request.signal?.removeEventListener('abort', abortFromWorker);
-      await context?.close().catch(() => undefined);
-      releaseContextSlot?.();
+      clearTimeout(timeout)
+      request.signal?.removeEventListener('abort', abortFromWorker)
+      await context?.close().catch(() => undefined)
+      releaseContextSlot?.()
     }
   }
 
@@ -325,88 +325,88 @@ export class HtmlRenderer {
     handle: RenderAttemptHandle,
     signal: AbortSignal,
   ): Promise<HtmlRenderResult> {
-    let context: BrowserContext | undefined;
-    let releaseContextSlot: (() => void) | undefined;
+    let context: BrowserContext | undefined
+    let releaseContextSlot: (() => void) | undefined
     try {
-      releaseContextSlot = await this.contextLimiter.acquire(signal);
-      context = await this.createContext(signal, handle);
+      releaseContextSlot = await this.contextLimiter.acquire(signal)
+      context = await this.createContext(signal, handle)
       const state: RenderState = {
         warnings: new Set(),
         assetBudget: new AssetBudget(),
         blockedNavigation: false,
-      };
-      const assetToken = randomUUID();
+      }
+      const assetToken = randomUUID()
       await context.route('**/*', (route) =>
         this.handleRoute(route, request.sourcePath, assetToken, state),
-      );
+      )
       await context.routeWebSocket('**/*', (webSocket) => {
-        state.warnings.add('ASSET_BLOCKED');
-        webSocket.close();
-      });
-      const page = await context.newPage();
-      this.blockPageCapabilities(page, state.warnings);
-      const virtualBaseUrl = `${VIRTUAL_ASSET_ORIGIN}/${assetToken}/`;
+        state.warnings.add('ASSET_BLOCKED')
+        webSocket.close()
+      })
+      const page = await context.newPage()
+      this.blockPageCapabilities(page, state.warnings)
+      const virtualBaseUrl = `${VIRTUAL_ASSET_ORIGIN}/${assetToken}/`
       const rewrittenHtml = this.rewriteHtmlAssetReferences(
         request.html,
         virtualBaseUrl,
         state.warnings,
-      );
+      )
       await page.setContent(this.isolatedDocument(rewrittenHtml, assetToken), {
         waitUntil: 'load',
-      });
+      })
       try {
-        await page.evaluate(() => document.fonts.ready);
+        await page.evaluate(() => document.fonts.ready)
       } catch (error) {
         if (!state.blockedNavigation) {
-          throw error;
+          throw error
         }
       }
       if (state.blockedNavigation) {
-        await this.replaceBlockedNavigation(page);
+        await this.replaceBlockedNavigation(page)
       }
       if (state.error) {
-        throw state.error;
+        throw state.error
       }
       const naturalHeight = await page.evaluate(() =>
         Math.max(document.body?.scrollHeight ?? 0, document.documentElement.scrollHeight, 1),
-      );
-      const height = Math.min(naturalHeight, SCREENSHOT_MAX_HEIGHT);
+      )
+      const height = Math.min(naturalHeight, SCREENSHOT_MAX_HEIGHT)
       if (naturalHeight > SCREENSHOT_MAX_HEIGHT) {
-        state.warnings.add('CONTENT_CLIPPED');
+        state.warnings.add('CONTENT_CLIPPED')
       }
-      const screenshot = await this.captureWebp(page, height);
+      const screenshot = await this.captureWebp(page, height)
       return {
         screenshot,
         width: SCREENSHOT_WIDTH,
         height,
         warnings: [...state.warnings].map((code) => ({ code })),
-      };
+      }
     } catch (error) {
       if (error instanceof HtmlRenderError) {
-        throw error;
+        throw error
       }
-      throw new HtmlRenderError('HTML_RENDER_FAILED', { cause: error });
+      throw new HtmlRenderError('HTML_RENDER_FAILED', { cause: error })
     } finally {
-      await context?.close().catch(() => undefined);
-      handle.context = undefined;
-      releaseContextSlot?.();
+      await context?.close().catch(() => undefined)
+      handle.context = undefined
+      releaseContextSlot?.()
     }
   }
 
   async close(): Promise<void> {
-    const browser = this.browser ?? (await this.browserLaunch?.catch(() => null));
-    this.browser = null;
-    this.browserLaunch = null;
-    await browser?.close().catch(() => undefined);
+    const browser = this.browser ?? (await this.browserLaunch?.catch(() => null))
+    this.browser = null
+    this.browserLaunch = null
+    await browser?.close().catch(() => undefined)
   }
 
   private async createContext(
     signal: AbortSignal,
     handle: RenderAttemptHandle,
   ): Promise<BrowserContext> {
-    const browser = await this.awaitAttempt(this.ensureBrowser(), signal);
-    this.assertAttemptActive(signal);
-    let context: BrowserContext | undefined;
+    const browser = await this.awaitAttempt(this.ensureBrowser(), signal)
+    this.assertAttemptActive(signal)
+    let context: BrowserContext | undefined
     try {
       context = await this.awaitAttempt(
         browser.newContext({
@@ -417,21 +417,21 @@ export class HtmlRenderer {
         }),
         signal,
         (lateContext) => lateContext.close(),
-      );
-      handle.context = context;
-      this.assertAttemptActive(signal);
-      await this.awaitAttempt(context.clearPermissions(), signal);
-      this.assertAttemptActive(signal);
-      return context;
+      )
+      handle.context = context
+      this.assertAttemptActive(signal)
+      await this.awaitAttempt(context.clearPermissions(), signal)
+      this.assertAttemptActive(signal)
+      return context
     } catch (error) {
-      await context?.close().catch(() => undefined);
-      if (handle.context === context) handle.context = undefined;
-      throw error;
+      await context?.close().catch(() => undefined)
+      if (handle.context === context) handle.context = undefined
+      throw error
     }
   }
 
   private assertAttemptActive(signal: AbortSignal): void {
-    if (signal.aborted) throw new HtmlRenderError('TIMEOUT');
+    if (signal.aborted) throw new HtmlRenderError('TIMEOUT')
   }
 
   private awaitAttempt<T>(
@@ -440,59 +440,59 @@ export class HtmlRenderer {
     disposeLateResult?: (value: T) => Promise<unknown>,
   ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      let settled = false;
+      let settled = false
       const onAbort = () => {
-        if (settled) return;
-        settled = true;
-        reject(new HtmlRenderError('TIMEOUT'));
-      };
-      signal.addEventListener('abort', onAbort, { once: true });
-      if (signal.aborted) onAbort();
+        if (settled) return
+        settled = true
+        reject(new HtmlRenderError('TIMEOUT'))
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      if (signal.aborted) onAbort()
       void operation.then(
         (value) => {
           if (settled) {
-            void disposeLateResult?.(value).catch(() => undefined);
-            return;
+            void disposeLateResult?.(value).catch(() => undefined)
+            return
           }
-          settled = true;
-          signal.removeEventListener('abort', onAbort);
-          resolve(value);
+          settled = true
+          signal.removeEventListener('abort', onAbort)
+          resolve(value)
         },
         (error: unknown) => {
-          if (settled) return;
-          settled = true;
-          signal.removeEventListener('abort', onAbort);
-          reject(error);
+          if (settled) return
+          settled = true
+          signal.removeEventListener('abort', onAbort)
+          reject(error)
         },
-      );
-    });
+      )
+    })
   }
 
   private async ensureBrowser(): Promise<Browser> {
     if (this.browser?.isConnected()) {
-      return this.browser;
+      return this.browser
     }
     if (!this.browserLaunch) {
       const launch = this.launchBrowser().then((browser) => {
-        this.browser = browser;
+        this.browser = browser
         browser.on('disconnected', () => {
           if (this.browser === browser) {
-            this.browser = null;
+            this.browser = null
           }
-        });
-        return browser;
-      });
-      this.browserLaunch = launch;
+        })
+        return browser
+      })
+      this.browserLaunch = launch
       void launch.then(
         () => {
-          if (this.browserLaunch === launch) this.browserLaunch = null;
+          if (this.browserLaunch === launch) this.browserLaunch = null
         },
         () => {
-          if (this.browserLaunch === launch) this.browserLaunch = null;
+          if (this.browserLaunch === launch) this.browserLaunch = null
         },
-      );
+      )
     }
-    return this.browserLaunch;
+    return this.browserLaunch
   }
 
   private async handleRoute(
@@ -506,18 +506,18 @@ export class HtmlRenderer {
      * request -> virtual local asset? -- no --> abort + warning
      *                              `-- yes -> authorizeAsset -> fulfill | abort
      */
-    const assetPath = this.localAssetPath(route.request().url(), sourcePath, assetToken);
+    const assetPath = this.localAssetPath(route.request().url(), sourcePath, assetToken)
     if (!assetPath) {
-      state.warnings.add('ASSET_BLOCKED');
+      state.warnings.add('ASSET_BLOCKED')
       if (route.request().isNavigationRequest()) {
-        state.blockedNavigation = true;
+        state.blockedNavigation = true
       }
-      await route.abort('blockedbyclient');
-      return;
+      await route.abort('blockedbyclient')
+      return
     }
     try {
-      const asset = await this.pathPolicy.authorizeAsset(assetPath);
-      const bytes = await state.assetBudget.read(asset);
+      const asset = await this.pathPolicy.authorizeAsset(assetPath)
+      const bytes = await state.assetBudget.read(asset)
       const body = asset.mimeType.startsWith('text/css')
         ? Buffer.from(
             this.rewriteCssAssetReferences(
@@ -528,7 +528,7 @@ export class HtmlRenderer {
               state.warnings,
             ),
           )
-        : bytes;
+        : bytes
       await route.fulfill({
         status: 200,
         body,
@@ -537,33 +537,37 @@ export class HtmlRenderer {
           'access-control-allow-origin': '*',
           'x-content-type-options': 'nosniff',
         },
-      });
+      })
     } catch (error) {
       if (error instanceof AssetReadLimitError) {
-        state.error = new HtmlRenderError('ASSET_TOO_LARGE');
+        state.error = new HtmlRenderError('ASSET_TOO_LARGE')
       } else {
-        state.warnings.add('ASSET_BLOCKED');
+        state.warnings.add('ASSET_BLOCKED')
       }
-      await route.abort('blockedbyclient').catch(() => undefined);
+      await route.abort('blockedbyclient').catch(() => undefined)
     }
   }
 
-  private localAssetPath(requestUrl: string, sourcePath: string, assetToken: string): string | null {
-    let url: URL;
+  private localAssetPath(
+    requestUrl: string,
+    sourcePath: string,
+    assetToken: string,
+  ): string | null {
+    let url: URL
     try {
-      url = new URL(requestUrl);
+      url = new URL(requestUrl)
     } catch {
-      return null;
+      return null
     }
-    const prefix = `/${assetToken}/`;
+    const prefix = `/${assetToken}/`
     if (url.origin !== VIRTUAL_ASSET_ORIGIN || !url.pathname.startsWith(prefix)) {
-      return null;
+      return null
     }
-    let relativePath: string;
+    let relativePath: string
     try {
-      relativePath = decodeURIComponent(url.pathname.slice(prefix.length));
+      relativePath = decodeURIComponent(url.pathname.slice(prefix.length))
     } catch {
-      return null;
+      return null
     }
     if (
       relativePath.length === 0 ||
@@ -571,39 +575,39 @@ export class HtmlRenderer {
       relativePath.includes('\\') ||
       relativePath.split('/').includes('..')
     ) {
-      return null;
+      return null
     }
-    return resolve(dirname(sourcePath), relativePath);
+    return resolve(dirname(sourcePath), relativePath)
   }
 
   private blockPageCapabilities(page: Page, warnings: Set<HtmlRenderWarningCode>): void {
     page.on('console', (message) => {
-      const text = message.text();
+      const text = message.text()
       if (
         text.includes('Content Security Policy') ||
         text.includes('Not allowed to load local resource')
       ) {
-        warnings.add('ASSET_BLOCKED');
+        warnings.add('ASSET_BLOCKED')
       }
-    });
+    })
     page.on('dialog', (dialog) => {
-      warnings.add('ASSET_BLOCKED');
-      void dialog.dismiss();
-    });
+      warnings.add('ASSET_BLOCKED')
+      void dialog.dismiss()
+    })
     page.on('download', (download) => {
-      warnings.add('ASSET_BLOCKED');
-      void download.cancel();
-    });
+      warnings.add('ASSET_BLOCKED')
+      void download.cancel()
+    })
     page.on('popup', (popup) => {
-      warnings.add('ASSET_BLOCKED');
-      void popup.close();
-    });
+      warnings.add('ASSET_BLOCKED')
+      void popup.close()
+    })
   }
 
   private isolatedDocument(html: string, assetToken: string): string {
     return `<meta http-equiv="Content-Security-Policy" content="${CONTENT_SECURITY_POLICY}">
       <base href="${VIRTUAL_ASSET_ORIGIN}/${assetToken}/">
-      ${html}`;
+      ${html}`
   }
 
   private rewriteHtmlAssetReferences(
@@ -611,13 +615,15 @@ export class HtmlRenderer {
     virtualBaseUrl: string,
     warnings: Set<HtmlRenderWarningCode>,
   ): string {
-    const document = parseHtml(html);
+    const document = parseHtml(html)
     const visit = (node: DefaultTreeAdapterTypes.Node): void => {
       if (isHtmlElement(node)) {
         if (node.tagName === 'base') {
-          const hadBaseCapability = node.attrs.some(({ name }) => name === 'href' || name === 'target');
-          node.attrs = node.attrs.filter(({ name }) => name !== 'href' && name !== 'target');
-          if (hadBaseCapability) warnings.add('ASSET_BLOCKED');
+          const hadBaseCapability = node.attrs.some(
+            ({ name }) => name === 'href' || name === 'target',
+          )
+          node.attrs = node.attrs.filter(({ name }) => name !== 'href' && name !== 'target')
+          if (hadBaseCapability) warnings.add('ASSET_BLOCKED')
         }
         if (
           node.tagName === 'meta' &&
@@ -625,31 +631,27 @@ export class HtmlRenderer {
             ({ name, value }) => name === 'http-equiv' && value.toLowerCase() === 'refresh',
           )
         ) {
-          const content = node.attrs.find(({ name }) => name === 'content');
-          if (content) content.value = '';
-          warnings.add('ASSET_BLOCKED');
+          const content = node.attrs.find(({ name }) => name === 'content')
+          if (content) content.value = ''
+          warnings.add('ASSET_BLOCKED')
         }
 
         for (const attribute of node.attrs) {
-          const attributeName = attribute.name.toLowerCase();
+          const attributeName = attribute.name.toLowerCase()
           if (HTML_URL_ATTRIBUTES.has(attributeName)) {
-            const rewritten = rewriteLocalAssetUrl(
-              attribute.value,
-              virtualBaseUrl,
-              virtualBaseUrl,
-            );
+            const rewritten = rewriteLocalAssetUrl(attribute.value, virtualBaseUrl, virtualBaseUrl)
             if (rewritten === null) {
-              attribute.value = 'data:,blocked';
-              warnings.add('ASSET_BLOCKED');
+              attribute.value = 'data:,blocked'
+              warnings.add('ASSET_BLOCKED')
             } else {
-              attribute.value = rewritten;
+              attribute.value = rewritten
             }
           } else if (attributeName === 'srcset' || attributeName === 'ping') {
-            attribute.value = '';
-            warnings.add('ASSET_BLOCKED');
+            attribute.value = ''
+            warnings.add('ASSET_BLOCKED')
           } else if (attributeName === 'srcdoc') {
-            attribute.value = '';
-            warnings.add('ASSET_BLOCKED');
+            attribute.value = ''
+            warnings.add('ASSET_BLOCKED')
           } else if (attributeName === 'style') {
             attribute.value = this.rewriteCssAssetReferences(
               attribute.value,
@@ -657,7 +659,7 @@ export class HtmlRenderer {
               virtualBaseUrl,
               'declarationList',
               warnings,
-            );
+            )
           } else if (SVG_CSS_URL_ATTRIBUTES.has(attributeName)) {
             attribute.value = this.rewriteCssAssetReferences(
               attribute.value,
@@ -665,7 +667,7 @@ export class HtmlRenderer {
               virtualBaseUrl,
               'value',
               warnings,
-            );
+            )
           }
         }
 
@@ -673,7 +675,7 @@ export class HtmlRenderer {
           const stylesheet = node.childNodes
             .filter(isHtmlTextNode)
             .map(({ value }) => value)
-            .join('');
+            .join('')
           node.childNodes = [
             {
               nodeName: '#text',
@@ -686,18 +688,18 @@ export class HtmlRenderer {
                 warnings,
               ),
             },
-          ];
+          ]
         }
         if (node.tagName === 'template' && 'content' in node) {
-          visit(node.content);
+          visit(node.content)
         }
       }
       if ('childNodes' in node) {
-        for (const child of node.childNodes) visit(child);
+        for (const child of node.childNodes) visit(child)
       }
-    };
-    visit(document);
-    return serializeHtml(document);
+    }
+    visit(document)
+    return serializeHtml(document)
   }
 
   private rewriteCssAssetReferences(
@@ -707,60 +709,56 @@ export class HtmlRenderer {
     context: 'stylesheet' | 'declarationList' | 'value',
     warnings: Set<HtmlRenderWarningCode>,
   ): string {
-    let malformed = false;
-    let ast: cssTree.CssNode;
+    let malformed = false
+    let ast: cssTree.CssNode
     try {
       ast = cssTree.parse(css, {
         context,
         parseCustomProperty: true,
         onParseError: () => {
-          malformed = true;
+          malformed = true
         },
-      });
+      })
     } catch {
-      warnings.add('ASSET_BLOCKED');
-      return '';
+      warnings.add('ASSET_BLOCKED')
+      return ''
     }
     cssTree.walk(ast, function (node) {
       if (node.type === 'Raw') {
-        malformed = true;
-        return;
+        malformed = true
+        return
       }
       const stringIsAssetUrl =
         node.type === 'String' &&
         (this.atrule?.name.toLowerCase() === 'import' ||
           this.function?.name.toLowerCase() === 'image-set' ||
-          this.function?.name.toLowerCase() === '-webkit-image-set');
-      if (node.type !== 'Url' && !stringIsAssetUrl) return;
-      const rewritten = rewriteLocalAssetUrl(
-        node.value,
-        resolutionBaseUrl,
-        virtualAssetRootUrl,
-      );
+          this.function?.name.toLowerCase() === '-webkit-image-set')
+      if (node.type !== 'Url' && !stringIsAssetUrl) return
+      const rewritten = rewriteLocalAssetUrl(node.value, resolutionBaseUrl, virtualAssetRootUrl)
       if (rewritten === null) {
-        node.value = 'data:,blocked';
-        warnings.add('ASSET_BLOCKED');
+        node.value = 'data:,blocked'
+        warnings.add('ASSET_BLOCKED')
       } else {
-        node.value = rewritten;
+        node.value = rewritten
       }
-    });
+    })
     if (malformed) {
-      warnings.add('ASSET_BLOCKED');
-      return '';
+      warnings.add('ASSET_BLOCKED')
+      return ''
     }
-    return cssTree.generate(ast);
+    return cssTree.generate(ast)
   }
 
   private async replaceBlockedNavigation(page: Page): Promise<void> {
-    await page.goto('about:blank', { waitUntil: 'commit' });
+    await page.goto('about:blank', { waitUntil: 'commit' })
     await page.setContent(
       `<meta http-equiv="Content-Security-Policy" content="${CONTENT_SECURITY_POLICY}">`,
       { waitUntil: 'load' },
-    );
+    )
   }
 
   private async captureWebp(page: Page, height: number): Promise<Buffer> {
-    return this.capturePageWebp(page, SCREENSHOT_WIDTH, height, 80);
+    return this.capturePageWebp(page, SCREENSHOT_WIDTH, height, 80)
   }
 
   private async capturePageWebp(
@@ -769,17 +767,17 @@ export class HtmlRenderer {
     height: number,
     quality: number,
   ): Promise<Buffer> {
-    const session = await page.context().newCDPSession(page);
+    const session = await page.context().newCDPSession(page)
     try {
       const result = await session.send('Page.captureScreenshot', {
         format: 'webp',
         quality,
         clip: { x: 0, y: 0, width, height, scale: 1 },
         captureBeyondViewport: true,
-      });
-      return Buffer.from(result.data, 'base64');
+      })
+      return Buffer.from(result.data, 'base64')
     } finally {
-      await session.detach().catch(() => undefined);
+      await session.detach().catch(() => undefined)
     }
   }
 }
@@ -787,13 +785,13 @@ export class HtmlRenderer {
 function isHtmlElement(
   node: DefaultTreeAdapterTypes.Node,
 ): node is DefaultTreeAdapterTypes.Element | DefaultTreeAdapterTypes.Template {
-  return 'tagName' in node;
+  return 'tagName' in node
 }
 
 function isHtmlTextNode(
   node: DefaultTreeAdapterTypes.ChildNode,
 ): node is DefaultTreeAdapterTypes.TextNode {
-  return node.nodeName === '#text';
+  return node.nodeName === '#text'
 }
 
 function rewriteLocalAssetUrl(
@@ -801,44 +799,44 @@ function rewriteLocalAssetUrl(
   resolutionBaseUrl: string,
   virtualAssetRootUrl: string,
 ): string | null {
-  const candidate = rawUrl.trim();
+  const candidate = rawUrl.trim()
   if (candidate.startsWith('#') || candidate.toLowerCase().startsWith('data:')) {
-    return candidate;
+    return candidate
   }
   if (candidate.length === 0 || containsTraversalAfterDecoding(candidate)) {
-    return null;
+    return null
   }
   try {
-    const url = new URL(candidate, resolutionBaseUrl);
-    const virtualRoot = new URL(virtualAssetRootUrl);
+    const url = new URL(candidate, resolutionBaseUrl)
+    const virtualRoot = new URL(virtualAssetRootUrl)
     if (
       url.origin !== virtualRoot.origin ||
       !url.pathname.startsWith(virtualRoot.pathname) ||
       url.username !== '' ||
       url.password !== ''
     ) {
-      return null;
+      return null
     }
-    return url.href;
+    return url.href
   } catch {
-    return null;
+    return null
   }
 }
 
 function containsTraversalAfterDecoding(rawUrl: string): boolean {
-  let decoded = rawUrl;
+  let decoded = rawUrl
   for (let depth = 0; depth < 8; depth += 1) {
-    if (decoded.includes('\0') || decoded.includes('\\')) return true;
-    const path = decoded.split(/[?#]/u, 1)[0] ?? '';
-    if (path.startsWith('/') || path.split('/').includes('..')) return true;
-    let next: string;
+    if (decoded.includes('\0') || decoded.includes('\\')) return true
+    const path = decoded.split(/[?#]/u, 1)[0] ?? ''
+    if (path.startsWith('/') || path.split('/').includes('..')) return true
+    let next: string
     try {
-      next = decodeURIComponent(decoded);
+      next = decodeURIComponent(decoded)
     } catch {
-      return true;
+      return true
     }
-    if (next === decoded) return false;
-    decoded = next;
+    if (next === decoded) return false
+    decoded = next
   }
-  return true;
+  return true
 }

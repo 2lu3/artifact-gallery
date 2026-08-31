@@ -3,9 +3,7 @@ const QUERY_WHITESPACE = /\s+/gu
 const PATH_BOUNDARY = /[^\p{L}\p{N}]+/gu
 
 export function normalizeSearchText(value: string): string {
-  return value
-    .normalize('NFKC')
-    .replace(ASCII_UPPERCASE, (character) => character.toLowerCase())
+  return value.normalize('NFKC').replace(ASCII_UPPERCASE, (character) => character.toLowerCase())
 }
 
 export function normalizeSearchQuery(value: string): string {
@@ -26,7 +24,9 @@ export function searchableCharacterCount(value: string): number {
 }
 
 export function normalizeSearchNeedle(value: string): string {
-  return parseSearchQuery(value).map((term) => term.value).join(' ')
+  return parseSearchQuery(value)
+    .map((term) => term.value)
+    .join(' ')
 }
 
 export function buildFts5Query(value: string): string | null {

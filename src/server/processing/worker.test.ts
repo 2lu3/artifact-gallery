@@ -16,9 +16,9 @@ const temporaryDirectories: string[] = []
 
 afterEach(async () => {
   await Promise.all(
-    temporaryDirectories.splice(0).map((directory) =>
-      rm(directory, { force: true, recursive: true }),
-    ),
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { force: true, recursive: true })),
   )
 })
 
@@ -88,18 +88,20 @@ describe('ImportWorker', () => {
     const failures: unknown[] = []
 
     expect(
-      worker.enqueue('register', { sourcePath: '/slow.md' }, {
-        onError: (error) => {
-          failures.push(error)
+      worker.enqueue(
+        'register',
+        { sourcePath: '/slow.md' },
+        {
+          onError: (error) => {
+            failures.push(error)
+          },
         },
-      }),
+      ),
     ).toBe(true)
     await worker.onIdle()
 
     expect(observedAbort).toBe(true)
-    expect(failures).toEqual([
-      expect.objectContaining({ code: 'TIMEOUT', stage: 'inspect' }),
-    ])
+    expect(failures).toEqual([expect.objectContaining({ code: 'TIMEOUT', stage: 'inspect' })])
     await worker.close()
   })
 
@@ -136,9 +138,7 @@ describe('ImportWorker', () => {
     const elapsedMs = performance.now() - startedAt
 
     expect(results).toEqual([])
-    expect(failures).toEqual([
-      expect.objectContaining({ code: 'TIMEOUT', stage: 'inspect' }),
-    ])
+    expect(failures).toEqual([expect.objectContaining({ code: 'TIMEOUT', stage: 'inspect' })])
     expect(elapsedMs).toBeGreaterThanOrEqual(20)
     expect(elapsedMs).toBeLessThan(200)
     await worker.close()
@@ -160,11 +160,9 @@ describe('ImportWorker', () => {
       htmlRenderer: {
         render: (request) =>
           new Promise((_resolve, reject) => {
-            request.signal?.addEventListener(
-              'abort',
-              () => reject(request.signal?.reason),
-              { once: true },
-            )
+            request.signal?.addEventListener('abort', () => reject(request.signal?.reason), {
+              once: true,
+            })
           }),
       },
       thumbnailDirectory,
@@ -225,11 +223,9 @@ describe('ImportWorker', () => {
         render: (request) => {
           markRenderStarted()
           return new Promise((_resolve, reject) => {
-            request.signal?.addEventListener(
-              'abort',
-              () => reject(request.signal?.reason),
-              { once: true },
-            )
+            request.signal?.addEventListener('abort', () => reject(request.signal?.reason), {
+              once: true,
+            })
           })
         },
       },
@@ -275,7 +271,9 @@ describe('ImportWorker', () => {
 })
 
 function processorWith(
-  operation: (request: ArtifactProcessRequest & { signal?: AbortSignal }) => Promise<ArtifactProcessResult>,
+  operation: (
+    request: ArtifactProcessRequest & { signal?: AbortSignal },
+  ) => Promise<ArtifactProcessResult>,
 ) {
   return {
     register: operation,

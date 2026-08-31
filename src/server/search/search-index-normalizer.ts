@@ -146,7 +146,8 @@ class SearchIndexNormalizerPool {
       worker.unref()
       this.#cleanup(task)
       if (message.ok) task.resolve(message.value)
-      else task.reject(Object.assign(new Error(message.error.message), { name: message.error.name }))
+      else
+        task.reject(Object.assign(new Error(message.error.message), { name: message.error.name }))
       this.#drain()
     })
     worker.on('error', (error) => {

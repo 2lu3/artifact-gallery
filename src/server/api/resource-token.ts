@@ -47,7 +47,11 @@ export class ThumbnailResourceCodec {
   }
 
   private sign(body: string): string {
-    return createHmac('sha256', this.secret).update(body).digest().subarray(0, 16).toString('base64url')
+    return createHmac('sha256', this.secret)
+      .update(body)
+      .digest()
+      .subarray(0, 16)
+      .toString('base64url')
   }
 
   private matches(body: string, signature: string): boolean {
