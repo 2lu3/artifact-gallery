@@ -129,6 +129,7 @@ describe('production worker with real Chromium', () => {
         resolveThird = resolve
       })
       const launchedBrowsers: Browser[] = []
+      const commitCriticalSectionMs: number[] = []
       let peakContexts = 0
       const renderer = new HtmlRenderer(
         {
@@ -165,6 +166,9 @@ describe('production worker with real Chromium', () => {
         pathPolicy: realPolicy,
         htmlRenderer: renderer,
         thumbnailDirectory,
+        reportCommitCriticalSection: ({ durationMs }) => {
+          commitCriticalSectionMs.push(durationMs)
+        },
       })
       const worker = new ImportWorker({ processor, concurrency: 2, capacity: 4 })
       const imports = new ImportRepository(database)
@@ -208,13 +212,16 @@ describe('production worker with real Chromium', () => {
       expect(rssMeasurement.peakBytes).toBe(Math.max(...rssMeasurement.samples))
       expect(rssMeasurement.peakBytes).toBeGreaterThan(0)
       expect(rssMeasurement.peakBytes).toBeLessThan(4 * 1024 * 1024 * 1024)
+      expect(commitCriticalSectionMs.length).toBeGreaterThan(1)
+      const maxCommitCriticalSectionMs = Math.max(...commitCriticalSectionMs)
+      expect(maxCommitCriticalSectionMs).toBeLessThan(250)
       expect(peakContexts).toBe(2)
       expect(launchedBrowsers).toHaveLength(1)
       expect(launchedBrowsers[0]?.contexts()).toHaveLength(0)
       expect(imports.getRun(runs[1]!.id).status).toBe('completed')
       expect(imports.getRun(runs[2]!.id).status).toBe('completed')
       console.info(
-        `task9-reliability chromiumPeakRssMiB=${(rssMeasurement.peakBytes / 1024 / 1024).toFixed(1)} rssSamples=${rssMeasurement.sampleCount} cancelLatencyMs=${cancelLatencyMs.toFixed(1)}`,
+        `task9-reliability chromiumPeakRssMiB=${(rssMeasurement.peakBytes / 1024 / 1024).toFixed(1)} rssSamples=${rssMeasurement.sampleCount} cancelLatencyMs=${cancelLatencyMs.toFixed(1)} commitCriticalMaxMs=${maxCommitCriticalSectionMs.toFixed(2)}`,
       )
 
       await worker.close()

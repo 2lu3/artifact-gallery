@@ -1,3 +1,5 @@
+import { basename } from 'node:path'
+
 import type Database from 'better-sqlite3'
 
 import type {
@@ -5,7 +7,10 @@ import type {
   PreparedArtifactIndex,
 } from '../processing/artifact-processor.js'
 import { SearchVisibilityRepository } from '../repositories/search-visibility-repository.js'
-import { normalizePathSegments, normalizeSearchText } from './search-query.js'
+import {
+  normalizeSearchIndexFields,
+  type NormalizedSearchIndexFields,
+} from './search-index-normalizer.js'
 
 export interface SearchIndexRepairInput {
   readonly artifactId: number
@@ -35,28 +40,51 @@ export class SQLiteSearchIndexer implements ArtifactIndexer {
     readonly generation: number
     readonly sourcePath: string
     readonly text: string
+    readonly title?: string | null
+    readonly signal?: AbortSignal
   }): Promise<PreparedArtifactIndex> {
     const generationId = this.readGenerationId(request.artifactId, request.generation)
-    const staged = {
+    const titles = this.readTitles(request.artifactId)
+    const derivedTitle =
+      request.title === undefined
+        ? (titles.derived_title ?? basename(request.sourcePath))
+        : (request.title ?? basename(request.sourcePath))
+    const normalized = await normalizeSearchIndexFields({
+      sourcePath: request.sourcePath,
+      userTitle: titles.user_title ?? '',
+      derivedTitle,
+      body: request.text,
+      signal: request.signal,
+    })
+    const staged: IndexedGenerationSource & { normalized: NormalizedSearchIndexFields } = {
       generationId,
       artifactId: request.artifactId,
       generation: request.generation,
       sourcePath: request.sourcePath,
+      userTitle: titles.user_title,
+      derivedTitle,
       text: request.text,
+      normalized,
     }
-    this.upsertDocument(staged)
+    this.upsertNormalizedDocument(staged)
 
     return {
-      commit: () => this.upsertDocument(staged),
+      commit: () => this.upsertNormalizedDocument(staged),
       rollback: async () => this.removeDocument(generationId),
       quarantine: async () => this.removeDocument(generationId),
     }
   }
 
-  repair(input: SearchIndexRepairInput): void {
+  async repair(input: SearchIndexRepairInput): Promise<void> {
+    const source = this.readRepairSource(input.artifactId, input.generation)
+    const normalized = await normalizeSearchIndexFields({
+      sourcePath: source.sourcePath,
+      userTitle: source.userTitle ?? '',
+      derivedTitle: source.derivedTitle ?? '',
+      body: source.text,
+    })
     this.database.transaction(() => {
-      const source = this.readRepairSource(input.artifactId, input.generation)
-      this.upsertDocument(source)
+      this.upsertNormalizedDocument({ ...source, normalized })
       this.visibility.clearQuarantineAfterRepair({
         artifactId: input.artifactId,
         generationId: source.generationId,
@@ -127,17 +155,22 @@ export class SQLiteSearchIndexer implements ArtifactIndexer {
     }
   }
 
-  private upsertDocument(
-    source: Omit<IndexedGenerationSource, 'userTitle' | 'derivedTitle'> &
-      Partial<Pick<IndexedGenerationSource, 'userTitle' | 'derivedTitle'>>,
-  ): void {
+  private readTitles(artifactId: number): {
+    user_title: string | null
+    derived_title: string | null
+  } {
     const titles = this.database
       .prepare('SELECT user_title, derived_title FROM artifact WHERE id = ?')
-      .get(source.artifactId) as
+      .get(artifactId) as
       | { user_title: string | null; derived_title: string | null }
       | undefined
     if (!titles) throw new Error('The indexed artifact does not exist.')
+    return titles
+  }
 
+  private upsertNormalizedDocument(
+    source: IndexedGenerationSource & { readonly normalized: NormalizedSearchIndexFields },
+  ): void {
     this.database
       .prepare(
         `INSERT INTO artifact_search_document (
@@ -161,10 +194,10 @@ export class SQLiteSearchIndexer implements ArtifactIndexer {
         source.generationId,
         source.artifactId,
         source.generation,
-        normalizeSearchText(source.userTitle ?? titles.user_title ?? ''),
-        normalizeSearchText(source.derivedTitle ?? titles.derived_title ?? ''),
-        normalizeSearchText(source.text),
-        normalizePathSegments(source.sourcePath),
+        source.normalized.userTitle,
+        source.normalized.derivedTitle,
+        source.normalized.body,
+        source.normalized.pathSegments,
       )
   }
 

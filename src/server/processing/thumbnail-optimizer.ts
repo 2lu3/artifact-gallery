@@ -1,6 +1,8 @@
 import { chromium, type Browser } from 'playwright'
 
 export const MAX_THUMBNAIL_BYTES = 500 * 1024
+// Chromium renders at no more than 1200x2400; this also bounds main-thread base64 work.
+export const MAX_OPTIMIZER_INPUT_BYTES = 16 * 1024 * 1024
 
 const MIN_IDENTIFIABLE_WIDTH = 480
 const MIN_IDENTIFIABLE_HEIGHT = 480
@@ -49,6 +51,9 @@ export class WebpThumbnailOptimizer implements ThumbnailOptimizer {
   }
 
   async optimize(input: ThumbnailInput): Promise<OptimizedThumbnail> {
+    if (input.bytes.byteLength > MAX_OPTIMIZER_INPUT_BYTES) {
+      throw new ThumbnailOptimizationError()
+    }
     if (input.bytes.byteLength <= MAX_THUMBNAIL_BYTES) {
       return { ...input, quality: 80 }
     }

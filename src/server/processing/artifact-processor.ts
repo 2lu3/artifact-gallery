@@ -41,6 +41,7 @@ import {
 import { extractSourceInWorker } from './source-extractor.js'
 
 const MAX_SOURCE_BYTES = 10 * 1024 * 1024
+export const MIN_COMMIT_REMAINING_MS = 100
 
 type ActiveGeneration = {
   readonly extractedText: string | null
@@ -78,6 +79,33 @@ interface CommitSnapshot {
     readonly status: string
     readonly completed_at: string | null
   }
+  readonly diagnostics: ArtifactDiagnosticSnapshot
+}
+
+interface ArtifactDiagnosticSnapshot {
+  readonly errors: ReadonlyArray<{
+    readonly id: number
+    readonly artifact_id: number
+    readonly generation_id: number | null
+    readonly code: string
+    readonly stage: string
+    readonly retryable: number
+    readonly user_message: string
+    readonly technical_detail: string | null
+    readonly occurred_at: string
+  }>
+  readonly warnings: ReadonlyArray<{
+    readonly id: number
+    readonly artifact_id: number
+    readonly generation_id: number | null
+    readonly code: string
+    readonly detail: string
+    readonly occurred_at: string
+  }>
+  readonly itemErrorRelations: ReadonlyArray<{
+    readonly item_id: number
+    readonly error_id: number
+  }>
 }
 
 export interface ArtifactIndexer {
@@ -87,6 +115,8 @@ export interface ArtifactIndexer {
     readonly generation: number
     readonly sourcePath: string
     readonly text: string
+    readonly title?: string | null
+    readonly signal?: AbortSignal
   }): Promise<PreparedArtifactIndex>
 }
 
@@ -110,6 +140,11 @@ export interface ProcessingOperationalError {
   readonly artifactId: number
   readonly generationId: number
   readonly technicalDetail: string | null
+}
+
+export interface CommitCriticalSectionMeasurement {
+  readonly durationMs: number
+  readonly remainingBudgetMs: number | null
 }
 
 export interface ProcessorFileSystem {
@@ -149,6 +184,9 @@ export interface ArtifactProcessorDependencies {
   readonly reportOperationalError?: (
     error: ProcessingOperationalError,
   ) => void | Promise<void>
+  readonly reportCommitCriticalSection?: (
+    measurement: CommitCriticalSectionMeasurement,
+  ) => void
 }
 
 export interface ArtifactProcessRequest {
@@ -157,7 +195,7 @@ export interface ArtifactProcessRequest {
   readonly runId?: number
   readonly itemId?: number
   readonly signal?: AbortSignal
-  /** Epoch milliseconds. The worker owns this absolute deadline. */
+  /** Epoch milliseconds. The worker owns this cooperative budget boundary. */
   readonly deadlineAt?: number
 }
 
@@ -209,6 +247,7 @@ interface MutableAttempt {
   preparedIndex: PreparedArtifactIndex | null
   errors: ArtifactProcessingError[]
   errorIds: number[]
+  diagnosticSnapshot: ArtifactDiagnosticSnapshot | null
 }
 
 const nodeFileSystem: ProcessorFileSystem = {
@@ -283,6 +322,7 @@ export class ArtifactProcessor {
       preparedIndex: null,
       errors: [],
       errorIds: [],
+      diagnosticSnapshot: null,
     }
 
     let authorizedFile: AuthorizedFile
@@ -304,6 +344,7 @@ export class ArtifactProcessor {
       })
       attempt.artifactId = artifact.id
       this.imports.attachArtifact(run.itemId, artifact.id)
+      attempt.diagnosticSnapshot = this.captureArtifactDiagnostics(artifact.id)
       if (request.userTitle !== undefined) {
         this.dependencies.database
           .prepare('UPDATE artifact SET user_title = ? WHERE id = ?')
@@ -399,6 +440,8 @@ export class ArtifactProcessor {
             generation: attempt.generation,
             sourcePath: authorizedFile.canonicalPath,
             text: attempt.extraction.text,
+            title: attempt.title,
+            signal: request.signal,
           }),
           request.signal,
           'index',
@@ -483,56 +526,20 @@ export class ArtifactProcessor {
         attempt.extraction?.extractorVersion ?? active?.extractorVersion ?? null
       const thumbnailPath = finalPath ?? active?.thumbnailPath ?? null
       const completedAt = this.now()
-      this.assertWithinDeadline(deadlineAt, 'commit')
-      const commitSnapshot = this.captureCommitSnapshot(
-        artifactId,
-        generationId,
-        run,
-      )
-      const transaction = this.dependencies.database.transaction(() => {
-        this.assertWithinDeadline(deadlineAt, 'commit')
-        this.artifacts.commitGeneration({
+      const remainingBudgetMs = this.requireCommitReserve(deadlineAt)
+      const criticalSectionStartedAt = performance.now()
+      const configuredBusyTimeoutMs = this.readBusyTimeout()
+      const boundedBusyTimeoutMs = this.boundedBusyTimeout(deadlineAt, configuredBusyTimeoutMs)
+      let commitSnapshot: CommitSnapshot | null = null
+      try {
+        this.setBusyTimeout(boundedBusyTimeoutMs)
+        commitSnapshot = this.captureCommitSnapshot(
           artifactId,
           generationId,
-          expectedGeneration: generation,
-          contentStatus: attempt.contentStatus,
-          renderStatus: attempt.renderStatus,
-          indexStatus: attempt.indexStatus,
-          extractedText,
-          extractorVersion,
-          thumbnailPath,
-          previewedAt: attempt.renderResult ? completedAt : null,
-          completedAt,
-        })
-        this.assertWithinDeadline(deadlineAt, 'commit')
-        this.dependencies.database
-          .prepare('UPDATE artifact SET derived_title = ?, updated_at = ? WHERE id = ?')
-          .run(attempt.title ?? basename(authorizedFile.canonicalPath), completedAt, artifactId)
-        this.assertWithinDeadline(deadlineAt, 'commit')
-        if (cleanSuccess) {
-          this.dependencies.database
-            .prepare('DELETE FROM artifact_error WHERE artifact_id = ?')
-            .run(artifactId)
-          this.dependencies.database
-            .prepare(
-              `DELETE FROM artifact_warning
-               WHERE artifact_id = ?
-                 AND code NOT IN ('THUMBNAIL_RETIRE_PENDING', 'INDEX_REPAIR_PENDING')`,
-            )
-            .run(artifactId)
-        }
-        for (const warning of attempt.renderResult?.warnings ?? []) {
-          this.artifacts.recordWarning({
-            artifactId,
-            generationId,
-            code: warning.code,
-            detail:
-              warning.code === 'CONTENT_CLIPPED'
-                ? 'Preview exceeded 2400px.'
-                : 'One or more preview assets were blocked.',
-            occurredAt: completedAt,
-          })
-        }
+          run,
+          attempt.diagnosticSnapshot ?? this.captureArtifactDiagnostics(artifactId),
+        )
+        this.requireCommitReserve(deadlineAt)
         try {
           attempt.preparedIndex?.commit()
         } catch (error) {
@@ -545,16 +552,69 @@ export class ArtifactProcessor {
         }
         this.assertWithinDeadline(deadlineAt, 'commit')
         if (this.isCancellationRequested(run.runId)) throw new CommitCancellationError()
-        if (attempt.errors.length > 0) {
-          this.failItemAndRun(run, attempt)
-        } else {
-          this.imports.completeItem(run.itemId, completedAt)
-          this.finishRunIfTerminal(run.runId, completedAt)
-        }
-        this.assertWithinDeadline(deadlineAt, 'commit')
-      })
-      transaction()
+        const transaction = this.dependencies.database.transaction(() => {
+          this.assertWithinDeadline(deadlineAt, 'commit')
+          this.artifacts.commitGeneration({
+            artifactId,
+            generationId,
+            expectedGeneration: generation,
+            contentStatus: attempt.contentStatus,
+            renderStatus: attempt.renderStatus,
+            indexStatus: attempt.indexStatus,
+            extractedText,
+            extractorVersion,
+            thumbnailPath,
+            previewedAt: attempt.renderResult ? completedAt : null,
+            completedAt,
+          })
+          this.assertWithinDeadline(deadlineAt, 'commit')
+          this.dependencies.database
+            .prepare('UPDATE artifact SET derived_title = ?, updated_at = ? WHERE id = ?')
+            .run(attempt.title ?? basename(authorizedFile.canonicalPath), completedAt, artifactId)
+          this.assertWithinDeadline(deadlineAt, 'commit')
+          if (cleanSuccess) {
+            this.dependencies.database
+              .prepare('DELETE FROM artifact_error WHERE artifact_id = ?')
+              .run(artifactId)
+            this.dependencies.database
+              .prepare(
+                `DELETE FROM artifact_warning
+                 WHERE artifact_id = ?
+                   AND code NOT IN ('THUMBNAIL_RETIRE_PENDING', 'INDEX_REPAIR_PENDING')`,
+              )
+              .run(artifactId)
+          }
+          for (const warning of attempt.renderResult?.warnings ?? []) {
+            this.artifacts.recordWarning({
+              artifactId,
+              generationId,
+              code: warning.code,
+              detail:
+                warning.code === 'CONTENT_CLIPPED'
+                  ? 'Preview exceeded 2400px.'
+                  : 'One or more preview assets were blocked.',
+              occurredAt: completedAt,
+            })
+          }
+          if (this.isCancellationRequested(run.runId)) throw new CommitCancellationError()
+          if (attempt.errors.length > 0) {
+            this.failItemAndRun(run, attempt)
+          } else {
+            this.imports.completeItem(run.itemId, completedAt)
+            this.finishRunIfTerminal(run.runId, completedAt)
+          }
+          this.assertWithinDeadline(deadlineAt, 'commit')
+        })
+        transaction()
+      } finally {
+        this.setBusyTimeout(configuredBusyTimeoutMs)
+        this.reportCommitCriticalSection({
+          durationMs: performance.now() - criticalSectionStartedAt,
+          remainingBudgetMs,
+        })
+      }
       if (this.deadlineExceeded(deadlineAt)) {
+        if (!commitSnapshot) throw new ArtifactProcessingError('TIMEOUT', 'commit')
         this.restoreCommitSnapshot(artifactId, generationId, run, commitSnapshot)
         throw new ArtifactProcessingError('TIMEOUT', 'commit')
       }
@@ -719,10 +779,48 @@ export class ArtifactProcessor {
     return deadlineAt !== undefined && Date.now() >= deadlineAt
   }
 
+  private requireCommitReserve(deadlineAt: number | undefined): number | null {
+    if (deadlineAt === undefined) return null
+    const remainingMs = deadlineAt - Date.now()
+    if (remainingMs < MIN_COMMIT_REMAINING_MS) {
+      throw new ArtifactProcessingError('TIMEOUT', 'commit')
+    }
+    return remainingMs
+  }
+
+  private boundedBusyTimeout(
+    deadlineAt: number | undefined,
+    configuredBusyTimeoutMs: number,
+  ): number {
+    if (deadlineAt === undefined) return configuredBusyTimeoutMs
+    const remainingMs = deadlineAt - Date.now()
+    if (remainingMs < MIN_COMMIT_REMAINING_MS) {
+      throw new ArtifactProcessingError('TIMEOUT', 'commit')
+    }
+    return Math.max(1, Math.min(configuredBusyTimeoutMs, Math.floor(remainingMs)))
+  }
+
+  private readBusyTimeout(): number {
+    return this.dependencies.database.pragma('busy_timeout', { simple: true }) as number
+  }
+
+  private setBusyTimeout(timeoutMs: number): void {
+    this.dependencies.database.pragma(`busy_timeout = ${Math.max(0, Math.floor(timeoutMs))}`)
+  }
+
+  private reportCommitCriticalSection(measurement: CommitCriticalSectionMeasurement): void {
+    try {
+      this.dependencies.reportCommitCriticalSection?.(measurement)
+    } catch {
+      // Reliability measurement cannot change a committed user-visible result.
+    }
+  }
+
   private captureCommitSnapshot(
     artifactId: number,
     generationId: number,
     run: RunContext,
+    diagnostics: ArtifactDiagnosticSnapshot,
   ): CommitSnapshot {
     const artifact = this.dependencies.database
       .prepare('SELECT active_generation_id, derived_title, updated_at FROM artifact WHERE id = ?')
@@ -749,7 +847,26 @@ export class ArtifactProcessor {
     if (!artifact || !generation || !visibility || !item || !importRun) {
       throw new Error('Commit state could not be snapshotted.')
     }
-    return { artifact, generation, visibility, item, run: importRun }
+    return { artifact, generation, visibility, item, run: importRun, diagnostics }
+  }
+
+  private captureArtifactDiagnostics(artifactId: number): ArtifactDiagnosticSnapshot {
+    const errors = this.dependencies.database
+      .prepare('SELECT * FROM artifact_error WHERE artifact_id = ? ORDER BY id')
+      .all(artifactId) as ArtifactDiagnosticSnapshot['errors']
+    const warnings = this.dependencies.database
+      .prepare('SELECT * FROM artifact_warning WHERE artifact_id = ? ORDER BY id')
+      .all(artifactId) as ArtifactDiagnosticSnapshot['warnings']
+    const itemErrorRelations = this.dependencies.database
+      .prepare(
+        `SELECT import_item.id AS item_id, import_item.error_id
+         FROM import_item
+         JOIN artifact_error ON artifact_error.id = import_item.error_id
+         WHERE artifact_error.artifact_id = ?
+         ORDER BY import_item.id`,
+      )
+      .all(artifactId) as ArtifactDiagnosticSnapshot['itemErrorRelations']
+    return { errors, warnings, itemErrorRelations }
   }
 
   private restoreCommitSnapshot(
@@ -759,6 +876,52 @@ export class ArtifactProcessor {
     snapshot: CommitSnapshot,
   ): void {
     this.dependencies.database.transaction(() => {
+      this.dependencies.database
+        .prepare('DELETE FROM artifact_warning WHERE artifact_id = ?')
+        .run(artifactId)
+      this.dependencies.database
+        .prepare('DELETE FROM artifact_error WHERE artifact_id = ?')
+        .run(artifactId)
+      const insertError = this.dependencies.database.prepare(
+        `INSERT INTO artifact_error (
+           id, artifact_id, generation_id, code, stage, retryable,
+           user_message, technical_detail, occurred_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      for (const error of snapshot.diagnostics.errors) {
+        insertError.run(
+          error.id,
+          error.artifact_id,
+          error.generation_id,
+          error.code,
+          error.stage,
+          error.retryable,
+          error.user_message,
+          error.technical_detail,
+          error.occurred_at,
+        )
+      }
+      const insertWarning = this.dependencies.database.prepare(
+        `INSERT INTO artifact_warning (
+           id, artifact_id, generation_id, code, detail, occurred_at
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      for (const warning of snapshot.diagnostics.warnings) {
+        insertWarning.run(
+          warning.id,
+          warning.artifact_id,
+          warning.generation_id,
+          warning.code,
+          warning.detail,
+          warning.occurred_at,
+        )
+      }
+      const restoreErrorRelation = this.dependencies.database.prepare(
+        'UPDATE import_item SET error_id = ? WHERE id = ?',
+      )
+      for (const relation of snapshot.diagnostics.itemErrorRelations) {
+        restoreErrorRelation.run(relation.error_id, relation.item_id)
+      }
       this.dependencies.database
         .prepare(
           `UPDATE artifact

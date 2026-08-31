@@ -450,7 +450,7 @@ describe('ArtifactProcessor staged pipeline', () => {
     harness.database.close()
   })
 
-  it('rolls back generation activation when synchronous commit work crosses the absolute deadline', async () => {
+  it('rolls back generation activation when synchronous commit work crosses the budget', async () => {
     const harness = await makeHarness()
     await writeFile(harness.sourcePath, '# Previous active generation')
     const first = await harness.processor.register({ sourcePath: harness.sourcePath })
@@ -463,7 +463,7 @@ describe('ArtifactProcessor staged pipeline', () => {
         ...realFileSystem,
         rename: (from, to) => {
           renameSync(from, to)
-          const busyUntil = performance.now() + 35
+          const busyUntil = performance.now() + 250
           while (performance.now() < busyUntil) {
             // A synchronous filesystem boundary can delay event-loop timers.
           }
@@ -475,7 +475,7 @@ describe('ArtifactProcessor staged pipeline', () => {
       sourcePath: harness.sourcePath,
       runId: run.id,
       itemId: run.itemIds[0],
-      deadlineAt: Date.now() + 20,
+      deadlineAt: Date.now() + 200,
     })
 
     expect(result).toMatchObject({
@@ -487,6 +487,89 @@ describe('ArtifactProcessor staged pipeline', () => {
     expect(imports.getItem(run.itemIds[0]).status).toBe('failed')
     expect(imports.getRun(run.id).status).toBe('failed')
     expect((await readdir(harness.derivedDirectory)).filter((name) => name.includes('.tmp'))).toEqual([])
+    harness.database.close()
+  })
+
+  it('does not enter rename or SQLite commit without a bounded remaining-time reserve', async () => {
+    let renamed = false
+    let indexCommitted = false
+    const harness = await makeHarness({
+      indexer: {
+        prepare: async () => ({
+          commit: () => {
+            indexCommitted = true
+          },
+          rollback: async () => undefined,
+          quarantine: async () => undefined,
+        }),
+      },
+    })
+    await writeFile(harness.sourcePath, '# Insufficient commit reserve')
+    const imports = new ImportRepository(harness.database)
+    const run = imports.createRun([harness.sourcePath])
+    const processor = harness.createProcessor({
+      fileSystem: {
+        ...realFileSystem,
+        rename: (from, to) => {
+          renamed = true
+          renameSync(from, to)
+        },
+      },
+    })
+
+    const result = await processor.register({
+      sourcePath: harness.sourcePath,
+      runId: run.id,
+      itemId: run.itemIds[0],
+      deadlineAt: Date.now() + 75,
+    })
+
+    expect(result).toMatchObject({
+      outcome: 'failed',
+      errors: [expect.objectContaining({ code: 'TIMEOUT', stage: 'commit' })],
+    })
+    expect(renamed).toBe(false)
+    expect(indexCommitted).toBe(false)
+    expect(
+      harness.database
+        .prepare('SELECT active_generation_id FROM artifact WHERE id = ?')
+        .pluck()
+        .get(result.artifactId),
+    ).toBeNull()
+    harness.database.close()
+  })
+
+  it('caps SQLite busy_timeout to the remaining budget and restores the connection setting', async () => {
+    let observedBusyTimeoutMs = 0
+    const harness = await makeHarness({
+      indexer: {
+        prepare: async () => ({
+          commit: () => {
+            observedBusyTimeoutMs = harness.database.pragma('busy_timeout', {
+              simple: true,
+            }) as number
+          },
+          rollback: async () => undefined,
+          quarantine: async () => undefined,
+        }),
+      },
+    })
+    await writeFile(harness.sourcePath, '# Bounded SQLite wait')
+    const configuredBusyTimeoutMs = harness.database.pragma('busy_timeout', {
+      simple: true,
+    }) as number
+
+    const result = await harness.processor.register({
+      sourcePath: harness.sourcePath,
+      deadlineAt: Date.now() + 1_000,
+    })
+
+    expect(result.outcome).toBe('completed')
+    expect(observedBusyTimeoutMs).toBeGreaterThan(0)
+    expect(observedBusyTimeoutMs).toBeLessThanOrEqual(1_000)
+    expect(harness.database.pragma('busy_timeout', { simple: true })).toBe(
+      configuredBusyTimeoutMs,
+    )
     harness.database.close()
   })
 
@@ -506,9 +589,9 @@ describe('ArtifactProcessor staged pipeline', () => {
         const result = transaction(...parameters)
         if (delayTransactionReturn && !harness.database.inTransaction) {
           delayTransactionReturn = false
-          const busyUntil = performance.now() + 35
+          const busyUntil = performance.now() + 250
           while (performance.now() < busyUntil) {
-            // Model a synchronous SQLite COMMIT returning after the absolute deadline.
+            // Model a synchronous SQLite COMMIT returning after the cooperative budget.
           }
         }
         return result
@@ -528,7 +611,7 @@ describe('ArtifactProcessor staged pipeline', () => {
       sourcePath: harness.sourcePath,
       runId: run.id,
       itemId: run.itemIds[0],
-      deadlineAt: Date.now() + 20,
+      deadlineAt: Date.now() + 200,
     })
 
     expect(result).toMatchObject({
@@ -537,6 +620,115 @@ describe('ArtifactProcessor staged pipeline', () => {
     })
     expect(activeGenerationId(harness.database, artifactId)).toBe(first.generationId)
     expect(existsSync(oldThumbnail)).toBe(true)
+    expect(imports.getItem(run.itemIds[0]).status).toBe('failed')
+    expect(imports.getRun(run.id).status).toBe('failed')
+    harness.database.close()
+  })
+
+  it('restores prior diagnostics and item error relations after post-commit expiry', async () => {
+    const harness = await makeHarness({
+      render: async () =>
+        rendered(Buffer.from('RIFF-warning-WEBP'), [{ code: 'CONTENT_CLIPPED' }]),
+    })
+    await writeFile(harness.sourcePath, '# Diagnostic baseline')
+    const first = await harness.processor.register({ sourcePath: harness.sourcePath })
+    const artifactId = requireResultNumber(first.artifactId)
+    const generationId = requireResultNumber(first.generationId)
+    harness.database.prepare('DELETE FROM artifact_warning WHERE artifact_id = ?').run(artifactId)
+    const artifacts = new ArtifactRepository(harness.database)
+    const oldErrorId = artifacts.recordError({
+      artifactId,
+      generationId,
+      code: 'HTML_RENDER_FAILED',
+      stage: 'render',
+      retryable: true,
+      userMessage: 'Old error',
+      technicalDetail: 'old detail',
+      occurredAt: '2026-08-31T23:59:00.000Z',
+    })
+    const oldWarningId = artifacts.recordWarning({
+      artifactId,
+      generationId,
+      code: 'ASSET_BLOCKED',
+      detail: 'Old warning',
+      occurredAt: '2026-08-31T23:59:30.000Z',
+    })
+    const previousItemId = harness.database
+      .prepare('SELECT id FROM import_item WHERE artifact_id = ? ORDER BY id LIMIT 1')
+      .pluck()
+      .get(artifactId) as number
+    harness.database
+      .prepare('UPDATE import_item SET error_id = ? WHERE id = ?')
+      .run(oldErrorId, previousItemId)
+    const priorErrors = harness.database
+      .prepare('SELECT * FROM artifact_error WHERE artifact_id = ? ORDER BY id')
+      .all(artifactId)
+    const priorWarnings = harness.database
+      .prepare('SELECT * FROM artifact_warning WHERE artifact_id = ? ORDER BY id')
+      .all(artifactId)
+    const priorActiveGeneration = harness.database
+      .prepare('SELECT * FROM artifact_generation WHERE id = ?')
+      .get(generationId)
+    const imports = new ImportRepository(harness.database)
+    const run = imports.createRun([harness.sourcePath])
+    const delayTransactionReturn = installDelayedTransactionReturn(
+      harness.database,
+      250,
+    )
+    const processor = harness.createProcessor({
+      fileSystem: {
+        ...realFileSystem,
+        rename: (from, to) => {
+          renameSync(from, to)
+          delayTransactionReturn()
+        },
+      },
+    })
+    const result = await processor.refresh({
+      sourcePath: harness.sourcePath,
+      runId: run.id,
+      itemId: run.itemIds[0],
+      deadlineAt: Date.now() + 200,
+    })
+
+    expect(result.errors.at(-1)).toMatchObject({ code: 'TIMEOUT', stage: 'commit' })
+    expect(
+      harness.database
+        .prepare(
+          `SELECT * FROM artifact_error
+           WHERE artifact_id = ? AND code <> 'TIMEOUT' ORDER BY id`,
+        )
+        .all(artifactId),
+    ).toEqual(priorErrors)
+    expect(
+      harness.database
+        .prepare('SELECT * FROM artifact_warning WHERE artifact_id = ? ORDER BY id')
+        .all(artifactId),
+    ).toEqual(priorWarnings)
+    expect(
+      harness.database.prepare('SELECT error_id FROM import_item WHERE id = ?').pluck().get(previousItemId),
+    ).toBe(oldErrorId)
+    expect(
+      harness.database
+        .prepare('SELECT COUNT(*) FROM artifact_warning WHERE id <> ? AND artifact_id = ?')
+        .pluck()
+        .get(oldWarningId, artifactId),
+    ).toBe(0)
+    expect(
+      harness.database.prepare('SELECT * FROM artifact_generation WHERE id = ?').get(generationId),
+    ).toEqual(priorActiveGeneration)
+    expect(activeGenerationId(harness.database, artifactId)).toBe(generationId)
+    expect(
+      harness.database
+        .prepare(
+          `SELECT artifact_generation.job_status, artifact_search_visibility.state
+           FROM artifact_generation
+           JOIN artifact_search_visibility
+             ON artifact_search_visibility.generation_id = artifact_generation.id
+           WHERE artifact_generation.id = ?`,
+        )
+        .get(result.generationId),
+    ).toEqual({ job_status: 'interrupted', state: 'staged' })
     expect(imports.getItem(run.itemIds[0]).status).toBe('failed')
     expect(imports.getRun(run.id).status).toBe('failed')
     harness.database.close()
@@ -1182,5 +1374,30 @@ function preparedIndex() {
     commit: () => undefined,
     rollback: async () => undefined,
     quarantine: async () => undefined,
+  }
+}
+
+function installDelayedTransactionReturn(
+  database: ReturnType<typeof openDatabase>,
+  delayMs: number,
+): () => void {
+  let armed = false
+  const originalTransaction = database.transaction.bind(database)
+  database.transaction = ((operation: (...parameters: never[]) => unknown) => {
+    const transaction = originalTransaction(operation)
+    return (...parameters: never[]) => {
+      const result = transaction(...parameters)
+      if (armed && !database.inTransaction) {
+        armed = false
+        const busyUntil = performance.now() + delayMs
+        while (performance.now() < busyUntil) {
+          // Model a synchronous SQLite COMMIT returning after the cooperative budget.
+        }
+      }
+      return result
+    }
+  }) as typeof database.transaction
+  return () => {
+    armed = true
   }
 }

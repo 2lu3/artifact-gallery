@@ -21,6 +21,46 @@ afterEach(async () => {
 })
 
 describe('SQLiteSearchIndexer', () => {
+  it('replaces a stale derived title with the source basename when the new source has no title', async () => {
+    const harness = await makeHarness('/canonical/New Guide.md')
+    harness.database
+      .prepare('UPDATE artifact SET derived_title = ? WHERE id = ?')
+      .run('Old heading', harness.artifactId)
+    const generation = harness.artifacts.createGeneration(harness.artifactId, NOW)
+
+    await harness.indexer.prepare({
+      artifactId: harness.artifactId,
+      generation: generation.generation,
+      sourcePath: '/canonical/New Guide.md',
+      text: 'Body without a heading',
+      title: null,
+    })
+
+    expect(readDocument(harness.database, generation.id)).toMatchObject({
+      derived_title_normalized: 'new guide.md',
+    })
+    harness.database.close()
+  })
+
+  it('normalizes attempt-sized index input without occupying the SQLite owner event loop', async () => {
+    const harness = await makeHarness('/canonical/large.md')
+    const generation = harness.artifacts.createGeneration(harness.artifactId, NOW)
+    let ownerTicked = false
+    setImmediate(() => {
+      ownerTicked = true
+    })
+
+    await harness.indexer.prepare({
+      artifactId: harness.artifactId,
+      generation: generation.generation,
+      sourcePath: '/canonical/large.md',
+      text: 'ＡＢＣ searchable body '.repeat(20_000),
+    })
+
+    expect(ownerTicked).toBe(true)
+    harness.database.close()
+  })
+
   it('stages normalized generation text and finalizes ranked fields inside the processor transaction', async () => {
     const harness = await makeHarness('/Library/Ｆｏｏ-Bar/Guide.MD')
     harness.database
@@ -33,11 +73,12 @@ describe('SQLiteSearchIndexer', () => {
       generation: generation.generation,
       sourcePath: '/Library/Ｆｏｏ-Bar/Guide.MD',
       text: 'ＢＯＤＹ Search Ω',
+      title: 'ＤＥＲＩＶＥＤ Guide',
     })
 
     expect(readDocument(harness.database, generation.id)).toEqual({
       user_title_normalized: 'user title',
-      derived_title_normalized: '',
+      derived_title_normalized: 'derived guide',
       body_normalized: 'body search Ω',
       path_segments_normalized: 'library foo bar guide md',
     })
@@ -129,7 +170,7 @@ describe('SQLiteSearchIndexer', () => {
       occurredAt: NOW,
     })
 
-    harness.indexer.repair({
+    await harness.indexer.repair({
       artifactId: harness.artifactId,
       generation: generation.generation,
       now: NOW,

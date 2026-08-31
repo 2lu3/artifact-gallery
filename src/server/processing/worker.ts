@@ -109,9 +109,9 @@ export class ImportWorker {
       () => abortController.abort(timeoutError),
       this.attemptTimeoutMs - abortGraceMs,
     )
-    let hardDeadlineTimer: ReturnType<typeof setTimeout> | undefined
-    const hardDeadline = new Promise<never>((_resolve, reject) => {
-      hardDeadlineTimer = setTimeout(() => reject(timeoutError), this.attemptTimeoutMs)
+    let budgetTimer: ReturnType<typeof setTimeout> | undefined
+    const budgetExpiry = new Promise<never>((_resolve, reject) => {
+      budgetTimer = setTimeout(() => reject(timeoutError), this.attemptTimeoutMs)
     })
     const boundedRequest = { ...request, signal: abortController.signal, deadlineAt }
     const operationPromise = Promise.resolve()
@@ -122,10 +122,10 @@ export class ImportWorker {
       })
     operationPromise.catch(() => undefined)
     try {
-      return await Promise.race([operationPromise, hardDeadline])
+      return await Promise.race([operationPromise, budgetExpiry])
     } finally {
       clearTimeout(abortTimer)
-      if (hardDeadlineTimer) clearTimeout(hardDeadlineTimer)
+      if (budgetTimer) clearTimeout(budgetTimer)
     }
   }
 

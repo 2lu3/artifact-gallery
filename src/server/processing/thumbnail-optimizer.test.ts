@@ -1,12 +1,32 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  MAX_OPTIMIZER_INPUT_BYTES,
   MAX_THUMBNAIL_BYTES,
   WebpThumbnailOptimizer,
   type WebpEncoder,
 } from './thumbnail-optimizer.js'
 
 describe('WebpThumbnailOptimizer', () => {
+  it('rejects an image beyond the bounded Chromium screenshot envelope before encoding', async () => {
+    let encoded = false
+    const optimizer = new WebpThumbnailOptimizer({
+      encode: async () => {
+        encoded = true
+        return Buffer.alloc(1)
+      },
+    })
+
+    await expect(
+      optimizer.optimize({
+        bytes: Buffer.alloc(MAX_OPTIMIZER_INPUT_BYTES + 1),
+        width: 1200,
+        height: 2400,
+      }),
+    ).rejects.toMatchObject({ code: 'DERIVED_WRITE_FAILED' })
+    expect(encoded).toBe(false)
+  })
+
   it('keeps an already bounded WebP without re-encoding it', async () => {
     const source = Buffer.alloc(100_000, 0x61)
     const optimizer = new WebpThumbnailOptimizer({

@@ -103,7 +103,7 @@ describe('ImportWorker', () => {
     await worker.close()
   })
 
-  it('rejects a synchronous processor result returned after the absolute deadline', async () => {
+  it('rejects a synchronous processor result returned after the cooperative budget', async () => {
     const results: ArtifactProcessResult[] = []
     const failures: unknown[] = []
     const worker = new ImportWorker({
