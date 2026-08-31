@@ -3,6 +3,24 @@ import { access, lstat, readFile, readdir, realpath, stat } from 'node:fs/promis
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 const SUPPORTED_EXTENSIONS = new Set(['.html', '.htm', '.md']);
+const ASSET_MIME_TYPES: Readonly<Record<string, string>> = {
+  '.avif': 'image/avif',
+  '.css': 'text/css; charset=utf-8',
+  '.gif': 'image/gif',
+  '.ico': 'image/x-icon',
+  '.jpeg': 'image/jpeg',
+  '.jpg': 'image/jpeg',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.otf': 'font/otf',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.ttf': 'font/ttf',
+  '.webp': 'image/webp',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+};
 
 export type PathPolicyErrorCode =
   | 'SOURCE_MISSING'
@@ -31,6 +49,12 @@ export interface AuthorizedDirectory {
   readonly canonicalPath: string;
 }
 
+export interface AuthorizedAsset {
+  readonly canonicalPath: string;
+  readonly mimeType: string;
+  read(): Promise<Buffer>;
+}
+
 export interface MissingPath {
   readonly normalizedPath: string;
 }
@@ -55,10 +79,16 @@ export class PathPolicy {
 
   static async create(allowedRoots: readonly string[]): Promise<PathPolicy> {
     const roots = await Promise.all(
-      allowedRoots.map(async (root) => ({
-        requestedPath: resolve(root),
-        canonicalPath: await realpath(root),
-      })),
+      allowedRoots.map(async (root) => {
+        try {
+          return {
+            requestedPath: resolve(root),
+            canonicalPath: await realpath(root),
+          };
+        } catch (error) {
+          throw classifyFilesystemError(error, root);
+        }
+      }),
     );
     return new PathPolicy(
       roots.toSorted((left, right) => right.requestedPath.length - left.requestedPath.length),
@@ -70,17 +100,28 @@ export class PathPolicy {
 
     return {
       canonicalPath,
-      read: async (encoding) =>
-        readFile(await this.validateFile(requestedPath), encoding),
+      read: (encoding) =>
+        normalizeFilesystemOperation(requestedPath, async () =>
+          readFile(await this.validateFile(requestedPath), encoding),
+        ),
     };
   }
 
   async authorizeDirectory(requestedPath: string): Promise<AuthorizedDirectory> {
-    const canonicalPath = await this.validateExistingPath(requestedPath);
-    if (!(await stat(canonicalPath)).isDirectory()) {
-      throw new PathPolicyError('UNREADABLE_SOURCE', requestedPath);
-    }
+    const canonicalPath = await this.validateDirectory(requestedPath);
     return { canonicalPath };
+  }
+
+  async authorizeAsset(requestedPath: string): Promise<AuthorizedAsset> {
+    const canonicalPath = await this.validateReadableFile(requestedPath);
+    return {
+      canonicalPath,
+      mimeType: mimeTypeFor(canonicalPath),
+      read: () =>
+        normalizeFilesystemOperation(requestedPath, async () =>
+          readFile(await this.validateReadableFile(requestedPath)),
+        ),
+    };
   }
 
   async validateMissingPath(requestedPath: string): Promise<MissingPath> {
@@ -110,10 +151,14 @@ export class PathPolicy {
         currentPath = nextPath;
       } catch (error) {
         if (isNodeError(error, 'ENOENT')) {
-          const canonicalParent = await realpath(currentPath);
-          return {
-            normalizedPath: join(canonicalParent, ...components.slice(index)),
-          };
+          try {
+            const canonicalParent = await realpath(currentPath);
+            return {
+              normalizedPath: join(canonicalParent, ...components.slice(index)),
+            };
+          } catch (parentError) {
+            throw classifyFilesystemError(parentError, requestedPath);
+          }
         }
         throw classifyFilesystemError(error, requestedPath);
       }
@@ -125,7 +170,11 @@ export class PathPolicy {
     const directory = await this.authorizeDirectory(requestedPath);
     const files: AuthorizedFile[] = [];
     const errors: PathPolicyItemError[] = [];
-    await this.walkFolder(directory.canonicalPath, files, errors);
+    try {
+      await this.walkFolder(directory.canonicalPath, files, errors);
+    } catch (error) {
+      throw classifyFilesystemError(error, requestedPath);
+    }
     return { files, errors };
   }
 
@@ -159,6 +208,14 @@ export class PathPolicy {
   }
 
   private async validateFile(requestedPath: string): Promise<string> {
+    const canonicalPath = await this.validateReadableFile(requestedPath);
+    if (!SUPPORTED_EXTENSIONS.has(extname(canonicalPath).toLowerCase())) {
+      throw new PathPolicyError('UNSUPPORTED_FORMAT', requestedPath);
+    }
+    return canonicalPath;
+  }
+
+  private async validateReadableFile(requestedPath: string): Promise<string> {
     const canonicalPath = await this.validateExistingPath(requestedPath);
     try {
       if (!(await stat(canonicalPath)).isFile()) {
@@ -168,8 +225,18 @@ export class PathPolicy {
     } catch (error) {
       throw classifyFilesystemError(error, requestedPath);
     }
-    if (!SUPPORTED_EXTENSIONS.has(extname(canonicalPath).toLowerCase())) {
-      throw new PathPolicyError('UNSUPPORTED_FORMAT', requestedPath);
+    return canonicalPath;
+  }
+
+  private async validateDirectory(requestedPath: string): Promise<string> {
+    const canonicalPath = await this.validateExistingPath(requestedPath);
+    try {
+      if (!(await stat(canonicalPath)).isDirectory()) {
+        throw new PathPolicyError('UNREADABLE_SOURCE', requestedPath);
+      }
+      await access(canonicalPath, constants.R_OK | constants.X_OK);
+    } catch (error) {
+      throw classifyFilesystemError(error, requestedPath);
     }
     return canonicalPath;
   }
@@ -187,11 +254,12 @@ export class PathPolicy {
     files: AuthorizedFile[],
     errors: PathPolicyItemError[],
   ): Promise<void> {
-    const entries = (await readdir(directory, { withFileTypes: true })).toSorted((left, right) =>
-      left.name.localeCompare(right.name),
-    );
+    const canonicalDirectory = await this.validateDirectory(directory);
+    const entries = (
+      await readdir(canonicalDirectory, { withFileTypes: true })
+    ).toSorted((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
-      const entryPath = join(directory, entry.name);
+      const entryPath = join(canonicalDirectory, entry.name);
       try {
         if (entry.name.startsWith('.')) {
           throw new PathPolicyError('UNREADABLE_SOURCE', entryPath);
@@ -257,4 +325,19 @@ function classifyFilesystemError(error: unknown, requestedPath: string): PathPol
 
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {
   return error instanceof Error && 'code' in error && error.code === code;
+}
+
+function mimeTypeFor(sourcePath: string): string {
+  return ASSET_MIME_TYPES[extname(sourcePath).toLowerCase()] ?? 'application/octet-stream';
+}
+
+async function normalizeFilesystemOperation<T>(
+  requestedPath: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    throw classifyFilesystemError(error, requestedPath);
+  }
 }

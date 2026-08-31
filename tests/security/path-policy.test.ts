@@ -1,7 +1,42 @@
 import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
+
+const readFileFault = vi.hoisted(() => ({
+  path: undefined as string | undefined,
+  beforeRead: undefined as (() => Promise<void>) | undefined,
+}));
+const readDirectoryFault = vi.hoisted(() => ({
+  path: undefined as string | undefined,
+  afterRead: undefined as (() => Promise<void>) | undefined,
+}));
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    readFile: async (...args: Parameters<typeof actual.readFile>) => {
+      if (String(args[0]) === readFileFault.path) {
+        const beforeRead = readFileFault.beforeRead;
+        readFileFault.path = undefined;
+        readFileFault.beforeRead = undefined;
+        await beforeRead?.();
+      }
+      return Reflect.apply(actual.readFile, actual, args);
+    },
+    readdir: async (...args: Parameters<typeof actual.readdir>) => {
+      const entries = await Reflect.apply(actual.readdir, actual, args);
+      if (String(args[0]) === readDirectoryFault.path) {
+        const afterRead = readDirectoryFault.afterRead;
+        readDirectoryFault.path = undefined;
+        readDirectoryFault.afterRead = undefined;
+        await afterRead?.();
+      }
+      return entries;
+    },
+  };
+});
 
 import { PathPolicy } from '../../src/server/security/path-policy.js';
 
@@ -14,6 +49,10 @@ async function makeTemporaryDirectory(): Promise<string> {
 }
 
 afterEach(async () => {
+  readFileFault.path = undefined;
+  readFileFault.beforeRead = undefined;
+  readDirectoryFault.path = undefined;
+  readDirectoryFault.afterRead = undefined;
   await Promise.all(
     temporaryDirectories.splice(0).map((directory) =>
       rm(directory, { recursive: true, force: true }),
@@ -22,6 +61,30 @@ afterEach(async () => {
 });
 
 describe('PathPolicy', () => {
+  test('normalizes a missing allowed root during policy creation', async () => {
+    const parent = await makeTemporaryDirectory();
+    const missingRoot = join(parent, 'missing-root');
+
+    await expect(PathPolicy.create([missingRoot])).rejects.toMatchObject({
+      name: 'PathPolicyError',
+      code: 'SOURCE_MISSING',
+      sourcePath: missingRoot,
+    });
+  });
+
+  test('normalizes a missing allowed root during missing-path validation', async () => {
+    const root = await makeTemporaryDirectory();
+    const missing = join(root, 'missing.html');
+    const policy = await PathPolicy.create([root]);
+    await rm(root, { recursive: true });
+
+    await expect(policy.validateMissingPath(missing)).rejects.toMatchObject({
+      name: 'PathPolicyError',
+      code: 'SOURCE_MISSING',
+      sourcePath: missing,
+    });
+  });
+
   test('authorizes and reads a supported file inside an allowed root', async () => {
     const root = await makeTemporaryDirectory();
     const source = join(root, 'artifact.HTML');
@@ -149,6 +212,28 @@ describe('PathPolicy', () => {
     });
   });
 
+  test('rejects an unreadable directory with a normalized error', async () => {
+    const root = await makeTemporaryDirectory();
+    const directory = join(root, 'unreadable');
+    await mkdir(directory);
+    const policy = await PathPolicy.create([root]);
+
+    const authorization = (async () => {
+      await chmod(directory, 0o000);
+      try {
+        return await policy.authorizeDirectory(directory);
+      } finally {
+        await chmod(directory, 0o755);
+      }
+    })();
+
+    await expect(authorization).rejects.toMatchObject({
+      name: 'PathPolicyError',
+      code: 'UNREADABLE_SOURCE',
+      sourcePath: directory,
+    });
+  });
+
   test('validates a missing path without granting read authority', async () => {
     const root = await makeTemporaryDirectory();
     const missing = join(root, 'missing.html');
@@ -239,6 +324,28 @@ describe('PathPolicy', () => {
     ]);
   });
 
+  test('normalizes an unreadable enumeration root', async () => {
+    const root = await makeTemporaryDirectory();
+    const folder = join(root, 'artifacts');
+    await mkdir(folder);
+    const policy = await PathPolicy.create([root]);
+
+    const enumeration = (async () => {
+      await chmod(folder, 0o000);
+      try {
+        return await policy.enumerateFolder(folder);
+      } finally {
+        await chmod(folder, 0o755);
+      }
+    })();
+
+    await expect(enumeration).rejects.toMatchObject({
+      name: 'PathPolicyError',
+      code: 'UNREADABLE_SOURCE',
+      sourcePath: folder,
+    });
+  });
+
   test('does not descend into hidden entries during enumeration', async () => {
     const root = await makeTemporaryDirectory();
     const folder = join(root, 'artifacts');
@@ -273,5 +380,99 @@ describe('PathPolicy', () => {
     await expect(authorized.read('utf8')).rejects.toMatchObject({
       code: 'SYMLINK_REJECTED',
     });
+  });
+
+  test('reads route assets as MIME-typed bytes without widening source formats', async () => {
+    const root = await makeTemporaryDirectory();
+    const outside = await makeTemporaryDirectory();
+    const fixtures = [
+      { name: 'styles.css', bytes: Buffer.from('body {}'), mimeType: 'text/css; charset=utf-8' },
+      { name: 'pixel.png', bytes: Buffer.from([0x89, 0x50, 0x4e, 0x47]), mimeType: 'image/png' },
+      { name: 'font.woff2', bytes: Buffer.from([0x77, 0x4f, 0x46, 0x32]), mimeType: 'font/woff2' },
+      { name: 'data.bin', bytes: Buffer.from([0x00, 0xff]), mimeType: 'application/octet-stream' },
+    ];
+    for (const fixture of fixtures) {
+      await writeFile(join(root, fixture.name), fixture.bytes);
+    }
+    const policy = await PathPolicy.create([root]);
+
+    await expect(policy.authorizeFile(join(root, 'styles.css'))).rejects.toMatchObject({
+      code: 'UNSUPPORTED_FORMAT',
+    });
+    for (const fixture of fixtures) {
+      const asset = await policy.authorizeAsset(join(root, fixture.name));
+      expect(asset.mimeType).toBe(fixture.mimeType);
+      await expect(asset.read()).resolves.toEqual(fixture.bytes);
+    }
+
+    const outsideAsset = join(outside, 'outside.png');
+    await writeFile(outsideAsset, Buffer.from('outside'));
+    const replaceable = join(root, 'pixel.png');
+    const authorized = await policy.authorizeAsset(replaceable);
+    await rm(replaceable);
+    await symlink(outsideAsset, replaceable, 'file');
+    await expect(authorized.read()).rejects.toMatchObject({ code: 'SYMLINK_REJECTED' });
+  });
+
+  test('normalizes disappearance after validation but before the read syscall', async () => {
+    const root = await makeTemporaryDirectory();
+    const source = join(root, 'vanishing.png');
+    await writeFile(source, Buffer.from('vanishing'));
+    const policy = await PathPolicy.create([root]);
+    const asset = await policy.authorizeAsset(source);
+    readFileFault.path = asset.canonicalPath;
+    readFileFault.beforeRead = () => rm(source);
+
+    await expect(asset.read()).rejects.toMatchObject({
+      name: 'PathPolicyError',
+      code: 'SOURCE_MISSING',
+      sourcePath: source,
+    });
+  });
+
+  test('normalizes permission loss after validation but before the read syscall', async () => {
+    const root = await makeTemporaryDirectory();
+    const source = join(root, 'unreadable.png');
+    await writeFile(source, Buffer.from('unreadable'));
+    const policy = await PathPolicy.create([root]);
+    const asset = await policy.authorizeAsset(source);
+    readFileFault.path = asset.canonicalPath;
+    readFileFault.beforeRead = () => chmod(source, 0o000);
+
+    try {
+      await expect(asset.read()).rejects.toMatchObject({
+        name: 'PathPolicyError',
+        code: 'UNREADABLE_SOURCE',
+        sourcePath: source,
+      });
+    } finally {
+      await chmod(source, 0o644);
+    }
+  });
+
+  test('revalidates a recursive directory immediately before reading its entries', async () => {
+    const root = await makeTemporaryDirectory();
+    const outside = await makeTemporaryDirectory();
+    const folder = join(root, 'artifacts');
+    const replaceableDirectory = join(folder, 'z-replaceable');
+    await mkdir(replaceableDirectory, { recursive: true });
+    await writeFile(join(outside, 'outside-secret.html'), 'secret');
+    const policy = await PathPolicy.create([root]);
+    const canonicalFolder = await realpath(folder);
+    readDirectoryFault.path = canonicalFolder;
+    readDirectoryFault.afterRead = async () => {
+      await rm(replaceableDirectory, { recursive: true });
+      await symlink(outside, replaceableDirectory, 'dir');
+    };
+
+    const result = await policy.enumerateFolder(folder);
+
+    expect(result.errors).toContainEqual({
+      path: join(canonicalFolder, 'z-replaceable'),
+      code: 'SYMLINK_REJECTED',
+    });
+    expect(result.errors.map((error) => error.path)).not.toContain(
+      join(canonicalFolder, 'z-replaceable', 'outside-secret.html'),
+    );
   });
 });

@@ -75,3 +75,64 @@ Implementation commit: `3245c3e` (`feat: add centralized path policy`)
 ## Concerns
 
 None. The unreadable-item test uses POSIX mode `000`, which is supported by the target macOS environment as required by the brief.
+
+---
+
+## Fix round 1
+
+### Findings addressed
+
+1. **Source/asset capability separation**
+   - Kept `authorizeFile()` restricted to `.html`, `.htm`, and `.md` UTF-8 sources.
+   - Added `authorizeAsset()` for contained regular files used by Playwright fulfillment.
+   - Asset handles expose MIME metadata and `Buffer` reads, including CSS, common image/font/script types, and a safe `application/octet-stream` fallback.
+   - Both source and asset reads revalidate path containment, symlink state, type, and readability immediately before the read syscall.
+2. **Recursive directory replacement**
+   - Every recursive `readdir()` now runs only after a fresh canonical containment, symlink, directory-type, and read/execute permission validation.
+   - A deterministic real-filesystem replacement test captures the actual parent Dirent snapshot, swaps the child directory for an outside symlink, and verifies the outside child name is never enumerated.
+3. **Public filesystem error normalization**
+   - Normalized allowed-root `realpath`, missing-parent `realpath`, directory `stat/access`, root `readdir`, and post-validation `readFile` failures to `PathPolicyError`.
+   - Added focused missing-root, unreadable-root, post-validation disappearance, and post-validation permission-loss coverage.
+
+### Fix-round RED/GREEN evidence
+
+| Regression | RED evidence | GREEN evidence |
+| --- | --- | --- |
+| MIME-typed binary asset handle without widening source formats | `authorizeAsset` was not a function | CSS/PNG/WOFF2/unknown bytes and MIME cases passed; `.css` remained rejected as a source |
+| Recursive directory replacement | Result exposed `z-replaceable/outside-secret.html` instead of rejecting `z-replaceable` itself | Replacement is reported at the directory as `SYMLINK_REJECTED`; outside child is absent |
+| Missing allowed root at policy creation | Raw `ENOENT` escaped | Classified `SOURCE_MISSING` `PathPolicyError` passed |
+| Allowed root removed before missing-path validation | Raw `ENOENT` escaped | Classified `SOURCE_MISSING` `PathPolicyError` passed |
+| Unreadable directory/root enumeration | Authorization resolved or raw `EACCES` escaped | Classified `UNREADABLE_SOURCE` `PathPolicyError` passed |
+| File removed after validation but before read syscall | Raw `ENOENT` escaped | Classified `SOURCE_MISSING` `PathPolicyError` passed |
+| Permission removed after validation but before read syscall | Raw `EACCES` escaped | Classified `UNREADABLE_SOURCE` `PathPolicyError` passed |
+
+The two post-validation read races use a narrowly scoped fault hook around only the final `readFile` boundary; all validation and the failing read remain real filesystem operations. The directory replacement hook performs the real `readdir` first, then changes the real filesystem before returning its stale Dirent snapshot.
+
+### Fix-round verification
+
+Fresh command:
+
+```text
+pnpm exec vitest run tests/security/path-policy.test.ts && pnpm lint && pnpm typecheck && pnpm test && pnpm build
+```
+
+Result: exit 0.
+
+- Focused PathPolicy tests: 23 passed, 0 failed
+- ESLint: clean
+- TypeScript typecheck: clean
+- Full Vitest suite: 7 files passed, 48 tests passed, 0 failed
+- Client and server builds: succeeded
+
+### Fix-round self-review
+
+- Source authorization remains extension-restricted; only the explicit asset capability permits other contained regular files.
+- Asset reads return bytes and never reuse the source text API.
+- All read handles preserve immediate revalidation and normalize final syscall races.
+- Recursive enumeration treats a Dirent only as discovery data, not authorization; the directory is reauthorized immediately before use.
+- Public filesystem boundaries now convert raw Node errno failures into the five policy classifications.
+- Mutation review covers removing source extension enforcement, removing asset revalidation, trusting stale Dirents, and deleting each error-normalization boundary.
+
+### Fix-round concerns
+
+None. Permission tests require POSIX permission semantics, which are supported by the target macOS environment.
