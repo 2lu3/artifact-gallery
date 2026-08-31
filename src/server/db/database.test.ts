@@ -1,6 +1,6 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { openDatabase } from './database.js'
 
@@ -398,6 +398,170 @@ describe('openDatabase', () => {
         .prepare('SELECT artifact_id, error_id FROM import_item WHERE id = ?')
         .get(itemErrorItemId),
     ).toEqual({ artifact_id: null, error_id: itemErrorId })
+    database.close()
+  })
+
+  it('upgrades an existing 001 database without losing persisted rows', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-db-'))
+    temporaryDirectories.push(directory)
+    const filename = join(directory, 'gallery.sqlite')
+    const legacyMigrations = join(directory, 'legacy-migrations')
+    await mkdir(legacyMigrations)
+    await copyFile(
+      resolve(process.cwd(), 'tests/fixtures/migrations/001_initial.sql'),
+      join(legacyMigrations, '001_initial.sql'),
+    )
+    const legacy = openDatabase({ filename, migrationsDirectory: legacyMigrations })
+    const now = '2026-08-31T00:00:00.000Z'
+    const artifactId = Number(
+      legacy
+        .prepare(
+          `INSERT INTO artifact
+            (source_path, format, source_status, created_at, updated_at, registered_at, generation_counter)
+           VALUES ('/canonical/legacy.md', 'markdown', 'available', ?, ?, ?, 1)`,
+        )
+        .run(now, now, now).lastInsertRowid,
+    )
+    const generationId = Number(
+      legacy
+        .prepare(
+          `INSERT INTO artifact_generation
+            (artifact_id, generation, job_status, content_status, render_status, index_status,
+             extracted_text, thumbnail_path, completed_at)
+           VALUES (?, 1, 'idle', 'ready', 'ready', 'ready', 'legacy text', '/derived/legacy.webp', ?)`,
+        )
+        .run(artifactId, now).lastInsertRowid,
+    )
+    legacy
+      .prepare('UPDATE artifact SET active_generation_id = ? WHERE id = ?')
+      .run(generationId, artifactId)
+    const errorId = Number(
+      legacy
+        .prepare(
+          `INSERT INTO artifact_error
+            (artifact_id, generation_id, code, stage, retryable, user_message, occurred_at)
+           VALUES (?, ?, 'ASSET_BLOCKED', 'render', 0, 'Asset blocked.', ?)`,
+        )
+        .run(artifactId, generationId, now).lastInsertRowid,
+    )
+    legacy
+      .prepare(
+        `INSERT INTO artifact_warning
+          (artifact_id, generation_id, code, detail, occurred_at)
+         VALUES (?, ?, 'PAGE_CLIPPED', 'Preview clipped.', ?)`,
+      )
+      .run(artifactId, generationId, now)
+    const runId = Number(
+      legacy.prepare("INSERT INTO import_run (status) VALUES ('completed')").run().lastInsertRowid,
+    )
+    const itemId = Number(
+      legacy
+        .prepare(
+          `INSERT INTO import_item
+            (run_id, canonical_path, artifact_id, stage, status, error_id, completed_at)
+           VALUES (?, '/canonical/legacy.md', ?, 'render', 'failed', ?, ?)`,
+        )
+        .run(runId, artifactId, errorId, now).lastInsertRowid,
+    )
+    legacy.close()
+
+    const upgraded = openDatabase({ filename })
+
+    expect(
+      upgraded.prepare('SELECT version FROM schema_migration ORDER BY version').all(),
+    ).toEqual([{ version: '001_initial.sql' }, { version: '002_error_ownership.sql' }])
+    expect(
+      upgraded
+        .prepare(
+          `SELECT active_generation_id, generation_counter
+           FROM artifact WHERE id = ?`,
+        )
+        .get(artifactId),
+    ).toEqual({ active_generation_id: generationId, generation_counter: 1 })
+    expect(
+      upgraded
+        .prepare(
+          `SELECT artifact_id, generation_id, code
+           FROM artifact_error WHERE id = ?`,
+        )
+        .get(errorId),
+    ).toEqual({ artifact_id: artifactId, generation_id: generationId, code: 'ASSET_BLOCKED' })
+    expect(
+      upgraded
+        .prepare('SELECT artifact_id, error_id, status FROM import_item WHERE id = ?')
+        .get(itemId),
+    ).toEqual({ artifact_id: artifactId, error_id: errorId, status: 'failed' })
+    expect(
+      upgraded.prepare('SELECT COUNT(*) AS count FROM artifact_warning').get(),
+    ).toEqual({ count: 1 })
+    expect(() =>
+      upgraded
+        .prepare(
+          `INSERT INTO artifact_error
+            (artifact_id, generation_id, code, stage, retryable, user_message, occurred_at)
+           VALUES (NULL, NULL, 'OUTSIDE_ALLOWED_ROOT', 'inspect', 0, 'Outside root.', ?)`,
+        )
+        .run(now),
+    ).not.toThrow()
+    upgraded.close()
+  })
+
+  it('deletes an artifact catalog row while preserving unrelated rows', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-db-'))
+    temporaryDirectories.push(directory)
+    const database = openDatabase({ filename: join(directory, 'gallery.sqlite') })
+    const now = '2026-08-31T00:00:00.000Z'
+    const insertArtifact = database.prepare(
+      `INSERT INTO artifact
+        (source_path, format, source_status, created_at, updated_at, registered_at)
+       VALUES (?, 'markdown', 'available', ?, ?, ?)`,
+    )
+    const deletedArtifactId = Number(
+      insertArtifact.run('/canonical/delete.md', now, now, now).lastInsertRowid,
+    )
+    const preservedArtifactId = Number(
+      insertArtifact.run('/canonical/preserve.md', now, now, now).lastInsertRowid,
+    )
+    const insertError = database.prepare(
+      `INSERT INTO artifact_error
+        (artifact_id, generation_id, code, stage, retryable, user_message, occurred_at)
+       VALUES (?, NULL, 'ASSET_BLOCKED', 'render', 0, 'Asset blocked.', ?)`,
+    )
+    const deletedErrorId = Number(insertError.run(deletedArtifactId, now).lastInsertRowid)
+    const preservedErrorId = Number(insertError.run(preservedArtifactId, now).lastInsertRowid)
+    const runId = Number(
+      database.prepare("INSERT INTO import_run (status) VALUES ('completed')").run().lastInsertRowid,
+    )
+    const insertItem = database.prepare(
+      `INSERT INTO import_item
+        (run_id, canonical_path, artifact_id, stage, status, error_id, completed_at)
+       VALUES (?, ?, ?, 'render', 'failed', ?, ?)`,
+    )
+    const clearedItemId = Number(
+      insertItem
+        .run(runId, '/canonical/delete.md', deletedArtifactId, deletedErrorId, now)
+        .lastInsertRowid,
+    )
+    const preservedItemId = Number(
+      insertItem
+        .run(runId, '/canonical/preserve.md', preservedArtifactId, preservedErrorId, now)
+        .lastInsertRowid,
+    )
+
+    expect(() =>
+      database.prepare('DELETE FROM artifact WHERE id = ?').run(deletedArtifactId),
+    ).not.toThrow()
+    expect(
+      database.prepare('SELECT artifact_id, error_id FROM import_item WHERE id = ?').get(clearedItemId),
+    ).toEqual({ artifact_id: null, error_id: null })
+    expect(
+      database.prepare('SELECT artifact_id, error_id FROM import_item WHERE id = ?').get(preservedItemId),
+    ).toEqual({ artifact_id: preservedArtifactId, error_id: preservedErrorId })
+    expect(database.prepare('SELECT COUNT(*) AS count FROM artifact WHERE id = ?').get(deletedArtifactId)).toEqual({ count: 0 })
+    expect(database.prepare('SELECT COUNT(*) AS count FROM artifact_error WHERE id = ?').get(deletedErrorId)).toEqual({ count: 0 })
+    expect(database.prepare('SELECT COUNT(*) AS count FROM artifact WHERE id = ?').get(preservedArtifactId)).toEqual({ count: 1 })
+    expect(database.prepare('SELECT COUNT(*) AS count FROM artifact_error WHERE id = ?').get(preservedErrorId)).toEqual({ count: 1 })
+
     database.close()
   })
 })

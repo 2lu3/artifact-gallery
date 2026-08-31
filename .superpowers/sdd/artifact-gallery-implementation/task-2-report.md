@@ -328,3 +328,91 @@ tsc --project tsconfig.server.json            exit 0
 ### Concerns
 
 - None specific to this fix round.
+
+## Fix round 3/5
+
+### Files changed
+
+- Restored `migrations/001_initial.sql` byte-for-byte to the initial Task 2
+  migration committed in `346f4d1`; previously released migration history is no
+  longer rewritten.
+- Added `migrations/002_error_ownership.sql` to rebuild `artifact_error` and
+  `import_item`, copy existing rows, enable nullable item-level error owners, and
+  install the owner-invariant triggers.
+- Added an artifact-delete trigger that clears only coupled import-item
+  `error_id` values before `artifact_id ON DELETE SET NULL` runs.
+- Added the immutable old-001 fixture at
+  `tests/fixtures/migrations/001_initial.sql` plus real-SQL migration upgrade and
+  catalog-row deletion integration tests in `database.test.ts`.
+
+### RED evidence
+
+1. **Existing 001 database was not upgraded**
+   - Test: `src/server/db/database.test.ts` —
+     `upgrades an existing 001 database without losing persisted rows`.
+   - The test created a database from the old 001 SQL, inserted an active
+     generation, error, warning, import run, and linked import item, then opened
+     it through the current migration runner.
+   - Command:
+     `pnpm test src/server/db/database.test.ts -t "upgrades an existing 001 database"`.
+   - RED: expected migration versions `001_initial.sql` and
+     `002_error_ownership.sql`, received only `001_initial.sql`; 1 failed,
+     7 skipped.
+2. **Artifact catalog deletion was blocked by the owner trigger**
+   - Test: `src/server/db/database.test.ts` —
+     `deletes an artifact catalog row while preserving unrelated rows`.
+   - Command:
+     `pnpm test src/server/db/database.test.ts -t "deletes an artifact catalog row"`.
+   - RED: `DELETE FROM artifact` threw
+     `SqliteError: import item error owner mismatch`; 1 failed, 7 skipped.
+
+### GREEN evidence
+
+- Focused command:
+  `pnpm test src/server/db/database.test.ts -t "upgrades an existing 001 database|deletes an artifact catalog row"`
+  passed 2/2.
+- Immutability check:
+  `git diff 346f4d1 -- migrations/001_initial.sql` produced no output.
+- Targeted persistence command:
+  `pnpm test src/server/db/database.test.ts src/server/repositories/artifact-repository.test.ts src/server/repositories/import-repository.test.ts src/server/db/recovery.test.ts`
+  passed 22/22 tests across 4 files.
+
+### Full verification
+
+The required command was rerun after the final migration and test changes:
+
+```text
+git diff --check && pnpm lint && pnpm typecheck && pnpm test && pnpm build
+
+git diff --check                              exit 0
+eslint .                                      exit 0
+tsc --noEmit                                  exit 0
+Test Files  6 passed (6)
+Tests       24 passed (24)
+vite build                                   15 modules transformed, exit 0
+tsc --project tsconfig.server.json            exit 0
+```
+
+### Self-review
+
+- An old database with only `001_initial.sql` recorded receives 002 exactly
+  once through the existing ordered migration runner.
+- 002 copies IDs and every column from existing `artifact_error` and
+  `import_item` rows before dropping the old tables, preserving active artifact,
+  generation, warning, run, item, and issue relationships.
+- New databases reach the same final behavior by applying immutable 001 followed
+  by 002; the old-schema fixture protects the upgrade route independently.
+- Before an artifact row is deleted, only import items owned by that artifact
+  have `error_id` cleared. The normal foreign-key actions then null their
+  `artifact_id` and delete owned errors; unrelated artifacts, errors, and items
+  remain unchanged.
+- The deletion integration test uses real SQLite DELETE and asserts both the
+  cleared row and the unrelated preserved row.
+
+### Commit hash
+
+`PENDING`
+
+### Concerns
+
+- None specific to this fix round.
