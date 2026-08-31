@@ -1,5 +1,11 @@
-import { buildApp } from './app.js'
+import { DEFAULT_LISTEN_OPTIONS } from './app.js'
+import { createServerRuntime, runtimeOptionsFromEnvironment } from './runtime.js'
 
-const app = buildApp()
+const app = await createServerRuntime(runtimeOptionsFromEnvironment())
+const configuredPort = Number(process.env.PORT)
+const port =
+  Number.isSafeInteger(configuredPort) && configuredPort > 0 && configuredPort <= 65_535
+    ? configuredPort
+    : DEFAULT_LISTEN_OPTIONS.port
 
-await app.listen({ host: '127.0.0.1', port: 3000 })
+await app.listen({ host: DEFAULT_LISTEN_OPTIONS.host, port })
