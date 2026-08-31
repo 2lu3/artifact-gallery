@@ -9,6 +9,7 @@ import { openDatabase } from '../db/database.js'
 import { MarkdownRenderer } from '../rendering/markdown-renderer.js'
 import { ArtifactRepository } from '../repositories/artifact-repository.js'
 import { ImportRepository } from '../repositories/import-repository.js'
+import { SearchVisibilityRepository } from '../repositories/search-visibility-repository.js'
 import { PathPolicy } from '../security/path-policy.js'
 import {
   ArtifactProcessor,
@@ -432,6 +433,69 @@ describe('ArtifactProcessor staged pipeline', () => {
     expect(activeGenerationId(harness.database, artifactId)).toBe(first.generationId)
     expect(quarantined).toBe(true)
     expect(visibleText).toBeNull()
+    expect(new ArtifactRepository(harness.database).listWarnings(artifactId)).toContainEqual({
+      code: 'INDEX_REPAIR_PENDING',
+      detail: 'Search index repair is pending.',
+      occurredAt: NOW,
+    })
+    harness.database.close()
+  })
+
+  it('durably gates search when prepared-index rollback and quarantine both fail', async () => {
+    const externalRows: Array<{
+      artifactId: number
+      generation: number
+      text: string
+    }> = []
+    const indexer: ArtifactIndexer = {
+      prepare: async ({ artifactId, generation, text }) => ({
+        commit: () => {
+          externalRows.push({ artifactId, generation, text })
+        },
+        rollback: async () => {
+          if (generation > 1) throw new Error('external rollback failed')
+          externalRows.splice(
+            externalRows.findIndex((row) => row.artifactId === artifactId && row.generation === generation),
+            1,
+          )
+        },
+        quarantine: async () => {
+          throw new Error('external quarantine failed')
+        },
+      }),
+    }
+    const harness = await makeHarness({ indexer })
+    await writeFile(harness.sourcePath, '# Previous indexed text')
+    const first = await harness.processor.register({ sourcePath: harness.sourcePath })
+    const artifactId = requireResultNumber(first.artifactId)
+    await writeFile(harness.sourcePath, '# Leaked external text')
+    const failingProcessor = harness.withFileSystem({
+      ...realFileSystem,
+      rename: () => {
+        throw new Error('rename failed after external commit')
+      },
+    })
+
+    const failed = await failingProcessor.refresh({ sourcePath: harness.sourcePath })
+
+    expect(failed.outcome).toBe('failed')
+    expect(failed.errors.at(-1)).toMatchObject({ code: 'INDEX_UPDATE_FAILED', stage: 'index' })
+    expect(externalRows).toContainEqual({
+      artifactId,
+      generation: failed.generation,
+      text: 'Leaked external text',
+    })
+    expect(new SearchVisibilityRepository(harness.database).filterVisibleCandidates(externalRows)).toEqual([
+      { artifactId, generation: first.generation, text: 'Previous indexed text' },
+    ])
+    expect(
+      harness.database
+        .prepare(
+          `SELECT state FROM artifact_search_visibility
+           WHERE artifact_id = ? AND generation_id = ?`,
+        )
+        .get(artifactId, failed.generationId),
+    ).toEqual({ state: 'quarantined' })
     expect(new ArtifactRepository(harness.database).listWarnings(artifactId)).toContainEqual({
       code: 'INDEX_REPAIR_PENDING',
       detail: 'Search index repair is pending.',

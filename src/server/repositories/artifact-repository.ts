@@ -141,6 +141,13 @@ export class ArtifactRepository {
            VALUES (?, ?, 'queued', 'pending', 'pending', 'pending')`,
         )
         .run(artifactId, artifact.generation_counter)
+      this.database
+        .prepare(
+          `INSERT INTO artifact_search_visibility
+            (artifact_id, generation_id, state, updated_at)
+           VALUES (?, ?, 'staged', ?)`,
+        )
+        .run(artifactId, result.lastInsertRowid, now)
 
       return {
         id: Number(result.lastInsertRowid),
@@ -203,6 +210,22 @@ export class ArtifactRepository {
         )
       if (artifact.changes !== 1) {
         throw new StaleGenerationError()
+      }
+
+      const visibility = this.database
+        .prepare(
+          `UPDATE artifact_search_visibility
+           SET state = ?, updated_at = ?
+           WHERE artifact_id = ? AND generation_id = ?`,
+        )
+        .run(
+          input.indexStatus === 'ready' ? 'visible' : 'staged',
+          input.completedAt,
+          input.artifactId,
+          input.generationId,
+        )
+      if (visibility.changes !== 1) {
+        throw new Error('The generation search visibility gate is missing.')
       }
     })()
   }

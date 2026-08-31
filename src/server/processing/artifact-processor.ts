@@ -25,6 +25,7 @@ import {
   type DerivedStatus,
 } from '../repositories/artifact-repository.js'
 import { ImportRepository, type ImportItemStage } from '../repositories/import-repository.js'
+import { SearchVisibilityRepository } from '../repositories/search-visibility-repository.js'
 import type { AuthorizedFile } from '../security/path-policy.js'
 import {
   MAX_THUMBNAIL_BYTES,
@@ -66,6 +67,7 @@ export interface ProcessingOperationalError {
     | 'thumbnail-retirement-cleanup'
     | 'thumbnail-retirement-warning'
     | 'index-rollback'
+    | 'index-quarantine-gate'
     | 'index-quarantine'
     | 'index-repair-warning'
   readonly artifactId: number
@@ -183,6 +185,7 @@ const noOpIndexer: ArtifactIndexer = {
 export class ArtifactProcessor {
   private readonly artifacts: ArtifactRepository
   private readonly imports: ImportRepository
+  private readonly searchVisibility: SearchVisibilityRepository
   private readonly markdownRenderer: NonNullable<ArtifactProcessorDependencies['markdownRenderer']>
   private readonly indexer: ArtifactIndexer
   private readonly optimizer: ThumbnailOptimizer
@@ -192,6 +195,7 @@ export class ArtifactProcessor {
   constructor(private readonly dependencies: ArtifactProcessorDependencies) {
     this.artifacts = new ArtifactRepository(dependencies.database)
     this.imports = new ImportRepository(dependencies.database)
+    this.searchVisibility = new SearchVisibilityRepository(dependencies.database)
     this.markdownRenderer = dependencies.markdownRenderer ?? new MarkdownRenderer()
     this.indexer = dependencies.indexer ?? noOpIndexer
     this.optimizer = dependencies.thumbnailOptimizer ?? new WebpThumbnailOptimizer()
@@ -728,6 +732,22 @@ export class ArtifactProcessor {
         generationId,
         technicalDetail: technicalDetail(rollbackError),
       })
+      let durableQuarantineError: unknown = null
+      try {
+        this.searchVisibility.quarantineGeneration({
+          artifactId,
+          generationId,
+          now: this.now(),
+        })
+      } catch (error) {
+        durableQuarantineError = error
+        await this.reportOperationalError({
+          operation: 'index-quarantine-gate',
+          artifactId,
+          generationId,
+          technicalDetail: technicalDetail(error),
+        })
+      }
       try {
         await attempt.preparedIndex.quarantine()
       } catch (quarantineError) {
@@ -762,7 +782,11 @@ export class ArtifactProcessor {
           technicalDetail: technicalDetail(warningError),
         })
       }
-      return mapProcessingError(rollbackError, 'index', 'INDEX_UPDATE_FAILED')
+      return mapProcessingError(
+        durableQuarantineError ?? rollbackError,
+        'index',
+        'INDEX_UPDATE_FAILED',
+      )
     }
   }
 

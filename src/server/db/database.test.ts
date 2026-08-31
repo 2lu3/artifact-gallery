@@ -36,6 +36,7 @@ describe('openDatabase', () => {
       'artifact',
       'artifact_error',
       'artifact_generation',
+      'artifact_search_visibility',
       'artifact_warning',
       'import_item',
       'import_run',
@@ -88,6 +89,12 @@ describe('openDatabase', () => {
       'user_message',
       'technical_detail',
       'occurred_at',
+    ])
+    expect(columnNames('artifact_search_visibility')).toEqual([
+      'artifact_id',
+      'generation_id',
+      'state',
+      'updated_at',
     ])
     expect(columnNames('artifact_warning')).toEqual([
       'id',
@@ -469,7 +476,11 @@ describe('openDatabase', () => {
 
     expect(
       upgraded.prepare('SELECT version FROM schema_migration ORDER BY version').all(),
-    ).toEqual([{ version: '001_initial.sql' }, { version: '002_error_ownership.sql' }])
+    ).toEqual([
+      { version: '001_initial.sql' },
+      { version: '002_error_ownership.sql' },
+      { version: '003_search_visibility.sql' },
+    ])
     expect(
       upgraded
         .prepare(
@@ -494,6 +505,14 @@ describe('openDatabase', () => {
     expect(
       upgraded.prepare('SELECT COUNT(*) AS count FROM artifact_warning').get(),
     ).toEqual({ count: 1 })
+    expect(
+      upgraded
+        .prepare(
+          `SELECT artifact_id, generation_id, state
+           FROM artifact_search_visibility WHERE generation_id = ?`,
+        )
+        .get(generationId),
+    ).toEqual({ artifact_id: artifactId, generation_id: generationId, state: 'visible' })
     expect(() =>
       upgraded
         .prepare(
@@ -589,7 +608,11 @@ describe('openDatabase', () => {
 
     expect(
       upgraded.prepare('SELECT version FROM schema_migration ORDER BY version').all(),
-    ).toEqual([{ version: '001_initial.sql' }, { version: '002_error_ownership.sql' }])
+    ).toEqual([
+      { version: '001_initial.sql' },
+      { version: '002_error_ownership.sql' },
+      { version: '003_search_visibility.sql' },
+    ])
     expect(
       upgraded
         .prepare(

@@ -327,3 +327,96 @@ Fix round and report: this commit.
 
 - Real Chromium verification retains the same managed-sandbox limitation; all 128 tests pass in
   the permitted execution context.
+
+---
+
+## Fix round 3/5
+
+### Finding addressed
+
+**Durable SQLite search-visibility authority**
+
+- Added immutable migration `003_search_visibility.sql` with one gate row per artifact generation.
+  Fresh generations start `staged`; only the successful generation transaction changes an
+  index-ready generation to `visible`; recovery can persist `quarantined`.
+- The migration backfills only the current active, index-ready generation as `visible`. Every
+  other legacy generation is backfilled `staged`, and owner triggers reject cross-artifact gate
+  associations.
+- Added `SearchVisibilityRepository.filterVisibleCandidates()` as the Task 6 read contract. It
+  returns an external candidate only when SQLite confirms the same artifact generation is active,
+  its `index_status` is `ready`, and its gate is `visible`.
+- Added durable `quarantineGeneration()` and `clearQuarantineAfterRepair()` transitions. Repair
+  re-evaluates active generation and index readiness, returning an inactive generation to
+  `staged` rather than making it visible.
+- `ArtifactProcessor` now persists the generation quarantine after prepared-index rollback fails,
+  before attempting the external quarantine. If both external rollback and quarantine fail, an
+  externally leaked row remains unreadable through the SQLite-authoritative repository API.
+- Gate persistence errors are mapped through the normal processing error boundary (including
+  `DATABASE_BUSY` for SQLite busy codes), reported internally, and remain fatal to the attempt.
+  The pre-existing `staged` default remains fail-closed if the quarantine transition itself fails.
+
+### Focused RED / GREEN evidence
+
+| Regression | Observed RED | GREEN evidence |
+| --- | --- | --- |
+| Missing immutable migration | Fresh schema omitted the gate table; 001 and pre-002 upgrades applied only two migrations | Fresh and upgraded databases apply `003`; the legacy active+ready generation is backfilled `visible` |
+| Missing Task 6 read authority | Repository module was absent | Real SQLite repository returns only active+ready+visible candidates and persists quarantine across reopen |
+| External rollback and quarantine both fail | Generation gate remained `staged`; no durable quarantine transition represented the recovery fault | External new row remains present, failed generation gate is `quarantined`, and read API returns only the previous active row |
+| Repair completes | No gate-release contract existed | Repair release rechecks SQLite active/readiness and restores the repaired active generation to visible |
+
+Focused command:
+
+```text
+pnpm test src/server/processing/artifact-processor.test.ts \
+  src/server/repositories/search-visibility-repository.test.ts \
+  src/server/db/database.test.ts
+
+Test Files  3 passed (3)
+Tests       34 passed (34)
+```
+
+### Verification
+
+Fresh verification after the final implementation and self-review:
+
+```text
+pnpm lint
+eslint .                                      exit 0
+
+pnpm typecheck
+tsc --noEmit                                  exit 0
+
+pnpm test
+Test Files  13 passed (13)
+Tests       131 passed (131)
+
+pnpm build
+vite build                                   exit 0
+tsc --project tsconfig.server.json            exit 0
+```
+
+The full suite ran outside the managed macOS process sandbox solely because Chromium Mach
+rendezvous registration is denied inside it.
+
+### Self-review
+
+- Mutation: omitting migration 003 fails fresh-schema and both legacy-upgrade assertions.
+- Mutation: omitting staged-row creation or transactional visible activation causes repository
+  commit/filter tests to fail closed instead of returning the active candidate.
+- Mutation: dropping any active-generation, index-ready, or visible-gate predicate exposes the
+  deliberately invalid external candidate in the repository test.
+- Mutation: swallowing both external recovery failures without the SQLite quarantine leaves the
+  processor regression at `staged` rather than the required durable `quarantined` state.
+- Mutation: clearing quarantine directly to visible exposes inactive generations; the repair test
+  requires the active/readiness recheck.
+
+### Commit
+
+Fix round and report: this commit.
+
+### Concerns
+
+- Task 6 must consume external search candidates through `SearchVisibilityRepository`; returning
+  backend rows directly would bypass the SQLite authority defined by this fix.
+- Real Chromium verification retains the same managed-sandbox limitation; all 131 tests pass in
+  the permitted execution context.
