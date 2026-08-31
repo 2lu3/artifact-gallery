@@ -6,7 +6,7 @@ Implemented the production reliability boundary described by the Task 9 brief:
 
 - `ImportWorker` now owns the bounded queue, per-source serialization, processor dispatch, a 30-second cooperative attempt budget, graceful accept-stop, and drain.
 - Timers are armed before processor dispatch, every production stage checks the shared budget after work, and results settling after the budget are rejected. This is not presented as OS-level wall-clock preemption of arbitrary synchronous injected code.
-- Production Markdown/HTML extraction and full search-index normalization run in terminate-capable worker threads. SQLite, filesystem commit, and Chromium ownership remain in the main processor so no database transaction is killed in flight.
+- Production Markdown/HTML extraction and the potentially long search-body normalization run in terminate-capable worker threads. Short title/path metadata is re-read and normalized synchronously at each index upsert. SQLite, filesystem commit, and Chromium ownership remain in the main processor so no database transaction is killed in flight.
 - Commit requires at least 100 ms remaining before entry, temporarily caps SQLite `busy_timeout` to the remaining budget, keeps index/rename outside the SQLite transaction, and performs no await inside the measured critical section. A noninterruptible operation is allowed to finish; elapsed checks then reject activation or run full compensation.
 - Post-commit compensation restores the prior active generation, current generation/search visibility staging, run/item state, every prior `artifact_error`/`artifact_warning` row with its original ID and timestamp, and every import-item error relation before terminal `TIMEOUT` persistence.
 - A durable cancellation request wins the terminal summary over a simultaneous stage timeout: `TIMEOUT` remains available as diagnostics, while result, item, and run finish as `cancelled` with a `CANCELLED` summary.
@@ -36,10 +36,10 @@ Measured while two real Chromium contexts were blocked concurrently through the 
 
 | Measurement | Observed | Enforced smoke ceiling |
 | --- | ---: | ---: |
-| Chromium descendant peak RSS | 347.4 MiB | 4096 MiB |
+| Chromium descendant peak RSS | 347.7 MiB | 4096 MiB |
 | Chromium descendant RSS samples | 5 | > 1 |
-| Running-item cancel latency under two-context load | 66.8 ms | 1500 ms |
-| Production commit critical-section maximum | 0.68 ms | 250 ms smoke ceiling |
+| Running-item cancel latency under two-context load | 64.8 ms | 1500 ms |
+| Production commit critical-section maximum | 0.72 ms | 250 ms smoke ceiling |
 | Browser processes launched for the three-item load | 1 | 1 |
 | Peak disposable contexts | 2 | 2 |
 
@@ -50,8 +50,8 @@ Browser disconnect coverage closes the first real browser during one worker item
 ## Cooperative budget and cancellation corrections
 
 - A generic injected processor that synchronously occupies the event loop past a 20 ms test budget cannot publish a successful result. The worker rejects it with `TIMEOUT` when the synchronous call eventually returns; caller settlement at 20 ms is not claimed.
-- Production CPU-heavy extraction and full-text/path/title normalization are isolated in worker threads and terminated by the attempt abort signal.
-- Production synchronous work remaining on the owner thread is explicitly input-bounded: source/HTML/CSS sizes, fixed render dimensions, 16 MiB optimizer input, bounded warning cardinality, and short local SQLite/fs statements.
+- Production CPU-heavy extraction and full search-body normalization are isolated in worker threads and terminated by the attempt abort signal.
+- Production synchronous work remaining on the owner thread is explicitly input-bounded: source/HTML/CSS sizes, fixed render dimensions, 16 MiB optimizer input, short title/path normalization, bounded warning cardinality, and short local SQLite/fs statements.
 - The processor checks elapsed budget before and after inspect, source read, extraction, render, index preparation, thumbnail optimization, directory/file writes, index commit, rename, item completion, and SQLite work.
 - A synchronous rename regression that crosses the budget rolls back the prepared index, removes the renamed output, retains the previous thumbnail/active generation, and durably fails the current run with commit-stage `TIMEOUT`.
 - A transaction-return regression that crosses the budget restores exact prior diagnostics and relations, removes attempt warning rows, stages the interrupted generation, and retains only the new terminal `TIMEOUT` alongside the restored prior errors.
@@ -79,7 +79,8 @@ The global plan permits no general production child process beyond Chromium. Who
 | Synchronous injected CPU | 45 ms busy processor published `completed` after a 20 ms budget | late result is rejected as `TIMEOUT`; no result callback runs |
 | Commit budget activation | synchronous rename, or transaction return, crossed the budget and still activated the generation | guard/compensation restores the prior generation, visibility, thumbnail, and terminal state |
 | CPU extraction ownership | Markdown/HTML parsing occupied the SQLite/renderer owner thread | production extraction runs in a terminate-capable worker thread |
-| Index normalization ownership | `async prepare()` normalized the full body before yielding | body/path/title normalization runs in a terminate-capable worker thread |
+| Index normalization ownership | `async prepare()` normalized the full body before yielding | generation-body normalization runs in a terminate-capable worker thread |
+| Concurrent title/index commit | `prepare()` retained pre-await user/derived/path metadata and overwrote a newer title at commit | body remains the generation snapshot; each staging/commit upsert re-reads current artifact metadata and normalizes the short values synchronously |
 | Commit entry reserve | 75 ms remaining still entered index/rename/SQLite commit | entry is rejected below the 100 ms reserve |
 | SQLite lock wait | connection retained a 5000 ms busy wait with 1000 ms remaining | critical-section `busy_timeout` is capped to remaining budget and restored afterward |
 | Diagnostic compensation | old error IDs/relations were lost and the attempt warning remained | exact prior error/warning rows and relations return; attempt rows are removed before terminal timeout |
@@ -91,12 +92,12 @@ The global plan permits no general production child process beyond Chromium. Who
 - `pnpm lint` — PASS
 - `pnpm typecheck` — PASS
 - `pnpm build` — PASS
-- `pnpm test` — PASS, 212/212
+- `pnpm test` — PASS, 213/213
 - `pnpm test:e2e` — PASS, 19/19
 
 ## Concerns
 
 - The RSS smoke measurement uses macOS/Linux `ps` process-tree data and is intentionally not an exact performance benchmark.
-- The 250 ms commit critical-section assertion is a generous smoke ceiling, not a wall-clock guarantee. The observed 0.68 ms maximum is machine-specific.
-- An arbitrary injected processor that synchronously blocks the owner thread cannot be forcibly preempted under the one-process plan. Its late success is rejected after it returns; production user-sized extraction/normalization work is isolated and terminate-capable.
+- The 250 ms commit critical-section assertion is a generous smoke ceiling, not a wall-clock guarantee. The observed 0.72 ms maximum is machine-specific.
+- An arbitrary injected processor that synchronously blocks the owner thread cannot be forcibly preempted under the one-process plan. Its late success is rejected after it returns; production user-sized extraction and long-body normalization work is isolated and terminate-capable.
 - SQLite/fs commit work is deliberately never killed. It starts only with a reserve, uses a remaining-budget lock wait, completes its bounded noninterruptible section, and compensates any late activation.

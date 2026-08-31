@@ -7,10 +7,8 @@ import type {
   PreparedArtifactIndex,
 } from '../processing/artifact-processor.js'
 import { SearchVisibilityRepository } from '../repositories/search-visibility-repository.js'
-import {
-  normalizeSearchIndexFields,
-  type NormalizedSearchIndexFields,
-} from './search-index-normalizer.js'
+import { normalizeSearchIndexBody } from './search-index-normalizer.js'
+import { normalizePathSegments, normalizeSearchText } from './search-query.js'
 
 export interface SearchIndexRepairInput {
   readonly artifactId: number
@@ -18,14 +16,18 @@ export interface SearchIndexRepairInput {
   readonly now: string
 }
 
-interface IndexedGenerationSource {
+interface PreparedGenerationIndex {
   readonly generationId: number
   readonly artifactId: number
   readonly generation: number
-  readonly sourcePath: string
-  readonly userTitle: string | null
-  readonly derivedTitle: string | null
-  readonly text: string
+  readonly bodyNormalized: string
+  readonly derivedTitleOverride?: string | null
+}
+
+interface ArtifactIndexMetadata {
+  readonly source_path: string
+  readonly user_title: string | null
+  readonly derived_title: string | null
 }
 
 export class SQLiteSearchIndexer implements ArtifactIndexer {
@@ -44,32 +46,21 @@ export class SQLiteSearchIndexer implements ArtifactIndexer {
     readonly signal?: AbortSignal
   }): Promise<PreparedArtifactIndex> {
     const generationId = this.readGenerationId(request.artifactId, request.generation)
-    const titles = this.readTitles(request.artifactId)
-    const derivedTitle =
-      request.title === undefined
-        ? (titles.derived_title ?? basename(request.sourcePath))
-        : (request.title ?? basename(request.sourcePath))
-    const normalized = await normalizeSearchIndexFields({
-      sourcePath: request.sourcePath,
-      userTitle: titles.user_title ?? '',
-      derivedTitle,
+    const normalized = await normalizeSearchIndexBody({
       body: request.text,
       signal: request.signal,
     })
-    const staged: IndexedGenerationSource & { normalized: NormalizedSearchIndexFields } = {
+    const staged: PreparedGenerationIndex = {
       generationId,
       artifactId: request.artifactId,
       generation: request.generation,
-      sourcePath: request.sourcePath,
-      userTitle: titles.user_title,
-      derivedTitle,
-      text: request.text,
-      normalized,
+      bodyNormalized: normalized.body,
+      derivedTitleOverride: request.title,
     }
-    this.upsertNormalizedDocument(staged)
+    this.upsertCurrentDocument(staged)
 
     return {
-      commit: () => this.upsertNormalizedDocument(staged),
+      commit: () => this.upsertCurrentDocument(staged),
       rollback: async () => this.removeDocument(generationId),
       quarantine: async () => this.removeDocument(generationId),
     }
@@ -77,14 +68,16 @@ export class SQLiteSearchIndexer implements ArtifactIndexer {
 
   async repair(input: SearchIndexRepairInput): Promise<void> {
     const source = this.readRepairSource(input.artifactId, input.generation)
-    const normalized = await normalizeSearchIndexFields({
-      sourcePath: source.sourcePath,
-      userTitle: source.userTitle ?? '',
-      derivedTitle: source.derivedTitle ?? '',
+    const normalized = await normalizeSearchIndexBody({
       body: source.text,
     })
     this.database.transaction(() => {
-      this.upsertNormalizedDocument({ ...source, normalized })
+      this.upsertCurrentDocument({
+        generationId: source.generationId,
+        artifactId: source.artifactId,
+        generation: source.generation,
+        bodyNormalized: normalized.body,
+      })
       this.visibility.clearQuarantineAfterRepair({
         artifactId: input.artifactId,
         generationId: source.generationId,
@@ -113,15 +106,17 @@ export class SQLiteSearchIndexer implements ArtifactIndexer {
     return generationId
   }
 
-  private readRepairSource(artifactId: number, generation: number): IndexedGenerationSource {
+  private readRepairSource(artifactId: number, generation: number): {
+    readonly generationId: number
+    readonly artifactId: number
+    readonly generation: number
+    readonly text: string
+  } {
     const row = this.database
       .prepare(
         `SELECT artifact_generation.id AS generation_id,
                 artifact.id AS artifact_id,
                 artifact_generation.generation,
-                artifact.source_path,
-                artifact.user_title,
-                artifact.derived_title,
                 artifact_generation.extracted_text
          FROM artifact_generation
          JOIN artifact ON artifact.id = artifact_generation.artifact_id
@@ -135,9 +130,6 @@ export class SQLiteSearchIndexer implements ArtifactIndexer {
           generation_id: number
           artifact_id: number
           generation: number
-          source_path: string
-          user_title: string | null
-          derived_title: string | null
           extracted_text: string | null
         }
       | undefined
@@ -148,29 +140,26 @@ export class SQLiteSearchIndexer implements ArtifactIndexer {
       generationId: row.generation_id,
       artifactId: row.artifact_id,
       generation: row.generation,
-      sourcePath: row.source_path,
-      userTitle: row.user_title,
-      derivedTitle: row.derived_title,
       text: row.extracted_text,
     }
   }
 
-  private readTitles(artifactId: number): {
-    user_title: string | null
-    derived_title: string | null
-  } {
-    const titles = this.database
-      .prepare('SELECT user_title, derived_title FROM artifact WHERE id = ?')
+  private readMetadata(artifactId: number): ArtifactIndexMetadata {
+    const metadata = this.database
+      .prepare('SELECT source_path, user_title, derived_title FROM artifact WHERE id = ?')
       .get(artifactId) as
-      | { user_title: string | null; derived_title: string | null }
+      | ArtifactIndexMetadata
       | undefined
-    if (!titles) throw new Error('The indexed artifact does not exist.')
-    return titles
+    if (!metadata) throw new Error('The indexed artifact does not exist.')
+    return metadata
   }
 
-  private upsertNormalizedDocument(
-    source: IndexedGenerationSource & { readonly normalized: NormalizedSearchIndexFields },
-  ): void {
+  private upsertCurrentDocument(source: PreparedGenerationIndex): void {
+    const metadata = this.readMetadata(source.artifactId)
+    const derivedTitle =
+      source.derivedTitleOverride === undefined
+        ? (metadata.derived_title ?? basename(metadata.source_path))
+        : (source.derivedTitleOverride ?? basename(metadata.source_path))
     this.database
       .prepare(
         `INSERT INTO artifact_search_document (
@@ -194,10 +183,10 @@ export class SQLiteSearchIndexer implements ArtifactIndexer {
         source.generationId,
         source.artifactId,
         source.generation,
-        source.normalized.userTitle,
-        source.normalized.derivedTitle,
-        source.normalized.body,
-        source.normalized.pathSegments,
+        normalizeSearchText(metadata.user_title ?? ''),
+        normalizeSearchText(derivedTitle),
+        source.bodyNormalized,
+        normalizePathSegments(metadata.source_path),
       )
   }
 

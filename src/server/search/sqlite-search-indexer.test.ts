@@ -21,6 +21,48 @@ afterEach(async () => {
 })
 
 describe('SQLiteSearchIndexer', () => {
+  it('commits current title and path metadata after asynchronous body normalization', async () => {
+    const harness = await makeHarness('/canonical/Old Guide.md')
+    harness.database
+      .prepare('UPDATE artifact SET user_title = ?, derived_title = ? WHERE id = ?')
+      .run('Old user title', 'Old derived title', harness.artifactId)
+    const generation = harness.artifacts.createGeneration(harness.artifactId, NOW)
+    const body = 'ＡＢＣ generation body '.repeat(20_000)
+
+    const preparing = harness.indexer.prepare({
+      artifactId: harness.artifactId,
+      generation: generation.generation,
+      sourcePath: '/canonical/Old Guide.md',
+      text: body,
+    })
+    harness.database
+      .prepare('UPDATE artifact SET user_title = ? WHERE id = ?')
+      .run('During normalization', harness.artifactId)
+    const prepared = await preparing
+    harness.database
+      .prepare(
+        `UPDATE artifact
+         SET user_title = ?, derived_title = ?, source_path = ?
+         WHERE id = ?`,
+      )
+      .run(
+        'Commit user title',
+        'Commit derived title',
+        '/canonical/Current Path.md',
+        harness.artifactId,
+      )
+
+    prepared.commit()
+
+    expect(readDocument(harness.database, generation.id)).toEqual({
+      user_title_normalized: 'commit user title',
+      derived_title_normalized: 'commit derived title',
+      body_normalized: 'abc generation body '.repeat(20_000),
+      path_segments_normalized: 'canonical current path md',
+    })
+    harness.database.close()
+  })
+
   it('replaces a stale derived title with the source basename when the new source has no title', async () => {
     const harness = await makeHarness('/canonical/New Guide.md')
     harness.database

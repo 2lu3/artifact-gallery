@@ -4,17 +4,11 @@ import { Worker } from 'node:worker_threads'
 
 import { ArtifactProcessingError } from '../../shared/errors.js'
 
-export interface NormalizedSearchIndexFields {
-  readonly userTitle: string
-  readonly derivedTitle: string
+export interface NormalizedSearchIndexBody {
   readonly body: string
-  readonly pathSegments: string
 }
 
 interface NormalizationRequest {
-  readonly sourcePath: string
-  readonly userTitle: string
-  readonly derivedTitle: string
   readonly body: string
   readonly signal?: AbortSignal
 }
@@ -24,7 +18,7 @@ interface WorkerNormalizationRequest extends Omit<NormalizationRequest, 'signal'
 }
 
 type NormalizationWorkerMessage =
-  | { readonly id: number; readonly ok: true; readonly value: NormalizedSearchIndexFields }
+  | { readonly id: number; readonly ok: true; readonly value: NormalizedSearchIndexBody }
   | {
       readonly id: number
       readonly ok: false
@@ -34,7 +28,7 @@ type NormalizationWorkerMessage =
 interface PendingNormalization {
   readonly request: WorkerNormalizationRequest
   readonly signal?: AbortSignal
-  readonly resolve: (value: NormalizedSearchIndexFields) => void
+  readonly resolve: (value: NormalizedSearchIndexBody) => void
   readonly reject: (error: unknown) => void
   onAbort?: () => void
 }
@@ -56,10 +50,7 @@ parentPort.on('message', async (request) => {
       id: request.id,
       ok: true,
       value: {
-        userTitle: search.normalizeSearchText(request.userTitle),
-        derivedTitle: search.normalizeSearchText(request.derivedTitle),
         body: search.normalizeSearchText(request.body),
-        pathSegments: search.normalizePathSegments(request.sourcePath),
       },
     })
   } catch (error) {
@@ -87,16 +78,13 @@ class SearchIndexNormalizerPool {
     }))
   }
 
-  normalize(request: NormalizationRequest): Promise<NormalizedSearchIndexFields> {
+  normalize(request: NormalizationRequest): Promise<NormalizedSearchIndexBody> {
     if (request.signal?.aborted) return Promise.reject(this.#timeoutError(request.signal))
 
-    return new Promise<NormalizedSearchIndexFields>((resolve, reject) => {
+    return new Promise<NormalizedSearchIndexBody>((resolve, reject) => {
       const task: PendingNormalization = {
         request: {
           id: this.#nextId++,
-          sourcePath: request.sourcePath,
-          userTitle: request.userTitle,
-          derivedTitle: request.derivedTitle,
           body: request.body,
         },
         signal: request.signal,
@@ -225,8 +213,8 @@ class SearchIndexNormalizerPool {
 
 const normalizerPool = new SearchIndexNormalizerPool(2)
 
-export function normalizeSearchIndexFields(
+export function normalizeSearchIndexBody(
   request: NormalizationRequest,
-): Promise<NormalizedSearchIndexFields> {
+): Promise<NormalizedSearchIndexBody> {
   return normalizerPool.normalize(request)
 }
