@@ -29,7 +29,7 @@ export interface GenerationState {
 }
 
 export interface ArtifactErrorInput {
-  artifactId: number
+  artifactId: number | null
   generationId: number | null
   code: string
   stage: string

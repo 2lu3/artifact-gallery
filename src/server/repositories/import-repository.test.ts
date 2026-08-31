@@ -183,6 +183,79 @@ describe('ImportRepository', () => {
     database.close()
   })
 
+  it('rejects an artifact-owned error on an item without an artifact', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-import-'))
+    temporaryDirectories.push(directory)
+    const database = openDatabase({ filename: join(directory, 'gallery.sqlite') })
+    const imports = new ImportRepository(database)
+    const artifacts = new ArtifactRepository(database)
+    const now = '2026-08-31T00:00:00.000Z'
+    const artifact = artifacts.register({
+      sourcePath: '/canonical/owned.md',
+      format: 'markdown',
+      now,
+    })
+    const ownedErrorId = artifacts.recordError({
+      artifactId: artifact.id,
+      generationId: null,
+      code: 'MARKDOWN_PARSE_FAILED',
+      stage: 'extract',
+      retryable: true,
+      userMessage: 'The Markdown could not be read.',
+      technicalDetail: null,
+      occurredAt: now,
+    })
+    const run = imports.createRun(['/canonical/not-yet-registered.md'])
+    imports.startRun(run.id, now)
+    imports.startStage(run.itemIds[0], 'inspect', now)
+
+    expect(() => imports.failItem(run.itemIds[0], ownedErrorId, now)).toThrow()
+    expect(imports.getItem(run.itemIds[0])).toMatchObject({
+      artifactId: null,
+      errorId: null,
+      status: 'processing',
+      completedAt: null,
+    })
+
+    database.close()
+  })
+
+  it('persists an item-level error before an artifact is created', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-import-'))
+    temporaryDirectories.push(directory)
+    const database = openDatabase({ filename: join(directory, 'gallery.sqlite') })
+    const imports = new ImportRepository(database)
+    const artifacts = new ArtifactRepository(database)
+    const now = '2026-08-31T00:00:00.000Z'
+    const run = imports.createRun(['/outside/allowed-root.md'])
+    imports.startRun(run.id, now)
+    imports.startStage(run.itemIds[0], 'inspect', now)
+    const itemErrorId = artifacts.recordError({
+      artifactId: null,
+      generationId: null,
+      code: 'OUTSIDE_ALLOWED_ROOT',
+      stage: 'inspect',
+      retryable: false,
+      userMessage: 'The source is outside an allowed root.',
+      technicalDetail: '/outside/allowed-root.md',
+      occurredAt: now,
+    })
+
+    imports.failItem(run.itemIds[0], itemErrorId, now)
+
+    expect(imports.getItem(run.itemIds[0])).toMatchObject({
+      artifactId: null,
+      errorId: itemErrorId,
+      status: 'failed',
+      completedAt: now,
+    })
+    expect(
+      database.prepare('SELECT artifact_id FROM artifact_error WHERE id = ?').get(itemErrorId),
+    ).toEqual({ artifact_id: null })
+
+    database.close()
+  })
+
   it('rejects restart and terminal mutation of completed or interrupted jobs', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-import-'))
     temporaryDirectories.push(directory)

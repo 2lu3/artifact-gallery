@@ -34,7 +34,7 @@ CREATE TABLE artifact_generation (
 
 CREATE TABLE artifact_error (
   id INTEGER PRIMARY KEY,
-  artifact_id INTEGER NOT NULL REFERENCES artifact(id) ON DELETE CASCADE,
+  artifact_id INTEGER REFERENCES artifact(id) ON DELETE CASCADE,
   generation_id INTEGER,
   code TEXT NOT NULL,
   stage TEXT NOT NULL,
@@ -42,6 +42,7 @@ CREATE TABLE artifact_error (
   user_message TEXT NOT NULL,
   technical_detail TEXT,
   occurred_at TEXT NOT NULL,
+  CHECK (generation_id IS NULL OR artifact_id IS NOT NULL),
   UNIQUE (id, artifact_id),
   FOREIGN KEY (generation_id, artifact_id)
     REFERENCES artifact_generation(id, artifact_id) ON DELETE CASCADE
@@ -85,6 +86,30 @@ CREATE TABLE import_item (
   FOREIGN KEY (error_id, artifact_id)
     REFERENCES artifact_error(id, artifact_id)
 ) STRICT;
+
+CREATE TRIGGER import_item_error_owner_insert
+BEFORE INSERT ON import_item
+WHEN NEW.error_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM artifact_error
+    WHERE artifact_error.id = NEW.error_id
+      AND artifact_error.artifact_id IS NEW.artifact_id
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'import item error owner mismatch');
+END;
+
+CREATE TRIGGER import_item_error_owner_update
+BEFORE UPDATE OF error_id, artifact_id ON import_item
+WHEN NEW.error_id IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM artifact_error
+    WHERE artifact_error.id = NEW.error_id
+      AND artifact_error.artifact_id IS NEW.artifact_id
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'import item error owner mismatch');
+END;
 
 CREATE INDEX artifact_generation_artifact_id_idx ON artifact_generation (artifact_id);
 CREATE INDEX artifact_error_artifact_id_idx ON artifact_error (artifact_id);

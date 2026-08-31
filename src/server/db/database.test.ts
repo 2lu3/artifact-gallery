@@ -343,4 +343,61 @@ describe('openDatabase', () => {
 
     database.close()
   })
+
+  it('matches nullable import-item and error owners even through direct SQL', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-db-'))
+    temporaryDirectories.push(directory)
+    const database = openDatabase({ filename: join(directory, 'gallery.sqlite') })
+    const now = '2026-08-31T00:00:00.000Z'
+    const artifactId = Number(
+      database
+        .prepare(
+          `INSERT INTO artifact
+            (source_path, format, source_status, created_at, updated_at, registered_at)
+           VALUES ('/canonical/owned.md', 'markdown', 'available', ?, ?, ?)`,
+        )
+        .run(now, now, now).lastInsertRowid,
+    )
+    const insertError = database.prepare(
+      `INSERT INTO artifact_error
+        (artifact_id, generation_id, code, stage, retryable, user_message, occurred_at)
+       VALUES (?, NULL, 'OUTSIDE_ALLOWED_ROOT', 'inspect', 0, 'Outside root.', ?)`,
+    )
+    const ownedErrorId = Number(insertError.run(artifactId, now).lastInsertRowid)
+    const itemErrorId = Number(insertError.run(null, now).lastInsertRowid)
+    const runId = Number(
+      database.prepare("INSERT INTO import_run (status) VALUES ('running')").run().lastInsertRowid,
+    )
+    const insertItem = database.prepare(
+      `INSERT INTO import_item (run_id, canonical_path, stage, status)
+       VALUES (?, ?, 'inspect', 'processing')`,
+    )
+    const unlinkedItemId = Number(
+      insertItem.run(runId, '/canonical/not-registered.md').lastInsertRowid,
+    )
+    const itemErrorItemId = Number(
+      insertItem.run(runId, '/outside/allowed-root.md').lastInsertRowid,
+    )
+
+    expect(() =>
+      database
+        .prepare('UPDATE import_item SET error_id = ? WHERE id = ?')
+        .run(ownedErrorId, unlinkedItemId),
+    ).toThrow()
+    database
+      .prepare('UPDATE import_item SET error_id = ? WHERE id = ?')
+      .run(itemErrorId, itemErrorItemId)
+    expect(() =>
+      database
+        .prepare('UPDATE import_item SET artifact_id = ? WHERE id = ?')
+        .run(artifactId, itemErrorItemId),
+    ).toThrow()
+
+    expect(
+      database
+        .prepare('SELECT artifact_id, error_id FROM import_item WHERE id = ?')
+        .get(itemErrorItemId),
+    ).toEqual({ artifact_id: null, error_id: itemErrorId })
+    database.close()
+  })
 })

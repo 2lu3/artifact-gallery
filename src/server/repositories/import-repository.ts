@@ -130,9 +130,15 @@ export class ImportRepository {
       .prepare(
         `UPDATE import_item
          SET status = 'failed', error_id = ?, completed_at = ?
-         WHERE id = ? AND status = 'processing'`,
+         WHERE id = ?
+           AND status = 'processing'
+           AND EXISTS (
+             SELECT 1 FROM artifact_error
+             WHERE artifact_error.id = ?
+               AND artifact_error.artifact_id IS import_item.artifact_id
+           )`,
       )
-      .run(errorId, completedAt, itemId)
+      .run(errorId, completedAt, itemId, errorId)
     requireTransition(result.changes, 'item', itemId, 'fail')
   }
 

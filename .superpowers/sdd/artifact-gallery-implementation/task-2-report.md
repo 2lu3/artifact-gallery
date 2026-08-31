@@ -241,3 +241,90 @@ tsc --project tsconfig.server.json            exit 0
 - `InvalidImportTransitionError` intentionally does not distinguish an unknown
   ID from a known row in the wrong state; callers receive one safe transition
   failure while repository internals avoid an extra race-prone read.
+
+## Fix round 2/5
+
+### Files changed
+
+- Updated `migrations/001_initial.sql` so `artifact_error.artifact_id` can be
+  NULL for pre-artifact item errors, while generation-owned errors still require
+  an artifact owner.
+- Added migration triggers that require nullable `import_item.artifact_id` and
+  `artifact_error.artifact_id` owners to match with SQLite `IS` semantics on
+  both INSERT and owner-column UPDATE.
+- Updated `ArtifactErrorInput` to represent item-level errors with a NULL owner.
+- Updated `ImportRepository.failItem` to perform the same NULL-safe owner check
+  inside its single conditional UPDATE.
+- Added focused repository and direct-SQL migration regression tests.
+
+### RED evidence
+
+1. **Unlinked item with artifact-owned error**
+   - Test: `src/server/repositories/import-repository.test.ts` —
+     `rejects an artifact-owned error on an item without an artifact`.
+   - Command:
+     `pnpm test src/server/repositories/import-repository.test.ts -t "without an artifact"`.
+   - RED: `failItem` did not throw because SQLite skipped the composite FK when
+     `import_item.artifact_id` was NULL; 1 failed, 6 skipped.
+2. **Legal pre-artifact item-level error**
+   - Test: `src/server/repositories/import-repository.test.ts` —
+     `persists an item-level error before an artifact is created`.
+   - Command:
+     `pnpm test src/server/repositories/import-repository.test.ts -t "item-level error"`.
+   - RED: insertion failed with
+     `NOT NULL constraint failed: artifact_error.artifact_id`; 1 failed, 7 skipped.
+3. **Direct SQL nullable-owner invariant**
+   - Test: `src/server/db/database.test.ts` —
+     `matches nullable import-item and error owners even through direct SQL`.
+   - Command:
+     `pnpm test src/server/db/database.test.ts -t "nullable import-item"`.
+   - RED: direct SQL linked an artifact-owned error to a NULL-owner item without
+     throwing; 1 failed, 5 skipped.
+
+### GREEN evidence
+
+- Repository NULL-owner tests:
+  `pnpm test src/server/repositories/import-repository.test.ts -t "without an artifact|item-level error"`
+  passed 2/2.
+- Direct SQL migration test:
+  `pnpm test src/server/db/database.test.ts -t "nullable import-item"`
+  passed 1/1.
+- Combined changed suites:
+  `pnpm test src/server/db/database.test.ts src/server/repositories/artifact-repository.test.ts src/server/repositories/import-repository.test.ts`
+  passed 19/19 tests across 3 files.
+
+### Full verification
+
+The required command was rerun after the migration trigger and final self-review:
+
+```text
+git diff --check && pnpm lint && pnpm typecheck && pnpm test && pnpm build
+
+git diff --check                              exit 0
+eslint .                                      exit 0
+tsc --noEmit                                  exit 0
+Test Files  6 passed (6)
+Tests       22 passed (22)
+vite build                                   15 modules transformed, exit 0
+tsc --project tsconfig.server.json            exit 0
+```
+
+### Self-review
+
+- An import item may link an error only when both owners are the same artifact
+  ID or both are NULL. SQLite `IS` supplies the required NULL-equality semantics.
+- The invariant is enforced at three layers: the existing composite FK for
+  non-NULL owners, INSERT/UPDATE migration triggers for direct SQL, and the
+  repository's atomic conditional UPDATE.
+- A NULL-owner error cannot reference a generation because
+  `generation_id IS NULL OR artifact_id IS NOT NULL` is a schema CHECK.
+- Pre-registration path/enumeration errors remain representable as a NULL-owner
+  `artifact_error` linked to a NULL-owner `import_item`.
+
+### Commit hash
+
+`PENDING`
+
+### Concerns
+
+- None specific to this fix round.
