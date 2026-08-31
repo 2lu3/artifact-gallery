@@ -87,6 +87,12 @@ interface DirectorySnapshot {
   readonly inode: number;
 }
 
+interface FileSnapshot {
+  readonly canonicalPath: string;
+  readonly deviceId: number;
+  readonly inode: number;
+}
+
 export class PathPolicy {
   private constructor(private readonly allowedRoots: readonly AllowedRoot[]) {}
 
@@ -126,15 +132,18 @@ export class PathPolicy {
   }
 
   async authorizeAsset(requestedPath: string): Promise<AuthorizedAsset> {
-    const canonicalPath = await this.validateReadableFile(requestedPath);
+    const { canonicalPath } = await this.validateReadableFileSnapshot(requestedPath);
     return {
       canonicalPath,
       mimeType: mimeTypeFor(canonicalPath),
       read: (maxBytes) =>
         normalizeFilesystemOperation(requestedPath, async () =>
-          maxBytes === undefined
-            ? readFile(await this.validateReadableFile(requestedPath))
-            : readFileBounded(await this.validateReadableFile(requestedPath), maxBytes),
+          readAssetFile(
+            await this.validateReadableFileSnapshot(requestedPath),
+            requestedPath,
+            () => this.validateReadableFileSnapshot(requestedPath),
+            maxBytes,
+          ),
         ),
     };
   }
@@ -231,16 +240,25 @@ export class PathPolicy {
   }
 
   private async validateReadableFile(requestedPath: string): Promise<string> {
+    return (await this.validateReadableFileSnapshot(requestedPath)).canonicalPath;
+  }
+
+  private async validateReadableFileSnapshot(requestedPath: string): Promise<FileSnapshot> {
     const canonicalPath = await this.validateExistingPath(requestedPath);
     try {
-      if (!(await stat(canonicalPath)).isFile()) {
+      const status = await stat(canonicalPath);
+      if (!status.isFile()) {
         throw new PathPolicyError('UNREADABLE_SOURCE', requestedPath);
       }
       await access(canonicalPath, constants.R_OK);
+      return {
+        canonicalPath,
+        deviceId: status.dev,
+        inode: status.ino,
+      };
     } catch (error) {
       throw classifyFilesystemError(error, requestedPath);
     }
-    return canonicalPath;
   }
 
   private async validateDirectory(requestedPath: string): Promise<DirectorySnapshot> {
@@ -369,13 +387,37 @@ async function normalizeFilesystemOperation<T>(
   }
 }
 
-async function readFileBounded(sourcePath: string, maxBytes: number): Promise<Buffer> {
-  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+async function readAssetFile(
+  snapshot: FileSnapshot,
+  requestedPath: string,
+  revalidate: () => Promise<FileSnapshot>,
+  maxBytes?: number,
+): Promise<Buffer> {
+  if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0)) {
     throw new AssetReadLimitError(maxBytes);
   }
-  const handle = await open(sourcePath, 'r');
+  const noFollowFlag = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0;
+  const handle = await open(snapshot.canonicalPath, constants.O_RDONLY | noFollowFlag);
   try {
     const status = await handle.stat();
+    if (
+      !status.isFile() ||
+      status.dev !== snapshot.deviceId ||
+      status.ino !== snapshot.inode
+    ) {
+      throw new PathPolicyError('UNREADABLE_SOURCE', requestedPath);
+    }
+    const verifiedSnapshot = await revalidate();
+    if (
+      verifiedSnapshot.canonicalPath !== snapshot.canonicalPath ||
+      status.dev !== verifiedSnapshot.deviceId ||
+      status.ino !== verifiedSnapshot.inode
+    ) {
+      throw new PathPolicyError('UNREADABLE_SOURCE', requestedPath);
+    }
+    if (maxBytes === undefined) {
+      return await handle.readFile();
+    }
     if (status.size > maxBytes) {
       throw new AssetReadLimitError(maxBytes);
     }

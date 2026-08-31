@@ -757,6 +757,104 @@ describe('HTML isolation', () => {
     },
     5_000,
   );
+
+  test(
+    'releases both limiter slots when clearPermissions never settles',
+    async () => {
+      const root = await makeTemporaryDirectory();
+      const sourcePath = join(root, 'artifact.html');
+      await writeFile(sourcePath, '<h1>source</h1>');
+      const policy = await PathPolicy.create([root]);
+      const firstTwoPermissionsStarted = deferred<void>();
+      let permissionsStarted = 0;
+      let contextCount = 0;
+      let actualBrowser: Browser | undefined;
+      const renderer = new HtmlRenderer(policy, {
+        renderTimeoutMs: 750,
+        launchBrowser: async () => {
+          actualBrowser = await chromium.launch({ headless: true });
+          return proxyBrowserNewContext(actualBrowser, async (options) => {
+            const context = await actualBrowser?.newContext(options);
+            if (!context) throw new Error('Browser context was not created');
+            contextCount += 1;
+            if (contextCount > 2) return context;
+            return proxyContextClearPermissions(context, () => {
+              permissionsStarted += 1;
+              if (permissionsStarted === 2) firstTwoPermissionsStarted.resolve();
+              return new Promise<void>(() => undefined);
+            });
+          });
+        },
+      });
+      renderers.push(renderer);
+      const stalled = [1, 2].map((attempt) =>
+        renderer
+          .render({ sourcePath, html: `<h1>Stalled ${attempt}</h1>` })
+          .then(() => ({ code: 'RENDERED' }), (error: unknown) => error),
+      );
+
+      await firstTwoPermissionsStarted.promise;
+      await expect(Promise.all(stalled)).resolves.toEqual([
+        expect.objectContaining({ code: 'TIMEOUT' }),
+        expect.objectContaining({ code: 'TIMEOUT' }),
+      ]);
+      await expect(renderer.render({ sourcePath, html: '<h1>Third</h1>' })).resolves.toMatchObject({
+        width: 1200,
+      });
+      expect(actualBrowser?.contexts()).toHaveLength(0);
+    },
+    5_000,
+  );
+
+  test(
+    'releases both limiter slots when route asset reads never settle',
+    async () => {
+      const root = await makeTemporaryDirectory();
+      const sourcePath = join(root, 'artifact.html');
+      const assetPath = join(root, 'stalled.css');
+      await writeFile(sourcePath, '<h1>source</h1>');
+      await writeFile(assetPath, 'body { color: purple; }');
+      const realPolicy = await PathPolicy.create([root]);
+      const firstTwoReadsStarted = deferred<void>();
+      let readsStarted = 0;
+      const renderer = new HtmlRenderer(
+        {
+          authorizeAsset: async (requestedPath) => {
+            const asset = await realPolicy.authorizeAsset(requestedPath);
+            return {
+              canonicalPath: asset.canonicalPath,
+              mimeType: asset.mimeType,
+              read: () => {
+                readsStarted += 1;
+                if (readsStarted === 2) firstTwoReadsStarted.resolve();
+                return new Promise<Buffer>(() => undefined);
+              },
+            };
+          },
+        },
+        { renderTimeoutMs: 750 },
+      );
+      renderers.push(renderer);
+      const stalled = [1, 2].map((attempt) =>
+        renderer
+          .render({
+            sourcePath,
+            html: `<link rel="stylesheet" href="./stalled.css?attempt=${attempt}">`,
+          })
+          .then(() => ({ code: 'RENDERED' }), (error: unknown) => error),
+      );
+
+      await firstTwoReadsStarted.promise;
+      await expect(Promise.all(stalled)).resolves.toEqual([
+        expect.objectContaining({ code: 'TIMEOUT' }),
+        expect.objectContaining({ code: 'TIMEOUT' }),
+      ]);
+      await expect(renderer.render({ sourcePath, html: '<h1>Third</h1>' })).resolves.toMatchObject({
+        width: 1200,
+      });
+    },
+    5_000,
+  );
 });
 
 async function makeTemporaryDirectory(): Promise<string> {

@@ -341,19 +341,23 @@ export class HtmlRenderer {
     signal: AbortSignal,
     handle: RenderAttemptHandle,
   ): Promise<BrowserContext> {
-    const browser = await this.ensureBrowser();
+    const browser = await this.awaitAttempt(this.ensureBrowser(), signal);
     this.assertAttemptActive(signal);
     let context: BrowserContext | undefined;
     try {
-      context = await browser.newContext({
-        acceptDownloads: false,
-        javaScriptEnabled: false,
-        serviceWorkers: 'block',
-        viewport: { width: SCREENSHOT_WIDTH, height: 800 },
-      });
+      context = await this.awaitAttempt(
+        browser.newContext({
+          acceptDownloads: false,
+          javaScriptEnabled: false,
+          serviceWorkers: 'block',
+          viewport: { width: SCREENSHOT_WIDTH, height: 800 },
+        }),
+        signal,
+        (lateContext) => lateContext.close(),
+      );
       handle.context = context;
       this.assertAttemptActive(signal);
-      await context.clearPermissions();
+      await this.awaitAttempt(context.clearPermissions(), signal);
       this.assertAttemptActive(signal);
       return context;
     } catch (error) {
@@ -365,6 +369,40 @@ export class HtmlRenderer {
 
   private assertAttemptActive(signal: AbortSignal): void {
     if (signal.aborted) throw new HtmlRenderError('TIMEOUT');
+  }
+
+  private awaitAttempt<T>(
+    operation: Promise<T>,
+    signal: AbortSignal,
+    disposeLateResult?: (value: T) => Promise<unknown>,
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        reject(new HtmlRenderError('TIMEOUT'));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+      void operation.then(
+        (value) => {
+          if (settled) {
+            void disposeLateResult?.(value).catch(() => undefined);
+            return;
+          }
+          settled = true;
+          signal.removeEventListener('abort', onAbort);
+          resolve(value);
+        },
+        (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener('abort', onAbort);
+          reject(error);
+        },
+      );
+    });
   }
 
   private async ensureBrowser(): Promise<Browser> {

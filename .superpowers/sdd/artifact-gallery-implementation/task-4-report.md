@@ -158,3 +158,58 @@ tsc --project tsconfig.server.json: passed
 ```
 
 Round 1 fix and report are committed together in the follow-up commit.
+
+## Round 2 FD identity and timeout availability follow-up
+
+### Asset descriptor binding
+
+Focused RED tests synchronized real filesystem replacements at the `open()`/`stat()` syscall boundary. Before the fix, both a final-file symlink replacement and a parent-directory rename-to-symlink replacement returned the literal outside payload `outside-secret`. A further RED test showed that replacement after `realpath()` but before the pre-open `stat()` could cause the outside inode itself to be treated as the initial snapshot.
+
+The asset capability now:
+
+- records the validated canonical target's device and inode;
+- opens with numeric `O_RDONLY | O_NOFOLLOW` when the platform exposes `O_NOFOLLOW` (including macOS);
+- uses `fstat()` on the resulting descriptor and rejects non-regular files or device/inode mismatch;
+- re-runs the existing symlink/containment/readability validation after opening and compares that snapshot to the same descriptor;
+- applies the size precheck and `limit + 1` bounded loop to that descriptor; and
+- reads both bounded and unbounded asset bodies only from the already-verified descriptor.
+
+The identity and post-open containment checks remain active even on a platform without `O_NOFOLLOW`, providing the portability fallback. No outside bytes are read before all checks pass.
+
+### Limiter availability after timeout
+
+The focused RED test started two real Chromium contexts whose `clearPermissions()` promises never settle. Both public renders returned `TIMEOUT`, but the third render also timed out because the two internal attempts retained both limiter slots.
+
+Context setup now races renderer-owned browser launch, context creation, and permission clearing against the attempt's abort signal. Abort settles the renderer-owned wait without assuming the dependency promise can be cancelled. A context returned after abort is still closed through the late-result disposer, and an already-created context is closed by the setup failure path before its limiter slot is released. The GREEN regression observes a successful third render and zero live contexts after the two permanently pending permission calls.
+
+A companion real-Chromium characterization confirms that two permanently pending route asset reads already release their limiter slots when timeout-driven context closure settles the owning `setContent()` operation; a third render succeeds. No cancellation behavior is assumed for either dependency promise.
+
+### Round 2 verification
+
+Focused security verification:
+
+```text
+pnpm exec vitest run tests/security/path-policy.test.ts tests/security/html-isolation.test.ts
+Test Files  2 passed (2)
+Tests       66 passed (66)
+```
+
+Binding full verification:
+
+```text
+pnpm lint
+passed
+
+pnpm typecheck
+passed
+
+pnpm test
+Test Files  8 passed (8)
+Tests       91 passed (91)
+
+pnpm build
+vite build: passed
+tsc --project tsconfig.server.json: passed
+```
+
+Round 2 fix and report are committed together in the follow-up commit.

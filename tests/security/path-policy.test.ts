@@ -12,28 +12,41 @@ import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 
-const readFileFault = vi.hoisted(() => ({
-  path: undefined as string | undefined,
-  beforeRead: undefined as (() => Promise<void>) | undefined,
-}));
 const readDirectoryFault = vi.hoisted(() => ({
   path: undefined as string | undefined,
   beforeRead: undefined as (() => Promise<void>) | undefined,
   afterRead: undefined as (() => Promise<void>) | undefined,
+}));
+const openFileFault = vi.hoisted(() => ({
+  path: undefined as string | undefined,
+  beforeOpen: undefined as (() => Promise<void>) | undefined,
+}));
+const statFileFault = vi.hoisted(() => ({
+  path: undefined as string | undefined,
+  beforeStat: undefined as (() => Promise<void>) | undefined,
 }));
 
 vi.mock('node:fs/promises', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs/promises')>();
   return {
     ...actual,
-    readFile: async (...args: Parameters<typeof actual.readFile>) => {
-      if (String(args[0]) === readFileFault.path) {
-        const beforeRead = readFileFault.beforeRead;
-        readFileFault.path = undefined;
-        readFileFault.beforeRead = undefined;
-        await beforeRead?.();
+    open: async (...args: Parameters<typeof actual.open>) => {
+      if (String(args[0]) === openFileFault.path) {
+        const beforeOpen = openFileFault.beforeOpen;
+        openFileFault.path = undefined;
+        openFileFault.beforeOpen = undefined;
+        await beforeOpen?.();
       }
-      return Reflect.apply(actual.readFile, actual, args);
+      return Reflect.apply(actual.open, actual, args);
+    },
+    stat: async (...args: Parameters<typeof actual.stat>) => {
+      if (String(args[0]) === statFileFault.path) {
+        const beforeStat = statFileFault.beforeStat;
+        statFileFault.path = undefined;
+        statFileFault.beforeStat = undefined;
+        await beforeStat?.();
+      }
+      return Reflect.apply(actual.stat, actual, args);
     },
     readdir: async (...args: Parameters<typeof actual.readdir>) => {
       const matchesFault = String(args[0]) === readDirectoryFault.path;
@@ -63,11 +76,13 @@ async function makeTemporaryDirectory(): Promise<string> {
 }
 
 afterEach(async () => {
-  readFileFault.path = undefined;
-  readFileFault.beforeRead = undefined;
   readDirectoryFault.path = undefined;
   readDirectoryFault.beforeRead = undefined;
   readDirectoryFault.afterRead = undefined;
+  openFileFault.path = undefined;
+  openFileFault.beforeOpen = undefined;
+  statFileFault.path = undefined;
+  statFileFault.beforeStat = undefined;
   await Promise.all(
     temporaryDirectories.splice(0).map((directory) =>
       rm(directory, { recursive: true, force: true }),
@@ -442,14 +457,80 @@ describe('PathPolicy', () => {
     });
   });
 
+  test('does not follow a final symlink installed immediately before bounded open', async () => {
+    const root = await makeTemporaryDirectory();
+    const outside = await makeTemporaryDirectory();
+    const source = join(root, 'replaceable.png');
+    const outsideSource = join(outside, 'outside.png');
+    await writeFile(source, Buffer.from('inside'));
+    await writeFile(outsideSource, Buffer.from('outside-secret'));
+    const policy = await PathPolicy.create([root]);
+    const asset = await policy.authorizeAsset(source);
+    openFileFault.path = asset.canonicalPath;
+    openFileFault.beforeOpen = async () => {
+      await rm(source);
+      await symlink(outsideSource, source, 'file');
+    };
+
+    await expect(asset.read(1024)).rejects.toMatchObject({
+      name: 'PathPolicyError',
+    });
+  });
+
+  test('rejects a parent component replacement by comparing the bounded FD identity', async () => {
+    const root = await makeTemporaryDirectory();
+    const outside = await makeTemporaryDirectory();
+    const nested = join(root, 'nested');
+    const parked = join(root, 'parked');
+    const source = join(nested, 'asset.png');
+    const outsideSource = join(outside, 'asset.png');
+    await mkdir(nested);
+    await writeFile(source, Buffer.from('inside'));
+    await writeFile(outsideSource, Buffer.from('outside-secret'));
+    const policy = await PathPolicy.create([root]);
+    const asset = await policy.authorizeAsset(source);
+    openFileFault.path = asset.canonicalPath;
+    openFileFault.beforeOpen = async () => {
+      await rename(nested, parked);
+      await symlink(outside, nested, 'dir');
+    };
+
+    await expect(asset.read(1024)).rejects.toMatchObject({
+      name: 'PathPolicyError',
+    });
+  });
+
+  test('revalidates parent containment after opening the bounded asset FD', async () => {
+    const root = await makeTemporaryDirectory();
+    const outside = await makeTemporaryDirectory();
+    const nested = join(root, 'nested');
+    const parked = join(root, 'parked');
+    const source = join(nested, 'asset.png');
+    const outsideSource = join(outside, 'asset.png');
+    await mkdir(nested);
+    await writeFile(source, Buffer.from('inside'));
+    await writeFile(outsideSource, Buffer.from('outside-secret'));
+    const policy = await PathPolicy.create([root]);
+    const asset = await policy.authorizeAsset(source);
+    statFileFault.path = asset.canonicalPath;
+    statFileFault.beforeStat = async () => {
+      await rename(nested, parked);
+      await symlink(outside, nested, 'dir');
+    };
+
+    await expect(asset.read(1024)).rejects.toMatchObject({
+      name: 'PathPolicyError',
+    });
+  });
+
   test('normalizes disappearance after validation but before the read syscall', async () => {
     const root = await makeTemporaryDirectory();
     const source = join(root, 'vanishing.png');
     await writeFile(source, Buffer.from('vanishing'));
     const policy = await PathPolicy.create([root]);
     const asset = await policy.authorizeAsset(source);
-    readFileFault.path = asset.canonicalPath;
-    readFileFault.beforeRead = () => rm(source);
+    openFileFault.path = asset.canonicalPath;
+    openFileFault.beforeOpen = () => rm(source);
 
     await expect(asset.read()).rejects.toMatchObject({
       name: 'PathPolicyError',
@@ -464,8 +545,8 @@ describe('PathPolicy', () => {
     await writeFile(source, Buffer.from('unreadable'));
     const policy = await PathPolicy.create([root]);
     const asset = await policy.authorizeAsset(source);
-    readFileFault.path = asset.canonicalPath;
-    readFileFault.beforeRead = () => chmod(source, 0o000);
+    openFileFault.path = asset.canonicalPath;
+    openFileFault.beforeOpen = () => chmod(source, 0o000);
 
     try {
       await expect(asset.read()).rejects.toMatchObject({
