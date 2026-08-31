@@ -139,4 +139,138 @@ describe('ImportRepository', () => {
 
     database.close()
   })
+
+  it('rejects an item failure owned by another artifact', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-import-'))
+    temporaryDirectories.push(directory)
+    const database = openDatabase({ filename: join(directory, 'gallery.sqlite') })
+    const imports = new ImportRepository(database)
+    const artifacts = new ArtifactRepository(database)
+    const now = '2026-08-31T00:00:00.000Z'
+    const first = artifacts.register({
+      sourcePath: '/canonical/first.md',
+      format: 'markdown',
+      now,
+    })
+    const second = artifacts.register({
+      sourcePath: '/canonical/second.md',
+      format: 'markdown',
+      now,
+    })
+    const run = imports.createRun(['/canonical/first.md'])
+    imports.startRun(run.id, now)
+    imports.attachArtifact(run.itemIds[0], first.id)
+    imports.startStage(run.itemIds[0], 'extract', now)
+    const foreignErrorId = artifacts.recordError({
+      artifactId: second.id,
+      generationId: null,
+      code: 'MARKDOWN_PARSE_FAILED',
+      stage: 'extract',
+      retryable: true,
+      userMessage: 'The Markdown could not be read.',
+      technicalDetail: null,
+      occurredAt: now,
+    })
+
+    expect(() => imports.failItem(run.itemIds[0], foreignErrorId, now)).toThrow()
+    expect(imports.getItem(run.itemIds[0])).toMatchObject({
+      artifactId: first.id,
+      errorId: null,
+      status: 'processing',
+      completedAt: null,
+    })
+
+    database.close()
+  })
+
+  it('rejects restart and terminal mutation of completed or interrupted jobs', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-import-'))
+    temporaryDirectories.push(directory)
+    const database = openDatabase({ filename: join(directory, 'gallery.sqlite') })
+    const imports = new ImportRepository(database)
+    const artifacts = new ArtifactRepository(database)
+    const now = '2026-08-31T00:00:00.000Z'
+    const artifact = artifacts.register({
+      sourcePath: '/canonical/completed.md',
+      format: 'markdown',
+      now,
+    })
+    const completed = imports.createRun(['/canonical/completed.md'])
+    imports.startRun(completed.id, now)
+    imports.attachArtifact(completed.itemIds[0], artifact.id)
+    imports.startStage(completed.itemIds[0], 'extract', now)
+    const errorId = artifacts.recordError({
+      artifactId: artifact.id,
+      generationId: null,
+      code: 'MARKDOWN_PARSE_FAILED',
+      stage: 'extract',
+      retryable: true,
+      userMessage: 'The Markdown could not be read.',
+      technicalDetail: null,
+      occurredAt: now,
+    })
+    imports.completeItem(completed.itemIds[0], now)
+    imports.completeRun(completed.id, now)
+
+    expect(() => imports.startRun(completed.id, now)).toThrow(/import run transition/i)
+    expect(() => imports.requestCancellation(completed.id, now)).toThrow(/import run transition/i)
+    expect(() => imports.cancelRun(completed.id, now)).toThrow(/import run transition/i)
+    expect(() => imports.completeRun(completed.id, now)).toThrow(/import run transition/i)
+    expect(() => imports.attachArtifact(completed.itemIds[0], artifact.id)).toThrow(
+      /import item transition/i,
+    )
+    expect(() => imports.failItem(completed.itemIds[0], errorId, now)).toThrow(
+      /import item transition/i,
+    )
+    expect(() => imports.cancelItem(completed.itemIds[0], now)).toThrow(/import item transition/i)
+    expect(() => imports.completeItem(completed.itemIds[0], now)).toThrow(
+      /import item transition/i,
+    )
+
+    const interrupted = imports.createRun(['/canonical/interrupted.md'])
+    database
+      .prepare("UPDATE import_run SET status = 'interrupted' WHERE id = ?")
+      .run(interrupted.id)
+    database
+      .prepare("UPDATE import_item SET status = 'interrupted' WHERE id = ?")
+      .run(interrupted.itemIds[0])
+    expect(() => imports.startRun(interrupted.id, now)).toThrow(/import run transition/i)
+    expect(() => imports.cancelRun(interrupted.id, now)).toThrow(/import run transition/i)
+    expect(() => imports.completeItem(interrupted.itemIds[0], now)).toThrow(
+      /import item transition/i,
+    )
+
+    database.close()
+  })
+
+  it('reports unknown import run and item IDs instead of silently succeeding', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-import-'))
+    temporaryDirectories.push(directory)
+    const database = openDatabase({ filename: join(directory, 'gallery.sqlite') })
+    const repository = new ImportRepository(database)
+    const now = '2026-08-31T00:00:00.000Z'
+
+    const runMutations = [
+      () => repository.startRun(999, now),
+      () => repository.requestCancellation(999, now),
+      () => repository.cancelRun(999, now),
+      () => repository.completeRun(999, now),
+    ]
+    for (const mutate of runMutations) {
+      expect(mutate).toThrow(/import run transition/i)
+    }
+
+    const itemMutations = [
+      () => repository.attachArtifact(999, 999),
+      () => repository.failItem(999, 999, now),
+      () => repository.cancelItem(999, now),
+      () => repository.completeItem(999, now),
+    ]
+    for (const mutate of itemMutations) {
+      expect(mutate).toThrow(/import item transition/i)
+    }
+    expect(repository.startStage(999, 'inspect', now)).toBe(false)
+
+    database.close()
+  })
 })

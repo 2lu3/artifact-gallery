@@ -141,3 +141,103 @@ Tests       13 passed (13)
 - Import run/item status domains were closed around the lifecycle required by
   this task (`queued/running/...` and `queued/processing/...`); future lifecycle
   expansion must use a migration rather than inserting ad-hoc status strings.
+
+## Fix round 1/5
+
+### Files changed
+
+- Updated `src/server/repositories/artifact-repository.ts` so an all-failed
+  generation is committed as durable history without replacing the prior active
+  successful generation.
+- Updated `migrations/001_initial.sql` with composite owner foreign keys for
+  artifact active generations, error/warning generations, and import-item errors.
+- Updated `src/server/repositories/import-repository.ts` with guarded from-state
+  transitions and explicit `InvalidImportTransitionError` failures for zero-row
+  run/item mutations.
+- Extended `database.test.ts`, `artifact-repository.test.ts`, and
+  `import-repository.test.ts` with regression coverage for all three findings.
+
+### RED evidence
+
+1. **All-failed generation fallback**
+   - Focused test:
+     `src/server/repositories/artifact-repository.test.ts` —
+     `keeps the prior active generation when a new generation has no ready derivative`.
+   - Command:
+     `pnpm test src/server/repositories/artifact-repository.test.ts -t "keeps the prior active generation"`.
+   - RED: expected `active_generation_id: 1`, received
+     `active_generation_id: 2`; 1 failed, 4 skipped.
+2. **Cross-artifact ownership**
+   - Focused migration test:
+     `src/server/db/database.test.ts` —
+     `rejects cross-artifact generation and issue associations`.
+   - Command:
+     `pnpm test src/server/db/database.test.ts -t "rejects cross-artifact"`.
+   - RED: updating artifact A to generation B did not throw; 1 failed, 4 skipped.
+   - Focused repository test:
+     `src/server/repositories/import-repository.test.ts` —
+     `rejects an item failure owned by another artifact`.
+   - Command:
+     `pnpm test src/server/repositories/import-repository.test.ts -t "owned by another artifact"`.
+   - RED: linking artifact A's item to artifact B's error did not throw; 1 failed,
+     3 skipped.
+3. **Import transition guards and unknown IDs**
+   - Focused tests:
+     `rejects restart and terminal mutation of completed or interrupted jobs` and
+     `reports unknown import run and item IDs instead of silently succeeding` in
+     `src/server/repositories/import-repository.test.ts`.
+   - Command:
+     `pnpm test src/server/repositories/import-repository.test.ts -t "rejects restart and terminal mutation|reports unknown"`.
+   - RED: both tests observed void success instead of an explicit transition
+     failure; 2 failed, 4 skipped.
+
+### GREEN evidence
+
+- All-failed fallback focused test: 1/1 passed.
+- Cross-artifact migration focused test: 1/1 passed.
+- Cross-artifact import repository focused test: 1/1 passed.
+- Import terminal/unknown-ID focused tests: 2/2 passed.
+- Combined changed suites:
+  `pnpm test src/server/db/database.test.ts src/server/repositories/artifact-repository.test.ts src/server/repositories/import-repository.test.ts`
+  passed 16/16 tests across 3 files.
+
+### Full verification
+
+The required command was rerun after the fixes and self-review:
+
+```text
+git diff --check && pnpm lint && pnpm typecheck && pnpm test && pnpm build
+
+git diff --check                              exit 0
+eslint .                                      exit 0
+tsc --noEmit                                  exit 0
+Test Files  6 passed (6)
+Tests       19 passed (19)
+vite build                                   15 modules transformed, exit 0
+tsc --project tsconfig.server.json            exit 0
+```
+
+### Self-review
+
+- `commitGeneration` still validates the generation counter and commits the
+  failed generation atomically, but only changes `active_generation_id` when at
+  least one derived result is ready.
+- Composite foreign keys use `(id, artifact_id)` parent keys, so existence alone
+  is insufficient: active generations, issue generations, and import errors must
+  have the same artifact owner as their child row.
+- Run transitions now permit only `queued -> running`, active -> cancelled, and
+  `running -> completed`. Item terminal transitions require an active item;
+  completed/interrupted records cannot be reopened or overwritten.
+- All void mutation methods validate exactly one updated row and throw
+  `InvalidImportTransitionError` for both invalid from-state and unknown IDs.
+  `startStage` retains its existing explicit boolean failure contract.
+
+### Commit hash
+
+`PENDING`
+
+### Concerns
+
+- `InvalidImportTransitionError` intentionally does not distinguish an unknown
+  ID from a known row in the wrong state; callers receive one safe transition
+  failure while repository internals avoid an extra race-prone read.

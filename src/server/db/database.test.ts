@@ -268,4 +268,79 @@ describe('openDatabase', () => {
 
     database.close()
   })
+
+  it('rejects cross-artifact generation and issue associations', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-db-'))
+    temporaryDirectories.push(directory)
+    const database = openDatabase({ filename: join(directory, 'gallery.sqlite') })
+    const now = '2026-08-31T00:00:00.000Z'
+    const insertArtifact = database.prepare(
+      `INSERT INTO artifact
+        (source_path, format, source_status, created_at, updated_at, registered_at)
+       VALUES (?, 'markdown', 'available', ?, ?, ?)`,
+    )
+    const firstArtifactId = Number(
+      insertArtifact.run('/canonical/first.md', now, now, now).lastInsertRowid,
+    )
+    const secondArtifactId = Number(
+      insertArtifact.run('/canonical/second.md', now, now, now).lastInsertRowid,
+    )
+    const insertGeneration = database.prepare(
+      `INSERT INTO artifact_generation
+        (artifact_id, generation, job_status, content_status, render_status, index_status)
+       VALUES (?, 1, 'idle', 'ready', 'ready', 'ready')`,
+    )
+    insertGeneration.run(firstArtifactId)
+    const secondGenerationId = Number(insertGeneration.run(secondArtifactId).lastInsertRowid)
+
+    expect(() =>
+      database
+        .prepare('UPDATE artifact SET active_generation_id = ? WHERE id = ?')
+        .run(secondGenerationId, firstArtifactId),
+    ).toThrow()
+    expect(() =>
+      database
+        .prepare(
+          `INSERT INTO artifact_error
+            (artifact_id, generation_id, code, stage, retryable, user_message, occurred_at)
+           VALUES (?, ?, 'INTERRUPTED', 'render', 1, 'Interrupted.', ?)`,
+        )
+        .run(firstArtifactId, secondGenerationId, now),
+    ).toThrow()
+    expect(() =>
+      database
+        .prepare(
+          `INSERT INTO artifact_warning
+            (artifact_id, generation_id, code, detail, occurred_at)
+           VALUES (?, ?, 'PAGE_CLIPPED', 'Clipped.', ?)`,
+        )
+        .run(firstArtifactId, secondGenerationId, now),
+    ).toThrow()
+
+    const secondErrorId = Number(
+      database
+        .prepare(
+          `INSERT INTO artifact_error
+            (artifact_id, generation_id, code, stage, retryable, user_message, occurred_at)
+           VALUES (?, ?, 'INTERRUPTED', 'render', 1, 'Interrupted.', ?)`,
+        )
+        .run(secondArtifactId, secondGenerationId, now).lastInsertRowid,
+    )
+    const runId = Number(
+      database.prepare("INSERT INTO import_run (status) VALUES ('running')").run().lastInsertRowid,
+    )
+    const itemId = Number(
+      database
+        .prepare(
+          `INSERT INTO import_item (run_id, canonical_path, artifact_id, stage, status)
+           VALUES (?, '/canonical/first.md', ?, 'render', 'processing')`,
+        )
+        .run(runId, firstArtifactId).lastInsertRowid,
+    )
+    expect(() =>
+      database.prepare('UPDATE import_item SET error_id = ? WHERE id = ?').run(secondErrorId, itemId),
+    ).toThrow()
+
+    database.close()
+  })
 })

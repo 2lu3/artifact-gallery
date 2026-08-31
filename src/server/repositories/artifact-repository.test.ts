@@ -197,6 +197,64 @@ describe('ArtifactRepository', () => {
     database.close()
   })
 
+  it('keeps the prior active generation when a new generation has no ready derivative', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-artifacts-'))
+    temporaryDirectories.push(directory)
+    const database = openDatabase({ filename: join(directory, 'gallery.sqlite') })
+    const repository = new ArtifactRepository(database)
+    const now = '2026-08-31T00:00:00.000Z'
+    const artifact = repository.register({
+      sourcePath: '/canonical/note.md',
+      format: 'markdown',
+      now,
+    })
+    const successful = repository.createGeneration(artifact.id, now)
+    repository.commitGeneration({
+      artifactId: artifact.id,
+      generationId: successful.id,
+      expectedGeneration: successful.generation,
+      contentStatus: 'ready',
+      renderStatus: 'ready',
+      indexStatus: 'ready',
+      extractedText: 'previous successful text',
+      extractorVersion: 'commonmark-1',
+      thumbnailPath: '/derived/success.webp',
+      previewedAt: now,
+      completedAt: now,
+    })
+
+    const failed = repository.createGeneration(artifact.id, now)
+    repository.commitGeneration({
+      artifactId: artifact.id,
+      generationId: failed.id,
+      expectedGeneration: failed.generation,
+      contentStatus: 'failed',
+      renderStatus: 'failed',
+      indexStatus: 'failed',
+      extractedText: null,
+      extractorVersion: null,
+      thumbnailPath: null,
+      previewedAt: null,
+      completedAt: now,
+    })
+
+    expect(
+      database.prepare('SELECT active_generation_id FROM artifact WHERE id = ?').get(artifact.id),
+    ).toEqual({ active_generation_id: successful.id })
+    expect(
+      database
+        .prepare('SELECT job_status, content_status, render_status, index_status FROM artifact_generation WHERE id = ?')
+        .get(failed.id),
+    ).toEqual({
+      job_status: 'idle',
+      content_status: 'failed',
+      render_status: 'failed',
+      index_status: 'failed',
+    })
+
+    database.close()
+  })
+
   it('upserts a canonical source path without discarding its successful generation', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-artifacts-'))
     temporaryDirectories.push(directory)

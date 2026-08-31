@@ -8,8 +8,10 @@ CREATE TABLE artifact (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   registered_at TEXT NOT NULL,
-  active_generation_id INTEGER REFERENCES artifact_generation(id),
-  generation_counter INTEGER NOT NULL DEFAULT 0 CHECK (generation_counter >= 0)
+  active_generation_id INTEGER,
+  generation_counter INTEGER NOT NULL DEFAULT 0 CHECK (generation_counter >= 0),
+  FOREIGN KEY (active_generation_id, id)
+    REFERENCES artifact_generation(id, artifact_id)
 ) STRICT;
 
 CREATE TABLE artifact_generation (
@@ -26,28 +28,34 @@ CREATE TABLE artifact_generation (
   previewed_at TEXT,
   started_at TEXT,
   completed_at TEXT,
-  UNIQUE (artifact_id, generation)
+  UNIQUE (artifact_id, generation),
+  UNIQUE (id, artifact_id)
 ) STRICT;
 
 CREATE TABLE artifact_error (
   id INTEGER PRIMARY KEY,
   artifact_id INTEGER NOT NULL REFERENCES artifact(id) ON DELETE CASCADE,
-  generation_id INTEGER REFERENCES artifact_generation(id) ON DELETE CASCADE,
+  generation_id INTEGER,
   code TEXT NOT NULL,
   stage TEXT NOT NULL,
   retryable INTEGER NOT NULL CHECK (retryable IN (0, 1)),
   user_message TEXT NOT NULL,
   technical_detail TEXT,
-  occurred_at TEXT NOT NULL
+  occurred_at TEXT NOT NULL,
+  UNIQUE (id, artifact_id),
+  FOREIGN KEY (generation_id, artifact_id)
+    REFERENCES artifact_generation(id, artifact_id) ON DELETE CASCADE
 ) STRICT;
 
 CREATE TABLE artifact_warning (
   id INTEGER PRIMARY KEY,
   artifact_id INTEGER NOT NULL REFERENCES artifact(id) ON DELETE CASCADE,
-  generation_id INTEGER REFERENCES artifact_generation(id) ON DELETE CASCADE,
+  generation_id INTEGER,
   code TEXT NOT NULL,
   detail TEXT NOT NULL,
-  occurred_at TEXT NOT NULL
+  occurred_at TEXT NOT NULL,
+  FOREIGN KEY (generation_id, artifact_id)
+    REFERENCES artifact_generation(id, artifact_id) ON DELETE CASCADE
 ) STRICT;
 
 CREATE TABLE allowed_root (
@@ -73,7 +81,9 @@ CREATE TABLE import_item (
   status TEXT NOT NULL CHECK (status IN ('queued', 'processing', 'completed', 'failed', 'cancelled', 'interrupted')),
   error_id INTEGER REFERENCES artifact_error(id) ON DELETE SET NULL,
   started_at TEXT,
-  completed_at TEXT
+  completed_at TEXT,
+  FOREIGN KEY (error_id, artifact_id)
+    REFERENCES artifact_error(id, artifact_id)
 ) STRICT;
 
 CREATE INDEX artifact_generation_artifact_id_idx ON artifact_generation (artifact_id);

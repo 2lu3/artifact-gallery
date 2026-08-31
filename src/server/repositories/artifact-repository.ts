@@ -186,10 +186,16 @@ export class ArtifactRepository {
       const artifact = this.database
         .prepare(
           `UPDATE artifact
-           SET active_generation_id = ?, updated_at = ?
+           SET active_generation_id = CASE WHEN ? THEN ? ELSE active_generation_id END,
+               updated_at = ?
            WHERE id = ? AND generation_counter = ?`,
         )
         .run(
+          input.contentStatus === 'ready' ||
+            input.renderStatus === 'ready' ||
+            input.indexStatus === 'ready'
+            ? 1
+            : 0,
           input.generationId,
           input.completedAt,
           input.artifactId,

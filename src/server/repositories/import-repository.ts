@@ -56,6 +56,13 @@ interface ImportItemRow {
   completed_at: string | null
 }
 
+export class InvalidImportTransitionError extends Error {
+  constructor(entity: 'run' | 'item', id: number, action: string) {
+    super(`Invalid import ${entity} transition '${action}' for id ${id}.`)
+    this.name = 'InvalidImportTransitionError'
+  }
+}
+
 export class ImportRepository {
   constructor(private readonly database: Database.Database) {}
 
@@ -76,9 +83,14 @@ export class ImportRepository {
   }
 
   startRun(runId: number, startedAt: string): void {
-    this.database
-      .prepare("UPDATE import_run SET status = 'running', started_at = ? WHERE id = ?")
+    const result = this.database
+      .prepare(
+        `UPDATE import_run
+         SET status = 'running', started_at = ?
+         WHERE id = ? AND status = 'queued' AND cancel_requested_at IS NULL`,
+      )
       .run(startedAt, runId)
+    requireTransition(result.changes, 'run', runId, 'start')
   }
 
   startStage(
@@ -104,49 +116,76 @@ export class ImportRepository {
   }
 
   attachArtifact(itemId: number, artifactId: number): void {
-    this.database
-      .prepare('UPDATE import_item SET artifact_id = ? WHERE id = ?')
+    const result = this.database
+      .prepare(
+        `UPDATE import_item SET artifact_id = ?
+         WHERE id = ? AND status IN ('queued', 'processing')`,
+      )
       .run(artifactId, itemId)
+    requireTransition(result.changes, 'item', itemId, 'attach artifact')
   }
 
   failItem(itemId: number, errorId: number, completedAt: string): void {
-    this.database
+    const result = this.database
       .prepare(
         `UPDATE import_item
          SET status = 'failed', error_id = ?, completed_at = ?
-         WHERE id = ?`,
+         WHERE id = ? AND status = 'processing'`,
       )
       .run(errorId, completedAt, itemId)
+    requireTransition(result.changes, 'item', itemId, 'fail')
   }
 
   requestCancellation(runId: number, requestedAt: string): void {
-    this.database
-      .prepare('UPDATE import_run SET cancel_requested_at = ? WHERE id = ?')
+    const result = this.database
+      .prepare(
+        `UPDATE import_run SET cancel_requested_at = ?
+         WHERE id = ?
+           AND status IN ('queued', 'running')
+           AND cancel_requested_at IS NULL`,
+      )
       .run(requestedAt, runId)
+    requireTransition(result.changes, 'run', runId, 'request cancellation')
   }
 
   cancelItem(itemId: number, completedAt: string): void {
-    this.database
-      .prepare("UPDATE import_item SET status = 'cancelled', completed_at = ? WHERE id = ?")
+    const result = this.database
+      .prepare(
+        `UPDATE import_item SET status = 'cancelled', completed_at = ?
+         WHERE id = ? AND status IN ('queued', 'processing')`,
+      )
       .run(completedAt, itemId)
+    requireTransition(result.changes, 'item', itemId, 'cancel')
   }
 
   cancelRun(runId: number, completedAt: string): void {
-    this.database
-      .prepare("UPDATE import_run SET status = 'cancelled', completed_at = ? WHERE id = ?")
+    const result = this.database
+      .prepare(
+        `UPDATE import_run SET status = 'cancelled', completed_at = ?
+         WHERE id = ? AND status IN ('queued', 'running')`,
+      )
       .run(completedAt, runId)
+    requireTransition(result.changes, 'run', runId, 'cancel')
   }
 
   completeItem(itemId: number, completedAt: string): void {
-    this.database
-      .prepare("UPDATE import_item SET status = 'completed', completed_at = ? WHERE id = ?")
+    const result = this.database
+      .prepare(
+        `UPDATE import_item SET status = 'completed', completed_at = ?
+         WHERE id = ? AND status = 'processing'`,
+      )
       .run(completedAt, itemId)
+    requireTransition(result.changes, 'item', itemId, 'complete')
   }
 
   completeRun(runId: number, completedAt: string): void {
-    this.database
-      .prepare("UPDATE import_run SET status = 'completed', completed_at = ? WHERE id = ?")
+    const result = this.database
+      .prepare(
+        `UPDATE import_run SET status = 'completed', completed_at = ?
+         WHERE id = ? AND status = 'running'`,
+      )
       .run(completedAt, runId)
+    requireTransition(result.changes, 'run', runId, 'complete')
   }
 
   getRun(runId: number): ImportRunRecord {
@@ -173,5 +212,16 @@ export class ImportRepository {
       startedAt: row.started_at,
       completedAt: row.completed_at,
     }
+  }
+}
+
+function requireTransition(
+  changes: number,
+  entity: 'run' | 'item',
+  id: number,
+  action: string,
+): void {
+  if (changes !== 1) {
+    throw new InvalidImportTransitionError(entity, id, action)
   }
 }
