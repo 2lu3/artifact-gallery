@@ -416,3 +416,80 @@ tsc --project tsconfig.server.json            exit 0
 ### Concerns
 
 - None specific to this fix round.
+
+## Fix round 4/5
+
+### Files changed
+
+- Added the byte-for-byte `3ee6725:migrations/001_initial.sql` fixture as
+  `tests/fixtures/migrations/001_error_ownership.sql`.
+- Extended `database.test.ts` with a real SQLite upgrade regression that starts
+  from that fixture, installs the remaining historical ownership-trigger names,
+  persists artifact/generation/error/warning/import rows, and verifies both row
+  preservation and the final cross-owner invariants after migration.
+- Updated `migrations/002_error_ownership.sql` to remove all eight prior
+  ownership-trigger variants before rebuilding the final schema and triggers.
+
+### RED evidence
+
+1. **Pre-existing ownership triggers blocked the 002 upgrade**
+   - Test: `src/server/db/database.test.ts` —
+     `upgrades the pre-002 ownership variant without losing rows or ownership checks`.
+   - Command:
+     `pnpm test src/server/db/database.test.ts -t "upgrades the pre-002 ownership variant"`.
+   - RED: migration failed at `openDatabase` with
+     `SqliteError: trigger artifact_active_generation_owner_insert already exists`;
+     1 failed, 8 skipped.
+   - Break caught: 002 recreated an ownership trigger that could survive from a
+     previously applied 001 variant, rolling back the entire migration.
+
+### GREEN evidence
+
+- Focused regression command passed 1/1 test with 8 skipped.
+- Targeted persistence command:
+  `pnpm test src/server/db/database.test.ts src/server/repositories/artifact-repository.test.ts src/server/repositories/import-repository.test.ts src/server/db/recovery.test.ts`
+  passed 23/23 tests across 4 files.
+- Fixture immutability check:
+  `git show 3ee6725:migrations/001_initial.sql | diff -u - tests/fixtures/migrations/001_error_ownership.sql`
+  exited 0 with no output.
+
+### Full verification
+
+The required command was run after the final migration, test, and fixture changes:
+
+```text
+git diff --check && pnpm lint && pnpm typecheck && pnpm test && pnpm build
+
+git diff --check                              exit 0
+eslint .                                      exit 0
+tsc --noEmit                                  exit 0
+Test Files  6 passed (6)
+Tests       25 passed (25)
+vite build                                   15 modules transformed, exit 0
+tsc --project tsconfig.server.json            exit 0
+```
+
+### Self-review
+
+- 002 drops only the eight known ownership-trigger names and immediately
+  recreates the final definitions inside the same migration transaction.
+- `IF EXISTS` keeps upgrades valid for the immutable initial 001, the
+  `3ee6725` ownership schema, and databases carrying the additional historical
+  trigger variants.
+- The regression fixture is exactly the committed `3ee6725` SQL. The test adds
+  only the extra trigger variants needed to reproduce the surviving-name
+  collision while preserving the fixture as an auditable historical snapshot.
+- The upgrade assertion covers migration completion, active generation state,
+  derivative data, errors, warnings, import linkage, and four final ownership
+  checks across artifact, error, warning, and import-item relations.
+- Removing the trigger drops restores the observed RED collision, so the test
+  directly protects the production migration behavior rather than inspecting
+  SQL source text.
+
+### Commit hash
+
+`5dd0915da1009c5a84402d8ad4f80ec5bdee4954`
+
+### Concerns
+
+- None specific to this fix round.
