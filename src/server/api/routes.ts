@@ -225,10 +225,12 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
       const body = readObject(request.body)
       assertKeys(body, ['path'])
       const sourcePath = readPath(body.path)
-      const run = imports.createRun([sourcePath])
-      const accepted = enqueueItem(run.id, run.itemIds[0] as number, sourcePath, async () => {
+      const authorized = await dependencies.pathPolicy.authorizeFile(sourcePath)
+      const canonicalPath = authorized.canonicalPath
+      const run = imports.createRun([canonicalPath])
+      const accepted = enqueueItem(run.id, run.itemIds[0] as number, canonicalPath, async () => {
         await dependencies.processor.register({
-          sourcePath,
+          sourcePath: canonicalPath,
           runId: run.id,
           itemId: run.itemIds[0] as number,
         })

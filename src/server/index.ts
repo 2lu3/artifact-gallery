@@ -1,11 +1,16 @@
 import { DEFAULT_LISTEN_OPTIONS } from './app.js'
+import { installGracefulShutdown } from './graceful-shutdown.js'
 import { createServerRuntime, runtimeOptionsFromEnvironment } from './runtime.js'
 
-const app = await createServerRuntime(runtimeOptionsFromEnvironment())
-const configuredPort = Number(process.env.PORT)
-const port =
-  Number.isSafeInteger(configuredPort) && configuredPort > 0 && configuredPort <= 65_535
-    ? configuredPort
-    : DEFAULT_LISTEN_OPTIONS.port
+const runtimeOptions = runtimeOptionsFromEnvironment()
+const app = await createServerRuntime(runtimeOptions)
+const port = runtimeOptions.port ?? DEFAULT_LISTEN_OPTIONS.port
+const removeSignalListeners = installGracefulShutdown({ app })
 
-await app.listen({ host: DEFAULT_LISTEN_OPTIONS.host, port })
+try {
+  await app.listen({ host: DEFAULT_LISTEN_OPTIONS.host, port })
+} catch (error) {
+  removeSignalListeners()
+  await app.close()
+  throw error
+}

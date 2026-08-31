@@ -15,11 +15,15 @@ export const DEFAULT_LISTEN_OPTIONS = { host: '127.0.0.1', port: 3000 } as const
 
 export type BuildAppOptions = Partial<ApiRouteDependencies> & {
   readonly clientDirectory?: string
+  readonly trustedHosts?: readonly string[]
+  readonly trustedPort?: number
 }
 
 export function buildApp(options: BuildAppOptions = {}): LocalApiApp {
   const app = Fastify({ bodyLimit: 64 * 1024 }) as unknown as LocalApiApp
   const sessionToken = randomBytes(32).toString('base64url')
+  const trustedHosts = readTrustedHosts(options.trustedHosts)
+  const trustedPort = readTrustedPort(options.trustedPort ?? DEFAULT_LISTEN_OPTIONS.port)
   Object.defineProperty(app, 'sessionToken', {
     value: sessionToken,
     configurable: false,
@@ -27,7 +31,25 @@ export function buildApp(options: BuildAppOptions = {}): LocalApiApp {
     writable: false,
   })
 
+  app.addHook('onSend', async (request, reply, payload) => {
+    if (!request.url.startsWith('/api')) return payload
+    reply.header('cache-control', 'no-store')
+    reply.header('vary', appendVaryHeader(reply.getHeader('vary'), SESSION_TOKEN_HEADER))
+    return payload
+  })
+
   app.addHook('onRequest', async (request, reply) => {
+    if (!isTrustedAuthority(request.headers.host, trustedHosts, trustedPort)) {
+      await reply.code(421).send({
+        error: {
+          code: 'UNTRUSTED_HOST',
+          stage: 'request',
+          retryable: false,
+          message: 'The request Host is not trusted.',
+        },
+      })
+      return
+    }
     if (!request.url.startsWith('/api')) return
     const supplied = request.headers[SESSION_TOKEN_HEADER]
     if (typeof supplied !== 'string' || !tokensEqual(sessionToken, supplied)) {
@@ -99,6 +121,53 @@ export function buildApp(options: BuildAppOptions = {}): LocalApiApp {
   )
 
   return app
+}
+
+function appendVaryHeader(existing: string | string[] | number | undefined, field: string): string {
+  const fields = (Array.isArray(existing) ? existing.join(',') : String(existing ?? ''))
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean)
+  if (!fields.some((value) => value.toLowerCase() === field.toLowerCase())) fields.push(field)
+  return fields.join(', ')
+}
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1'])
+
+function readTrustedHosts(configured: readonly string[] | undefined): ReadonlySet<string> {
+  const hosts = configured ?? ['localhost', '127.0.0.1']
+  if (hosts.length === 0) throw new TypeError('At least one trusted Host is required.')
+  const normalized = hosts.map((host) => host.toLowerCase())
+  if (normalized.some((host) => !LOOPBACK_HOSTS.has(host))) {
+    throw new TypeError('Only loopback Host values can be trusted.')
+  }
+  return new Set(normalized)
+}
+
+function readTrustedPort(port: number): number {
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new TypeError('The trusted Host port is invalid.')
+  }
+  return port
+}
+
+function isTrustedAuthority(
+  authority: string | undefined,
+  trustedHosts: ReadonlySet<string>,
+  trustedPort: number,
+): boolean {
+  if (!authority || authority.length > 255 || /[\s,@/\\]/u.test(authority)) return false
+  const ipv6 = /^\[([^\]]+)\](?::([1-9]\d{0,4}))?$/u.exec(authority)
+  const ordinary = /^([^:]+)(?::([1-9]\d{0,4}))?$/u.exec(authority)
+  const match = ipv6 ?? ordinary
+  if (!match) return false
+  const host = match[1]?.toLowerCase()
+  const port = match[2]
+  if (!host || !trustedHosts.has(host)) return false
+  if (host.includes(':') && !ipv6) return false
+  if (port === undefined) return true
+  const parsedPort = Number(port)
+  return parsedPort <= 65_535 && parsedPort === trustedPort
 }
 
 function tokensEqual(expected: string, supplied: string): boolean {

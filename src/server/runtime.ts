@@ -1,7 +1,7 @@
 import { mkdir } from 'node:fs/promises'
 import { delimiter, dirname, resolve } from 'node:path'
 
-import { buildApp, type LocalApiApp } from './app.js'
+import { buildApp, DEFAULT_LISTEN_OPTIONS, type LocalApiApp } from './app.js'
 import { BackgroundQueue } from './api/background-queue.js'
 import { openDatabase } from './db/database.js'
 import { ArtifactProcessor } from './processing/artifact-processor.js'
@@ -13,6 +13,7 @@ export interface ServerRuntimeOptions {
   readonly thumbnailDirectory: string
   readonly allowedRoots: readonly string[]
   readonly clientDirectory?: string
+  readonly port?: number
 }
 
 export async function createServerRuntime(options: ServerRuntimeOptions): Promise<LocalApiApp> {
@@ -38,6 +39,7 @@ export async function createServerRuntime(options: ServerRuntimeOptions): Promis
       thumbnailDirectory: options.thumbnailDirectory,
       clientDirectory: options.clientDirectory,
       backgroundQueue,
+      trustedPort: options.port ?? DEFAULT_LISTEN_OPTIONS.port,
     })
     app.addHook('onClose', async () => {
       await backgroundQueue.onIdle()
@@ -56,6 +58,7 @@ export function runtimeOptionsFromEnvironment(
 ): ServerRuntimeOptions {
   const stateDirectory = resolve(environment.ARTIFACT_GALLERY_STATE_DIRECTORY ?? '.artifact-gallery')
   const configuredRoots = environment.ARTIFACT_GALLERY_ALLOWED_ROOTS
+  const configuredPort = Number(environment.PORT)
   return {
     databaseFilename: resolve(
       environment.ARTIFACT_GALLERY_DATABASE ?? resolve(stateDirectory, 'catalog.sqlite'),
@@ -74,5 +77,9 @@ export function runtimeOptionsFromEnvironment(
       environment.ARTIFACT_GALLERY_DEVELOPMENT === '1'
         ? undefined
         : resolve(environment.ARTIFACT_GALLERY_CLIENT_DIRECTORY ?? 'dist'),
+    port:
+      Number.isSafeInteger(configuredPort) && configuredPort > 0 && configuredPort <= 65_535
+        ? configuredPort
+        : DEFAULT_LISTEN_OPTIONS.port,
   }
 }

@@ -25,18 +25,19 @@ describe('server composition root', () => {
       databaseFilename,
       thumbnailDirectory: join(root, 'state', 'thumbnails'),
       allowedRoots: [root],
+      port: 4173,
     })
     const token = app.sessionToken
 
     const health = await app.inject({
       method: 'GET',
       url: '/api/health',
-      headers: { 'x-artifact-gallery-token': token },
+      headers: { host: '127.0.0.1:4173', 'x-artifact-gallery-token': token },
     })
     const registrationRoute = await app.inject({
       method: 'POST',
       url: '/api/registrations/file',
-      headers: { 'x-artifact-gallery-token': token },
+      headers: { host: '127.0.0.1:4173', 'x-artifact-gallery-token': token },
       payload: {},
     })
 
@@ -50,6 +51,7 @@ describe('server composition root', () => {
     const options = runtimeOptionsFromEnvironment({
       ARTIFACT_GALLERY_STATE_DIRECTORY: '/tmp/artifact-gallery-state',
       ARTIFACT_GALLERY_ALLOWED_ROOTS: `/tmp/one${process.platform === 'win32' ? ';' : ':'}/tmp/two`,
+      PORT: '4173',
     })
 
     expect(options).toEqual({
@@ -57,6 +59,7 @@ describe('server composition root', () => {
       thumbnailDirectory: '/tmp/artifact-gallery-state/thumbnails',
       allowedRoots: ['/tmp/one', '/tmp/two'],
       clientDirectory: resolve('dist'),
+      port: 4173,
     })
     expect(options).not.toHaveProperty('host')
   })

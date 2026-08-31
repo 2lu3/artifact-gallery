@@ -11,6 +11,7 @@ export type GalleryStatusFilter = 'all' | CardPresentation
 
 export type ApiErrorCode =
   | 'UNAUTHORIZED'
+  | 'UNTRUSTED_HOST'
   | 'INVALID_REQUEST'
   | 'NOT_FOUND'
   | 'CURSOR_STALE'

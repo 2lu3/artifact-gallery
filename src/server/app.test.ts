@@ -7,6 +7,68 @@ import { SESSION_TOKEN_HEADER } from '../shared/contracts.js'
 import { buildApp, DEFAULT_LISTEN_OPTIONS } from './app.js'
 
 describe('buildApp', () => {
+  it('rejects untrusted Host values before exposing the bootstrap token', async () => {
+    const app = buildApp()
+
+    for (const host of ['localhost', 'localhost:3000', '127.0.0.1', '127.0.0.1:3000']) {
+      const response = await app.inject({ method: 'GET', url: '/', headers: { host } })
+      expect(response.statusCode, host).toBe(200)
+      expect(response.body, host).toContain(app.sessionToken)
+    }
+    for (const host of [
+      'attacker.example',
+      'attacker.example:3000',
+      'localhost:3001',
+      'localhost:99999',
+      '[::1]:3000',
+    ]) {
+      const response = await app.inject({
+        method: 'GET',
+        url: '/',
+        headers: { host, 'x-forwarded-host': 'localhost:3000' },
+      })
+      expect(response.statusCode, host).toBe(421)
+      expect(response.body, host).not.toContain(app.sessionToken)
+    }
+
+    const forwardedAttacker = await app.inject({
+      method: 'GET',
+      url: '/',
+      headers: { host: '127.0.0.1:3000', 'x-forwarded-host': 'attacker.example' },
+    })
+    expect(forwardedAttacker.statusCode).toBe(200)
+    const attackerApi = await app.inject({
+      method: 'GET',
+      url: '/api/health',
+      headers: { host: 'attacker.example' },
+    })
+    expect(attackerApi.statusCode).toBe(421)
+    expect(attackerApi.json().error.code).toBe('UNTRUSTED_HOST')
+
+    const ipv6 = buildApp({ trustedHosts: ['::1'], trustedPort: 3000 })
+    expect(
+      (
+        await ipv6.inject({
+          method: 'GET',
+          url: '/',
+          headers: { host: '[::1]:3000' },
+        })
+      ).statusCode,
+    ).toBe(200)
+    expect(
+      (
+        await ipv6.inject({
+          method: 'GET',
+          url: '/',
+          headers: { host: 'localhost:3000' },
+        })
+      ).statusCode,
+    ).toBe(421)
+
+    await app.close()
+    await ipv6.close()
+  })
+
   it('requires the startup session token for every API route', async () => {
     const app = buildApp()
 
@@ -29,24 +91,67 @@ describe('buildApp', () => {
       { method: 'POST', url: '/api/artifacts/1/open-source' },
     ] as const
     for (const route of protectedRoutes) {
-      const missing = await app.inject(route)
+      const missing = await app.inject({ ...route, headers: { host: '127.0.0.1:3000' } })
       expect(missing.statusCode, `${route.method} ${route.url}`).toBe(401)
     }
     const incorrect = await app.inject({
       method: 'GET',
       url: '/api/health',
-      headers: { [SESSION_TOKEN_HEADER]: 'a'.repeat(43) },
+      headers: { host: '127.0.0.1:3000', [SESSION_TOKEN_HEADER]: 'a'.repeat(43) },
     })
     const authorized = await app.inject({
       method: 'GET',
       url: '/api/health',
-      headers: { [SESSION_TOKEN_HEADER]: String(app.sessionToken) },
+      headers: {
+        host: '127.0.0.1:3000',
+        [SESSION_TOKEN_HEADER]: String(app.sessionToken),
+      },
     })
 
     expect(incorrect.statusCode).toBe(401)
     expect(authorized.statusCode).toBe(200)
     expect(authorized.json()).toEqual({ status: 'ok' })
 
+    await app.close()
+  })
+
+  it('prevents caching and safely varies every API response by the token header', async () => {
+    const app = buildApp()
+    const responses = await Promise.all([
+      app.inject({
+        method: 'GET',
+        url: '/api/health',
+        headers: { host: '127.0.0.1:3000' },
+      }),
+      app.inject({
+        method: 'GET',
+        url: '/api/health',
+        headers: {
+          host: '127.0.0.1:3000',
+          [SESSION_TOKEN_HEADER]: app.sessionToken,
+        },
+      }),
+      app.inject({
+        method: 'GET',
+        url: '/api/not-found',
+        headers: {
+          host: '127.0.0.1:3000',
+          [SESSION_TOKEN_HEADER]: app.sessionToken,
+        },
+      }),
+      app.inject({
+        method: 'GET',
+        url: '/api/health',
+        headers: { host: 'attacker.example' },
+      }),
+    ])
+
+    for (const response of responses) {
+      expect(response.headers['cache-control']).toBe('no-store')
+      expect(response.headers.vary?.toLowerCase().split(/\s*,\s*/u)).toContain(
+        SESSION_TOKEN_HEADER,
+      )
+    }
     await app.close()
   })
 
@@ -73,15 +178,27 @@ describe('buildApp', () => {
     await writeFile(join(assets, 'app.js'), 'document.body.dataset.loaded = "true"')
     const app = buildApp({ clientDirectory: directory })
 
-    const bootstrap = await app.inject({ method: 'GET', url: '/' })
+    const bootstrap = await app.inject({
+      method: 'GET',
+      url: '/',
+      headers: { host: '127.0.0.1:3000' },
+    })
     const modulePath = bootstrap.body.match(/src="([^"]+)"/)?.[1]
-    const moduleAsset = await app.inject({ method: 'GET', url: modulePath ?? '/missing' })
+    const moduleAsset = await app.inject({
+      method: 'GET',
+      url: modulePath ?? '/missing',
+      headers: { host: '127.0.0.1:3000' },
+    })
     const api = await app.inject({
       method: 'GET',
       url: '/api/health',
-      headers: { [SESSION_TOKEN_HEADER]: app.sessionToken },
+      headers: { host: '127.0.0.1:3000', [SESSION_TOKEN_HEADER]: app.sessionToken },
     })
-    const publicRoute = await app.inject({ method: 'GET', url: '/not-found' })
+    const publicRoute = await app.inject({
+      method: 'GET',
+      url: '/not-found',
+      headers: { host: '127.0.0.1:3000' },
+    })
 
     expect(bootstrap.statusCode).toBe(200)
     expect(bootstrap.headers['content-type']).toContain('text/html')

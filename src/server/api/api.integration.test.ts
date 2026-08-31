@@ -23,6 +23,56 @@ afterEach(async () => {
 })
 
 describe('local API integration', () => {
+  it('canonicalizes aliased source paths before locking and creating import runs', async () => {
+    let markRenderingStarted!: () => void
+    let releaseRendering!: () => void
+    const renderingStarted = new Promise<void>((resolve) => {
+      markRenderingStarted = resolve
+    })
+    const renderingReleased = new Promise<void>((resolve) => {
+      releaseRendering = resolve
+    })
+    const harness = await makeHarness({
+      beforeRender: async () => {
+        markRenderingStarted()
+        await renderingReleased
+      },
+    })
+    const canonicalPath = join(harness.sourceDirectory, 'aliased.md')
+    const aliasPath = `${harness.sourceDirectory}/./aliased.md`
+    await writeFile(canonicalPath, '# Canonical lock')
+
+    const responsesPromise = Promise.all(
+      [canonicalPath, aliasPath].map((sourcePath) =>
+        harness.app.inject({
+          method: 'POST',
+          url: '/api/registrations/file',
+          headers: harness.headers,
+          payload: { path: sourcePath },
+        }),
+      ),
+    )
+    await renderingStarted
+    releaseRendering()
+    const responses = await responsesPromise
+    const runs = await Promise.all(
+      responses.map((response) => waitForRun(harness, response.json().runId)),
+    )
+
+    expect(responses.map(({ statusCode }) => statusCode)).toEqual([202, 202])
+    expect(runs.map(({ status }) => status)).toEqual(['completed', 'completed'])
+    expect(
+      harness.database
+        .prepare('SELECT canonical_path FROM import_item ORDER BY id')
+        .pluck()
+        .all(),
+    ).toEqual([await realpath(canonicalPath), await realpath(canonicalPath)])
+    expect(harness.database.prepare('SELECT COUNT(*) AS count FROM artifact').get()).toEqual({
+      count: 1,
+    })
+    await harness.close()
+  })
+
   it('returns a durable run before background rendering finishes', async () => {
     let markRenderingStarted!: () => void
     let releaseRendering!: () => void
@@ -208,7 +258,11 @@ describe('local API integration', () => {
     expect(card).not.toHaveProperty('thumbnailPath')
     expect(JSON.stringify(card)).not.toContain(harness.thumbnailDirectory)
 
-    const unauthorized = await harness.app.inject({ method: 'GET', url: card.thumbnailUrl })
+    const unauthorized = await harness.app.inject({
+      method: 'GET',
+      url: card.thumbnailUrl,
+      headers: { host: '127.0.0.1:3000' },
+    })
     const thumbnail = await harness.app.inject({
       method: 'GET',
       url: card.thumbnailUrl,
@@ -217,7 +271,10 @@ describe('local API integration', () => {
     expect(unauthorized.statusCode).toBe(401)
     expect(thumbnail.statusCode).toBe(200)
     expect(thumbnail.headers['content-type']).toContain('image/webp')
-    expect(thumbnail.headers['cache-control']).toBe('private, no-store')
+    expect(thumbnail.headers['cache-control']).toBe('no-store')
+    expect(thumbnail.headers.vary?.toLowerCase().split(/\s*,\s*/u)).toContain(
+      'x-artifact-gallery-token',
+    )
     expect(thumbnail.rawPayload).toEqual(Buffer.from('RIFF-api-preview-WEBP'))
 
     const tamperedUrl = `${card.thumbnailUrl.slice(0, -1)}${card.thumbnailUrl.endsWith('x') ? 'y' : 'x'}`
@@ -689,7 +746,10 @@ async function makeHarness(
     thumbnailDirectory,
     backgroundQueue,
   })
-  const headers = { 'x-artifact-gallery-token': app.sessionToken }
+  const headers = {
+    host: '127.0.0.1:3000',
+    'x-artifact-gallery-token': app.sessionToken,
+  }
 
   return {
     app,
