@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { access, lstat, open, readFile, readdir, realpath, stat } from 'node:fs/promises';
+import { access, lstat, open, readdir, realpath, stat } from 'node:fs/promises';
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 const SUPPORTED_EXTENSIONS = new Set(['.html', '.htm', '.md']);
@@ -115,14 +115,19 @@ export class PathPolicy {
   }
 
   async authorizeFile(requestedPath: string): Promise<AuthorizedFile> {
-    const canonicalPath = await this.validateFile(requestedPath);
+    const authorizedSnapshot = await this.validateFileSnapshot(requestedPath);
 
     return {
-      canonicalPath,
+      canonicalPath: authorizedSnapshot.canonicalPath,
       read: (encoding) =>
-        normalizeFilesystemOperation(requestedPath, async () =>
-          readFile(await this.validateFile(requestedPath), encoding),
-        ),
+        normalizeFilesystemOperation(requestedPath, async () => {
+          const bytes = await readAuthorizedFile(
+            authorizedSnapshot,
+            requestedPath,
+            () => this.validateFileSnapshot(requestedPath),
+          );
+          return bytes.toString(encoding);
+        }),
     };
   }
 
@@ -132,14 +137,14 @@ export class PathPolicy {
   }
 
   async authorizeAsset(requestedPath: string): Promise<AuthorizedAsset> {
-    const { canonicalPath } = await this.validateReadableFileSnapshot(requestedPath);
+    const authorizedSnapshot = await this.validateReadableFileSnapshot(requestedPath);
     return {
-      canonicalPath,
-      mimeType: mimeTypeFor(canonicalPath),
+      canonicalPath: authorizedSnapshot.canonicalPath,
+      mimeType: mimeTypeFor(authorizedSnapshot.canonicalPath),
       read: (maxBytes) =>
         normalizeFilesystemOperation(requestedPath, async () =>
-          readAssetFile(
-            await this.validateReadableFileSnapshot(requestedPath),
+          readAuthorizedFile(
+            authorizedSnapshot,
             requestedPath,
             () => this.validateReadableFileSnapshot(requestedPath),
             maxBytes,
@@ -231,16 +236,12 @@ export class PathPolicy {
     return canonicalPath;
   }
 
-  private async validateFile(requestedPath: string): Promise<string> {
-    const canonicalPath = await this.validateReadableFile(requestedPath);
-    if (!SUPPORTED_EXTENSIONS.has(extname(canonicalPath).toLowerCase())) {
+  private async validateFileSnapshot(requestedPath: string): Promise<FileSnapshot> {
+    const snapshot = await this.validateReadableFileSnapshot(requestedPath);
+    if (!SUPPORTED_EXTENSIONS.has(extname(snapshot.canonicalPath).toLowerCase())) {
       throw new PathPolicyError('UNSUPPORTED_FORMAT', requestedPath);
     }
-    return canonicalPath;
-  }
-
-  private async validateReadableFile(requestedPath: string): Promise<string> {
-    return (await this.validateReadableFileSnapshot(requestedPath)).canonicalPath;
+    return snapshot;
   }
 
   private async validateReadableFileSnapshot(requestedPath: string): Promise<FileSnapshot> {
@@ -387,8 +388,8 @@ async function normalizeFilesystemOperation<T>(
   }
 }
 
-async function readAssetFile(
-  snapshot: FileSnapshot,
+async function readAuthorizedFile(
+  authorizedSnapshot: FileSnapshot,
   requestedPath: string,
   revalidate: () => Promise<FileSnapshot>,
   maxBytes?: number,
@@ -396,25 +397,19 @@ async function readAssetFile(
   if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0)) {
     throw new AssetReadLimitError(maxBytes);
   }
+  assertSameFileIdentity(authorizedSnapshot, await revalidate(), requestedPath);
   const noFollowFlag = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0;
-  const handle = await open(snapshot.canonicalPath, constants.O_RDONLY | noFollowFlag);
+  const handle = await open(authorizedSnapshot.canonicalPath, constants.O_RDONLY | noFollowFlag);
   try {
     const status = await handle.stat();
     if (
       !status.isFile() ||
-      status.dev !== snapshot.deviceId ||
-      status.ino !== snapshot.inode
+      status.dev !== authorizedSnapshot.deviceId ||
+      status.ino !== authorizedSnapshot.inode
     ) {
       throw new PathPolicyError('UNREADABLE_SOURCE', requestedPath);
     }
-    const verifiedSnapshot = await revalidate();
-    if (
-      verifiedSnapshot.canonicalPath !== snapshot.canonicalPath ||
-      status.dev !== verifiedSnapshot.deviceId ||
-      status.ino !== verifiedSnapshot.inode
-    ) {
-      throw new PathPolicyError('UNREADABLE_SOURCE', requestedPath);
-    }
+    assertSameFileIdentity(authorizedSnapshot, await revalidate(), requestedPath);
     if (maxBytes === undefined) {
       return await handle.readFile();
     }
@@ -436,5 +431,19 @@ async function readAssetFile(
     return Buffer.concat(chunks, totalBytes);
   } finally {
     await handle.close();
+  }
+}
+
+function assertSameFileIdentity(
+  authorizedSnapshot: FileSnapshot,
+  candidateSnapshot: FileSnapshot,
+  requestedPath: string,
+): void {
+  if (
+    candidateSnapshot.canonicalPath !== authorizedSnapshot.canonicalPath ||
+    candidateSnapshot.deviceId !== authorizedSnapshot.deviceId ||
+    candidateSnapshot.inode !== authorizedSnapshot.inode
+  ) {
+    throw new PathPolicyError('UNREADABLE_SOURCE', requestedPath);
   }
 }

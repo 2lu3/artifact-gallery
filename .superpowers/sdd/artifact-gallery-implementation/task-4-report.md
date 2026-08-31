@@ -213,3 +213,45 @@ tsc --project tsconfig.server.json: passed
 ```
 
 Round 2 fix and report are committed together in the follow-up commit.
+
+## Round 3 initial capability identity follow-up
+
+Round 2 bound each descriptor to the immediately preceding read-time snapshot, but `authorizeAsset()` discarded the first authorized device/inode. Consequently, a different regular file or complete replacement directory moved into the same allowed-root pathname before `read()` became the new expected identity and was accepted.
+
+Focused real-filesystem RED cases observed:
+
+- replacing an authorized asset with another allowed-root regular file returned the literal replacement bytes;
+- renaming away the authorized asset's parent and moving another allowed-root directory into its pathname returned that directory's replacement asset bytes; and
+- replacing an authorized source `AuthorizedFile` returned the replacement HTML string.
+
+`AuthorizedAsset` and `AuthorizedFile` now retain the initial canonical path, device, and inode in their capability closures. Every read requires the pre-open snapshot, descriptor `fstat()`, and post-open snapshot to match that initial identity. Both capability types use the same verified descriptor reader, so the source string is decoded from the already-verified FD rather than reopening its pathname. Same-inode in-place content updates remain readable; pathname replacement with a different inode is denied.
+
+### Round 3 verification
+
+Focused security verification:
+
+```text
+pnpm exec vitest run tests/security/path-policy.test.ts tests/security/html-isolation.test.ts
+Test Files  2 passed (2)
+Tests       69 passed (69)
+```
+
+Binding full verification:
+
+```text
+pnpm lint
+passed
+
+pnpm typecheck
+passed
+
+pnpm test
+Test Files  8 passed (8)
+Tests       94 passed (94)
+
+pnpm build
+vite build: passed
+tsc --project tsconfig.server.json: passed
+```
+
+Round 3 fix and report are committed together in the follow-up commit.

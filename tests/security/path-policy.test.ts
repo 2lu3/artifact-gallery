@@ -412,6 +412,23 @@ describe('PathPolicy', () => {
     });
   });
 
+  test('rejects an allowed-root regular file replacement after source authorization', async () => {
+    const root = await makeTemporaryDirectory();
+    const source = join(root, 'artifact.html');
+    const replacement = join(root, 'replacement.html');
+    await writeFile(source, '<h1>Original</h1>');
+    await writeFile(replacement, '<h1>Replacement</h1>');
+    const policy = await PathPolicy.create([root]);
+    const authorized = await policy.authorizeFile(source);
+
+    await rename(replacement, source);
+
+    await expect(authorized.read('utf8')).rejects.toMatchObject({
+      name: 'PathPolicyError',
+      code: 'UNREADABLE_SOURCE',
+    });
+  });
+
   test('reads route assets as MIME-typed bytes without widening source formats', async () => {
     const root = await makeTemporaryDirectory();
     const outside = await makeTemporaryDirectory();
@@ -454,6 +471,45 @@ describe('PathPolicy', () => {
     await expect(asset.read(1024)).rejects.toMatchObject({
       name: 'AssetReadLimitError',
       maxBytes: 1024,
+    });
+  });
+
+  test('rejects an allowed-root regular file replacement after asset authorization', async () => {
+    const root = await makeTemporaryDirectory();
+    const source = join(root, 'asset.png');
+    const replacement = join(root, 'replacement.png');
+    await writeFile(source, Buffer.from('original'));
+    await writeFile(replacement, Buffer.from('replacement'));
+    const policy = await PathPolicy.create([root]);
+    const asset = await policy.authorizeAsset(source);
+
+    await rename(replacement, source);
+
+    await expect(asset.read(1024)).rejects.toMatchObject({
+      name: 'PathPolicyError',
+      code: 'UNREADABLE_SOURCE',
+    });
+  });
+
+  test('rejects an allowed-root parent directory replacement after asset authorization', async () => {
+    const root = await makeTemporaryDirectory();
+    const originalDirectory = join(root, 'original');
+    const parkedDirectory = join(root, 'parked');
+    const replacementDirectory = join(root, 'replacement');
+    const source = join(originalDirectory, 'asset.png');
+    await mkdir(originalDirectory);
+    await mkdir(replacementDirectory);
+    await writeFile(source, Buffer.from('original'));
+    await writeFile(join(replacementDirectory, 'asset.png'), Buffer.from('replacement'));
+    const policy = await PathPolicy.create([root]);
+    const asset = await policy.authorizeAsset(source);
+
+    await rename(originalDirectory, parkedDirectory);
+    await rename(replacementDirectory, originalDirectory);
+
+    await expect(asset.read(1024)).rejects.toMatchObject({
+      name: 'PathPolicyError',
+      code: 'UNREADABLE_SOURCE',
     });
   });
 
