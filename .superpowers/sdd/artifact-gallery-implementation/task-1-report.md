@@ -57,7 +57,7 @@ produced the server/worker build in `dist/server`.
 
 ## Commit hash
 
-Pending amend after this report is committed.
+`f75099f89ca7eeebfa5e9eedbbc5ef7d628475cb`
 
 ## Concerns
 
