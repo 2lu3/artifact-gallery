@@ -1,4 +1,13 @@
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
@@ -9,6 +18,7 @@ const readFileFault = vi.hoisted(() => ({
 }));
 const readDirectoryFault = vi.hoisted(() => ({
   path: undefined as string | undefined,
+  beforeRead: undefined as (() => Promise<void>) | undefined,
   afterRead: undefined as (() => Promise<void>) | undefined,
 }));
 
@@ -26,13 +36,17 @@ vi.mock('node:fs/promises', async (importOriginal) => {
       return Reflect.apply(actual.readFile, actual, args);
     },
     readdir: async (...args: Parameters<typeof actual.readdir>) => {
-      const entries = await Reflect.apply(actual.readdir, actual, args);
-      if (String(args[0]) === readDirectoryFault.path) {
-        const afterRead = readDirectoryFault.afterRead;
+      const matchesFault = String(args[0]) === readDirectoryFault.path;
+      const beforeRead = matchesFault ? readDirectoryFault.beforeRead : undefined;
+      const afterRead = matchesFault ? readDirectoryFault.afterRead : undefined;
+      if (matchesFault) {
         readDirectoryFault.path = undefined;
+        readDirectoryFault.beforeRead = undefined;
         readDirectoryFault.afterRead = undefined;
-        await afterRead?.();
       }
+      await beforeRead?.();
+      const entries = await Reflect.apply(actual.readdir, actual, args);
+      await afterRead?.();
       return entries;
     },
   };
@@ -52,6 +66,7 @@ afterEach(async () => {
   readFileFault.path = undefined;
   readFileFault.beforeRead = undefined;
   readDirectoryFault.path = undefined;
+  readDirectoryFault.beforeRead = undefined;
   readDirectoryFault.afterRead = undefined;
   await Promise.all(
     temporaryDirectories.splice(0).map((directory) =>
@@ -473,6 +488,62 @@ describe('PathPolicy', () => {
     });
     expect(result.errors.map((error) => error.path)).not.toContain(
       join(canonicalFolder, 'z-replaceable', 'outside-secret.html'),
+    );
+  });
+
+  test('discards entries read after a validated directory becomes an outside symlink', async () => {
+    const root = await makeTemporaryDirectory();
+    const outside = await makeTemporaryDirectory();
+    const folder = join(root, 'artifacts');
+    const replaceableDirectory = join(folder, 'replaceable');
+    await mkdir(replaceableDirectory, { recursive: true });
+    await writeFile(join(outside, 'outside-secret.html'), 'secret');
+    const policy = await PathPolicy.create([root]);
+    const canonicalFolder = await realpath(folder);
+    readDirectoryFault.path = await realpath(replaceableDirectory);
+    readDirectoryFault.beforeRead = async () => {
+      await rm(replaceableDirectory, { recursive: true });
+      await symlink(outside, replaceableDirectory, 'dir');
+    };
+
+    const result = await policy.enumerateFolder(folder);
+
+    expect(result.errors).toContainEqual({
+      path: join(canonicalFolder, 'replaceable'),
+      code: 'SYMLINK_REJECTED',
+    });
+    expect(result.errors.map((error) => error.path)).not.toContain(
+      join(canonicalFolder, 'replaceable', 'outside-secret.html'),
+    );
+  });
+
+  test('discards entries read after a validated directory is replaced by another inode', async () => {
+    const root = await makeTemporaryDirectory();
+    const folder = join(root, 'artifacts');
+    const replaceableDirectory = join(folder, 'replaceable');
+    const replacementDirectory = join(root, 'replacement');
+    await mkdir(replaceableDirectory, { recursive: true });
+    await mkdir(replacementDirectory);
+    await writeFile(join(replacementDirectory, 'replacement-secret.html'), 'secret');
+    const policy = await PathPolicy.create([root]);
+    const canonicalFolder = await realpath(folder);
+    readDirectoryFault.path = await realpath(replaceableDirectory);
+    readDirectoryFault.beforeRead = async () => {
+      await rm(replaceableDirectory, { recursive: true });
+      await rename(replacementDirectory, replaceableDirectory);
+    };
+
+    const result = await policy.enumerateFolder(folder);
+
+    expect(result.errors).toContainEqual({
+      path: join(canonicalFolder, 'replaceable'),
+      code: 'UNREADABLE_SOURCE',
+    });
+    expect(result.files.map((file) => file.canonicalPath)).not.toContain(
+      join(canonicalFolder, 'replaceable', 'replacement-secret.html'),
+    );
+    expect(result.errors.map((error) => error.path)).not.toContain(
+      join(canonicalFolder, 'replaceable', 'replacement-secret.html'),
     );
   });
 });

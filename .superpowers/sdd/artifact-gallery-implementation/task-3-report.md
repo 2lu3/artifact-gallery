@@ -136,3 +136,54 @@ Result: exit 0.
 ### Fix-round concerns
 
 None. Permission tests require POSIX permission semantics, which are supported by the target macOS environment.
+
+---
+
+## Fix round 2
+
+### Finding addressed
+
+Closed the remaining recursive enumeration window between a successful directory validation and the path-based `readdir()` syscall.
+
+- Directory validation now returns a private snapshot containing canonical path, device id, and inode.
+- `walkFolder()` obtains a pre-read snapshot, performs `readdir`, then revalidates the same path before processing any returned Dirent.
+- A post-read symlink or containment/type failure discards the complete Dirent result and reports only the replaced directory.
+- A successful post-read validation with changed `dev/ino` is classified as `UNREADABLE_SOURCE`, likewise discarding the complete result.
+- No test hook or filesystem adapter was added to the production API.
+
+### RED/GREEN evidence
+
+| Regression | RED evidence | GREEN evidence |
+| --- | --- | --- |
+| Validated directory replaced by outside symlink immediately before `readdir` | Errors exposed `replaceable/outside-secret.html`; no error existed for `replaceable` itself | Only `replaceable` is reported as `SYMLINK_REJECTED`; outside child name appears in neither files nor errors |
+| Validated directory replaced by a different allowed-root inode immediately before `readdir` | Replacement child was accepted as a source and no directory error was returned | Pre/post `dev/ino` mismatch reports only `replaceable` as `UNREADABLE_SOURCE`; replacement child appears in neither files nor errors |
+
+The narrowly scoped test hook runs the real filesystem replacement immediately before the real `readdir` call. It changes only scheduling; validation, replacement, `readdir`, identity checks, and assertions all use the real filesystem.
+
+### Verification
+
+Fresh command:
+
+```text
+pnpm exec vitest run tests/security/path-policy.test.ts && pnpm lint && pnpm typecheck && pnpm test && pnpm build
+```
+
+Result: exit 0.
+
+- Focused PathPolicy tests: 25 passed, 0 failed
+- ESLint: clean
+- TypeScript typecheck: clean
+- Full Vitest suite: 7 files passed, 50 tests passed, 0 failed
+- Client and server builds: succeeded
+
+### Self-review
+
+- Dirent data is never processed until post-read policy validation succeeds.
+- Device and inode comparison detects non-symlink rename replacement within an allowed root.
+- The previous parent-snapshot/child-validation replacement regression remains covered independently.
+- A post-read failure propagates to the parent entry boundary, so the item-level error path names the replaced directory rather than any fetched child.
+- Mutation review covers removal of post-read validation and removal of either identity comparison field.
+
+### Concerns
+
+None.

@@ -74,6 +74,12 @@ interface AllowedRoot {
   readonly canonicalPath: string;
 }
 
+interface DirectorySnapshot {
+  readonly canonicalPath: string;
+  readonly deviceId: number;
+  readonly inode: number;
+}
+
 export class PathPolicy {
   private constructor(private readonly allowedRoots: readonly AllowedRoot[]) {}
 
@@ -108,8 +114,8 @@ export class PathPolicy {
   }
 
   async authorizeDirectory(requestedPath: string): Promise<AuthorizedDirectory> {
-    const canonicalPath = await this.validateDirectory(requestedPath);
-    return { canonicalPath };
+    const directory = await this.validateDirectory(requestedPath);
+    return { canonicalPath: directory.canonicalPath };
   }
 
   async authorizeAsset(requestedPath: string): Promise<AuthorizedAsset> {
@@ -228,17 +234,22 @@ export class PathPolicy {
     return canonicalPath;
   }
 
-  private async validateDirectory(requestedPath: string): Promise<string> {
+  private async validateDirectory(requestedPath: string): Promise<DirectorySnapshot> {
     const canonicalPath = await this.validateExistingPath(requestedPath);
     try {
-      if (!(await stat(canonicalPath)).isDirectory()) {
+      const status = await stat(canonicalPath);
+      if (!status.isDirectory()) {
         throw new PathPolicyError('UNREADABLE_SOURCE', requestedPath);
       }
       await access(canonicalPath, constants.R_OK | constants.X_OK);
+      return {
+        canonicalPath,
+        deviceId: status.dev,
+        inode: status.ino,
+      };
     } catch (error) {
       throw classifyFilesystemError(error, requestedPath);
     }
-    return canonicalPath;
   }
 
   private findLexicalRoot(absolutePath: string): AllowedRoot | undefined {
@@ -254,12 +265,16 @@ export class PathPolicy {
     files: AuthorizedFile[],
     errors: PathPolicyItemError[],
   ): Promise<void> {
-    const canonicalDirectory = await this.validateDirectory(directory);
+    const beforeRead = await this.validateDirectory(directory);
     const entries = (
-      await readdir(canonicalDirectory, { withFileTypes: true })
+      await readdir(beforeRead.canonicalPath, { withFileTypes: true })
     ).toSorted((left, right) => left.name.localeCompare(right.name));
+    const afterRead = await this.validateDirectory(beforeRead.canonicalPath);
+    if (beforeRead.deviceId !== afterRead.deviceId || beforeRead.inode !== afterRead.inode) {
+      throw new PathPolicyError('UNREADABLE_SOURCE', directory);
+    }
     for (const entry of entries) {
-      const entryPath = join(canonicalDirectory, entry.name);
+      const entryPath = join(afterRead.canonicalPath, entry.name);
       try {
         if (entry.name.startsWith('.')) {
           throw new PathPolicyError('UNREADABLE_SOURCE', entryPath);
