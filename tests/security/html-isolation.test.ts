@@ -1,12 +1,12 @@
-import { copyFile, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { copyFile, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { afterEach, describe, expect, test } from 'vitest';
-import { chromium, type Browser } from 'playwright';
+import { chromium, type Browser, type BrowserContext } from 'playwright';
 
 import { HtmlRenderer } from '../../src/server/rendering/html-renderer.js';
-import { PathPolicy } from '../../src/server/security/path-policy.js';
+import { AssetReadLimitError, PathPolicy } from '../../src/server/security/path-policy.js';
 
 const temporaryDirectories: string[] = [];
 const renderers: HtmlRenderer[] = [];
@@ -59,7 +59,7 @@ describe('HTML isolation', () => {
   );
 
   test(
-    'fulfills allowed CSS, image, and font bytes through the path policy',
+    'fulfills and applies allowed CSS, image, and font bytes through the path policy',
     async () => {
       const root = await makeTemporaryDirectory();
       const sourcePath = join(root, 'artifact.html');
@@ -67,17 +67,21 @@ describe('HTML isolation', () => {
       await writeFile(
         join(root, 'styles.css'),
         `
-          @font-face { font-family: AssetFont; src: url('./probe.ttf') format('truetype'); }
+          @font-face { font-family: AssetFont; src: url('./Abel-Regular.ttf') format('truetype'); }
           html, body { margin: 0; background: rgb(200, 10, 20); }
           #image { width: 100px; height: 100px; background: url('./square.svg'); }
-          #font { font-family: AssetFont; font-size: 32px; }
+          #font { display: inline-block; font: 100px/100px AssetFont, monospace; }
+          #font-marker { display: inline-block; width: 20px; height: 100px; background: rgb(240, 200, 5); }
         `,
       );
       await writeFile(
         join(root, 'square.svg'),
         '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><rect width="100" height="100" fill="rgb(5, 40, 220)"/></svg>',
       );
-      await copyFile('/System/Library/Fonts/Symbol.ttf', join(root, 'probe.ttf'));
+      await copyFile(
+        join(process.cwd(), 'tests/fixtures/fonts/abel/Abel-Regular.ttf'),
+        join(root, 'Abel-Regular.ttf'),
+      );
       const renderer = await makeRenderer(root);
 
       const result = await renderer.render({
@@ -85,16 +89,57 @@ describe('HTML isolation', () => {
         html: `
           <link rel="stylesheet" href="./styles.css">
           <div id="image"></div>
-          <div id="font">ABC</div>
+          <span id="font">WWWW</span><span id="font-marker"></span>
         `,
       });
 
       expect(result.warnings).toEqual([]);
       expectPixelClose(await readWebpPixel(result.screenshot, 110, 10), [200, 10, 20]);
       expectPixelClose(await readWebpPixel(result.screenshot, 20, 20), [5, 40, 220]);
+      expectPixelClose(await readWebpPixel(result.screenshot, 305, 120), [240, 200, 5]);
     },
     20_000,
   );
+
+  test('fulfills local font capabilities with a browser-observed CORS header', async () => {
+    const root = await makeTemporaryDirectory();
+    const sourcePath = join(root, 'artifact.html');
+    await writeFile(sourcePath, '<h1>source</h1>');
+    await copyFile(
+      join(process.cwd(), 'tests/fixtures/fonts/abel/Abel-Regular.ttf'),
+      join(root, 'Abel-Regular.ttf'),
+    );
+    const policy = await PathPolicy.create([root]);
+    let fontCorsHeader: string | undefined;
+    const renderer = new HtmlRenderer(policy, {
+      launchBrowser: async () => {
+        const browser = await chromium.launch({ headless: true });
+        return proxyBrowserNewContext(browser, async (options) => {
+          const context = await browser.newContext(options);
+          context.on('response', async (response) => {
+            if (response.url().includes('Abel-Regular.ttf')) {
+              fontCorsHeader = (await response.allHeaders())['access-control-allow-origin'];
+            }
+          });
+          return context;
+        });
+      },
+    });
+    renderers.push(renderer);
+
+    await renderer.render({
+      sourcePath,
+      html: `
+        <style>
+          @font-face { font-family: AssetFont; src: url('./Abel-Regular.ttf') format('truetype'); }
+          #font { font: 100px AssetFont; }
+        </style>
+        <span id="font">WWWW</span>
+      `,
+    });
+
+    expect(fontCorsHeader).toBe('*');
+  });
 
   test.each([
     ['external HTTP', 'http://example.invalid/blocked.png'],
@@ -116,6 +161,105 @@ describe('HTML isolation', () => {
     expect(result.warnings).toContainEqual({ code: 'ASSET_BLOCKED' });
     expect(Object.keys(result.warnings[0] ?? {})).toEqual(['code']);
   });
+
+  test.each([
+    ['raw attribute', '<img src="nested/../outside-child.svg" alt="blocked">'],
+    ['percent-encoded attribute', '<img src="nested/%2e%2e/outside-child.svg" alt="blocked">'],
+    [
+      'double-percent-encoded attribute',
+      '<img src="nested/%252e%252e/outside-child.svg" alt="blocked">',
+    ],
+    [
+      'inline CSS URL',
+      '<div style="width: 20px; height: 20px; background: url(\'nested/../outside-child.svg\')"></div>',
+    ],
+    [
+      'CSS-escaped URL',
+      '<style>body { background: url(\'nested/\\2e \\2e /outside-child.svg\') }</style>',
+    ],
+  ])(
+    'rejects %s traversal before Chromium normalization without reading sibling bytes',
+    async (_label, html) => {
+      const root = await makeTemporaryDirectory();
+      const sourcePath = join(root, 'artifact.html');
+      const outsideChildPath = join(root, 'outside-child.svg');
+      await writeFile(sourcePath, '<h1>source</h1>');
+      await writeFile(
+        outsideChildPath,
+        '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><rect width="20" height="20" fill="red"/></svg>',
+      );
+      const canonicalOutsideChildPath = await realpath(outsideChildPath);
+      const realPolicy = await PathPolicy.create([root]);
+      const readPaths: string[] = [];
+      const renderer = new HtmlRenderer({
+        authorizeAsset: async (requestedPath) => {
+          const asset = await realPolicy.authorizeAsset(requestedPath);
+          return {
+            canonicalPath: asset.canonicalPath,
+            mimeType: asset.mimeType,
+            read: async (maxBytes) => {
+              readPaths.push(asset.canonicalPath);
+              return asset.read(maxBytes);
+            },
+          };
+        },
+      });
+      renderers.push(renderer);
+
+      const result = await renderer.render({ sourcePath, html });
+
+      expect(result.warnings).toContainEqual({ code: 'ASSET_BLOCKED' });
+      expect(readPaths).not.toContain(canonicalOutsideChildPath);
+    },
+    20_000,
+  );
+
+  test(
+    'rejects traversal inside an authorized stylesheet without reading sibling bytes',
+    async () => {
+      const root = await makeTemporaryDirectory();
+      const sourcePath = join(root, 'artifact.html');
+      const stylesheetPath = join(root, 'styles.css');
+      const outsideChildPath = join(root, 'outside-child.svg');
+      await writeFile(sourcePath, '<h1>source</h1>');
+      await writeFile(
+        stylesheetPath,
+        "body { background: url('nested/../outside-child.svg') }",
+      );
+      await writeFile(
+        outsideChildPath,
+        '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"></svg>',
+      );
+      const canonicalStylesheetPath = await realpath(stylesheetPath);
+      const canonicalOutsideChildPath = await realpath(outsideChildPath);
+      const realPolicy = await PathPolicy.create([root]);
+      const readPaths: string[] = [];
+      const renderer = new HtmlRenderer({
+        authorizeAsset: async (requestedPath) => {
+          const asset = await realPolicy.authorizeAsset(requestedPath);
+          return {
+            canonicalPath: asset.canonicalPath,
+            mimeType: asset.mimeType,
+            read: async (maxBytes) => {
+              readPaths.push(asset.canonicalPath);
+              return asset.read(maxBytes);
+            },
+          };
+        },
+      });
+      renderers.push(renderer);
+
+      const result = await renderer.render({
+        sourcePath,
+        html: '<link rel="stylesheet" href="./styles.css">',
+      });
+
+      expect(result.warnings).toContainEqual({ code: 'ASSET_BLOCKED' });
+      expect(readPaths).toContain(canonicalStylesheetPath);
+      expect(readPaths).not.toContain(canonicalOutsideChildPath);
+    },
+    20_000,
+  );
 
   test('denies a symlink to an outside asset through the real path policy', async () => {
     const root = await makeTemporaryDirectory();
@@ -173,6 +317,63 @@ describe('HTML isolation', () => {
       });
     },
     30_000,
+  );
+
+  test(
+    'serializes bounded asset reads against the reserved cumulative budget',
+    async () => {
+      const root = await makeTemporaryDirectory();
+      const sourcePath = join(root, 'artifact.html');
+      const assetPath = join(root, 'reserved.bin');
+      await writeFile(sourcePath, '<h1>source</h1>');
+      await writeFile(assetPath, Buffer.from('capability'));
+      const realPolicy = await PathPolicy.create([root]);
+      const requestedLimits: Array<number | undefined> = [];
+      let activeReads = 0;
+      let peakReads = 0;
+      const renderer = new HtmlRenderer({
+        authorizeAsset: async (requestedPath) => {
+          const asset = await realPolicy.authorizeAsset(requestedPath);
+          return {
+            canonicalPath: asset.canonicalPath,
+            mimeType: asset.mimeType,
+            read: async (maxBytes?: number) => {
+              requestedLimits.push(maxBytes);
+              activeReads += 1;
+              peakReads = Math.max(peakReads, activeReads);
+              try {
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                if (maxBytes !== undefined && maxBytes < 9 * 1024 * 1024) {
+                  throw new AssetReadLimitError(maxBytes);
+                }
+                return Buffer.alloc(9 * 1024 * 1024, 0x64);
+              } finally {
+                activeReads -= 1;
+              }
+            },
+          };
+        },
+      });
+      renderers.push(renderer);
+      const images = Array.from(
+        { length: 6 },
+        (_, index) => `<img src="./reserved.bin?request=${index}" alt="asset ${index}">`,
+      ).join('');
+
+      await expect(renderer.render({ sourcePath, html: images })).rejects.toMatchObject({
+        code: 'ASSET_TOO_LARGE',
+      });
+      expect(peakReads).toBe(1);
+      expect(requestedLimits).toEqual([
+        10 * 1024 * 1024,
+        10 * 1024 * 1024,
+        10 * 1024 * 1024,
+        10 * 1024 * 1024,
+        10 * 1024 * 1024,
+        5 * 1024 * 1024,
+      ]);
+    },
+    20_000,
   );
 
   test('clips long pages at 2400px and exposes a structured warning', async () => {
@@ -467,6 +668,95 @@ describe('HTML isolation', () => {
     expect(recovered.screenshot.subarray(8, 12).toString('ascii')).toBe('WEBP');
     expect(launchedBrowsers[1]?.contexts()).toHaveLength(0);
   });
+
+  test(
+    'closes a context returned after the render timeout before clearing permissions',
+    async () => {
+      const root = await makeTemporaryDirectory();
+      const sourcePath = join(root, 'artifact.html');
+      await writeFile(sourcePath, '<h1>source</h1>');
+      const policy = await PathPolicy.create([root]);
+      const returnContext = deferred<void>();
+      const finishPermissions = deferred<void>();
+      const contextCreated = deferred<void>();
+      let permissionsCalled = false;
+      let actualBrowser: Browser | undefined;
+      const renderer = new HtmlRenderer(policy, {
+        renderTimeoutMs: 1_500,
+        launchBrowser: async () => {
+          actualBrowser = await chromium.launch({ headless: true });
+          return proxyBrowserNewContext(actualBrowser, async (options) => {
+            const context = await actualBrowser?.newContext(options);
+            if (!context) throw new Error('Browser context was not created');
+            contextCreated.resolve();
+            await returnContext.promise;
+            return proxyContextClearPermissions(context, async () => {
+              permissionsCalled = true;
+              await finishPermissions.promise;
+            });
+          });
+        },
+      });
+      renderers.push(renderer);
+      const outcome = renderer
+        .render({ sourcePath, html: '<h1>Timeout</h1>' })
+        .then(() => ({ code: 'RENDERED' }), (error: unknown) => error);
+
+      try {
+        await contextCreated.promise;
+        await expect(outcome).resolves.toMatchObject({ code: 'TIMEOUT' });
+        returnContext.resolve();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        expect(permissionsCalled).toBe(false);
+        expect(actualBrowser?.contexts()).toHaveLength(0);
+      } finally {
+        returnContext.resolve();
+        finishPermissions.resolve();
+      }
+    },
+    5_000,
+  );
+
+  test(
+    'tracks and closes a context while clearPermissions is delayed',
+    async () => {
+      const root = await makeTemporaryDirectory();
+      const sourcePath = join(root, 'artifact.html');
+      await writeFile(sourcePath, '<h1>source</h1>');
+      const policy = await PathPolicy.create([root]);
+      const finishPermissions = deferred<void>();
+      const permissionsCalled = deferred<void>();
+      let actualBrowser: Browser | undefined;
+      const renderer = new HtmlRenderer(policy, {
+        renderTimeoutMs: 1_500,
+        launchBrowser: async () => {
+          actualBrowser = await chromium.launch({ headless: true });
+          return proxyBrowserNewContext(actualBrowser, async (options) => {
+            const context = await actualBrowser?.newContext(options);
+            if (!context) throw new Error('Browser context was not created');
+            return proxyContextClearPermissions(context, async () => {
+              permissionsCalled.resolve();
+              await finishPermissions.promise;
+            });
+          });
+        },
+      });
+      renderers.push(renderer);
+      const outcome = renderer
+        .render({ sourcePath, html: '<h1>Timeout</h1>' })
+        .then(() => ({ code: 'RENDERED' }), (error: unknown) => error);
+
+      try {
+        await permissionsCalled.promise;
+        await expect(outcome).resolves.toMatchObject({ code: 'TIMEOUT' });
+        expect(actualBrowser?.contexts()).toHaveLength(0);
+      } finally {
+        finishPermissions.resolve();
+      }
+    },
+    5_000,
+  );
 });
 
 async function makeTemporaryDirectory(): Promise<string> {
@@ -540,4 +830,44 @@ function expectPixelClose(
   for (const [index, expectedChannel] of expected.entries()) {
     expect(Math.abs((actual[index] ?? 0) - expectedChannel)).toBeLessThanOrEqual(3);
   }
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value?: T) => void;
+} {
+  let resolvePromise: ((value: T) => void) | undefined;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return {
+    promise,
+    resolve: (value) => resolvePromise?.(value as T),
+  };
+}
+
+function proxyBrowserNewContext(
+  browser: Browser,
+  newContext: (...args: Parameters<Browser['newContext']>) => Promise<BrowserContext>,
+): Browser {
+  return new Proxy(browser, {
+    get(target, property) {
+      if (property === 'newContext') return newContext;
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
+function proxyContextClearPermissions(
+  context: BrowserContext,
+  clearPermissions: () => Promise<void>,
+): BrowserContext {
+  return new Proxy(context, {
+    get(target, property) {
+      if (property === 'clearPermissions') return clearPermissions;
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
 }

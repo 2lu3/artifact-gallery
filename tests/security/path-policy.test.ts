@@ -429,6 +429,19 @@ describe('PathPolicy', () => {
     await expect(authorized.read()).rejects.toMatchObject({ code: 'SYMLINK_REJECTED' });
   });
 
+  test('stops a bounded asset read when the file exceeds the byte limit', async () => {
+    const root = await makeTemporaryDirectory();
+    const source = join(root, 'bounded.bin');
+    await writeFile(source, Buffer.alloc(1025, 0x61));
+    const policy = await PathPolicy.create([root]);
+    const asset = await policy.authorizeAsset(source);
+
+    await expect(asset.read(1024)).rejects.toMatchObject({
+      name: 'AssetReadLimitError',
+      maxBytes: 1024,
+    });
+  });
+
   test('normalizes disappearance after validation but before the read syscall', async () => {
     const root = await makeTemporaryDirectory();
     const source = join(root, 'vanishing.png');

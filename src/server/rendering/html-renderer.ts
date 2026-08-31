@@ -1,9 +1,19 @@
 import { randomUUID } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 
+import * as cssTree from 'css-tree';
+import {
+  parse as parseHtml,
+  serialize as serializeHtml,
+  type DefaultTreeAdapterTypes,
+} from 'parse5';
 import { chromium, type Browser, type BrowserContext, type Page, type Route } from 'playwright';
 
-import type { PathPolicy } from '../security/path-policy.js';
+import {
+  AssetReadLimitError,
+  type AuthorizedAsset,
+  type PathPolicy,
+} from '../security/path-policy.js';
 
 export type HtmlRenderErrorCode =
   | 'HTML_RENDER_FAILED'
@@ -52,6 +62,33 @@ const SCREENSHOT_WIDTH = 1200;
 const SCREENSHOT_MAX_HEIGHT = 2400;
 const VIRTUAL_ASSET_ORIGIN = 'https://artifact.invalid';
 
+const HTML_URL_ATTRIBUTES = new Set([
+  'action',
+  'background',
+  'cite',
+  'data',
+  'formaction',
+  'href',
+  'longdesc',
+  'manifest',
+  'poster',
+  'src',
+  'xlink:href',
+]);
+
+const SVG_CSS_URL_ATTRIBUTES = new Set([
+  'clip-path',
+  'cursor',
+  'fill',
+  'filter',
+  'marker',
+  'marker-end',
+  'marker-mid',
+  'marker-start',
+  'mask',
+  'stroke',
+]);
+
 const CONTENT_SECURITY_POLICY = [
   "default-src 'none'",
   "script-src 'none'",
@@ -69,9 +106,43 @@ const CONTENT_SECURITY_POLICY = [
 
 interface RenderState {
   readonly warnings: Set<HtmlRenderWarningCode>;
-  totalAssetBytes: number;
+  readonly assetBudget: AssetBudget;
   blockedNavigation: boolean;
   error?: HtmlRenderError;
+}
+
+class AssetBudget {
+  private remainingBytes = MAX_TOTAL_ASSET_BYTES;
+  private failed = false;
+  private tail: Promise<void> = Promise.resolve();
+
+  read(asset: AuthorizedAsset): Promise<Buffer> {
+    const operation = this.tail.then(() => this.readNext(asset));
+    this.tail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
+  }
+
+  private async readNext(asset: AuthorizedAsset): Promise<Buffer> {
+    if (this.failed || this.remainingBytes <= 0) {
+      this.failed = true;
+      throw new AssetReadLimitError(Math.max(0, this.remainingBytes));
+    }
+    const reservedBytes = Math.min(MAX_ASSET_BYTES, this.remainingBytes);
+    try {
+      const bytes = await asset.read(reservedBytes);
+      if (bytes.byteLength > reservedBytes) {
+        throw new AssetReadLimitError(reservedBytes);
+      }
+      this.remainingBytes -= bytes.byteLength;
+      return bytes;
+    } catch (error) {
+      if (error instanceof AssetReadLimitError) this.failed = true;
+      throw error;
+    }
+  }
 }
 
 interface RenderAttemptHandle {
@@ -195,11 +266,10 @@ export class HtmlRenderer {
     let releaseContextSlot: (() => void) | undefined;
     try {
       releaseContextSlot = await this.contextLimiter.acquire(signal);
-      context = await this.createContext(signal);
-      handle.context = context;
+      context = await this.createContext(signal, handle);
       const state: RenderState = {
         warnings: new Set(),
-        totalAssetBytes: 0,
+        assetBudget: new AssetBudget(),
         blockedNavigation: false,
       };
       const assetToken = randomUUID();
@@ -212,7 +282,15 @@ export class HtmlRenderer {
       });
       const page = await context.newPage();
       this.blockPageCapabilities(page, state.warnings);
-      await page.setContent(this.isolatedDocument(request.html, assetToken), { waitUntil: 'load' });
+      const virtualBaseUrl = `${VIRTUAL_ASSET_ORIGIN}/${assetToken}/`;
+      const rewrittenHtml = this.rewriteHtmlAssetReferences(
+        request.html,
+        virtualBaseUrl,
+        state.warnings,
+      );
+      await page.setContent(this.isolatedDocument(rewrittenHtml, assetToken), {
+        waitUntil: 'load',
+      });
       try {
         await page.evaluate(() => document.fonts.ready);
       } catch (error) {
@@ -259,19 +337,34 @@ export class HtmlRenderer {
     await browser?.close().catch(() => undefined);
   }
 
-  private async createContext(signal: AbortSignal): Promise<BrowserContext> {
+  private async createContext(
+    signal: AbortSignal,
+    handle: RenderAttemptHandle,
+  ): Promise<BrowserContext> {
     const browser = await this.ensureBrowser();
-    if (signal.aborted) {
-      throw new HtmlRenderError('TIMEOUT');
+    this.assertAttemptActive(signal);
+    let context: BrowserContext | undefined;
+    try {
+      context = await browser.newContext({
+        acceptDownloads: false,
+        javaScriptEnabled: false,
+        serviceWorkers: 'block',
+        viewport: { width: SCREENSHOT_WIDTH, height: 800 },
+      });
+      handle.context = context;
+      this.assertAttemptActive(signal);
+      await context.clearPermissions();
+      this.assertAttemptActive(signal);
+      return context;
+    } catch (error) {
+      await context?.close().catch(() => undefined);
+      if (handle.context === context) handle.context = undefined;
+      throw error;
     }
-    const context = await browser.newContext({
-      acceptDownloads: false,
-      javaScriptEnabled: false,
-      serviceWorkers: 'block',
-      viewport: { width: SCREENSHOT_WIDTH, height: 800 },
-    });
-    await context.clearPermissions();
-    return context;
+  }
+
+  private assertAttemptActive(signal: AbortSignal): void {
+    if (signal.aborted) throw new HtmlRenderError('TIMEOUT');
   }
 
   private async ensureBrowser(): Promise<Browser> {
@@ -323,25 +416,34 @@ export class HtmlRenderer {
     }
     try {
       const asset = await this.pathPolicy.authorizeAsset(assetPath);
-      const bytes = await asset.read();
-      if (
-        bytes.byteLength > MAX_ASSET_BYTES ||
-        state.totalAssetBytes + bytes.byteLength > MAX_TOTAL_ASSET_BYTES
-      ) {
-        state.error = new HtmlRenderError('ASSET_TOO_LARGE');
-        await route.abort('blockedbyclient');
-        return;
-      }
-      state.totalAssetBytes += bytes.byteLength;
+      const bytes = await state.assetBudget.read(asset);
+      const body = asset.mimeType.startsWith('text/css')
+        ? Buffer.from(
+            this.rewriteCssAssetReferences(
+              bytes.toString('utf8'),
+              route.request().url(),
+              `${VIRTUAL_ASSET_ORIGIN}/${assetToken}/`,
+              'stylesheet',
+              state.warnings,
+            ),
+          )
+        : bytes;
       await route.fulfill({
         status: 200,
-        body: bytes,
+        body,
         contentType: asset.mimeType,
-        headers: { 'x-content-type-options': 'nosniff' },
+        headers: {
+          'access-control-allow-origin': '*',
+          'x-content-type-options': 'nosniff',
+        },
       });
-    } catch {
-      state.warnings.add('ASSET_BLOCKED');
-      await route.abort('blockedbyclient');
+    } catch (error) {
+      if (error instanceof AssetReadLimitError) {
+        state.error = new HtmlRenderError('ASSET_TOO_LARGE');
+      } else {
+        state.warnings.add('ASSET_BLOCKED');
+      }
+      await route.abort('blockedbyclient').catch(() => undefined);
     }
   }
 
@@ -403,6 +505,151 @@ export class HtmlRenderer {
       ${html}`;
   }
 
+  private rewriteHtmlAssetReferences(
+    html: string,
+    virtualBaseUrl: string,
+    warnings: Set<HtmlRenderWarningCode>,
+  ): string {
+    const document = parseHtml(html);
+    const visit = (node: DefaultTreeAdapterTypes.Node): void => {
+      if (isHtmlElement(node)) {
+        if (node.tagName === 'base') {
+          const hadBaseCapability = node.attrs.some(({ name }) => name === 'href' || name === 'target');
+          node.attrs = node.attrs.filter(({ name }) => name !== 'href' && name !== 'target');
+          if (hadBaseCapability) warnings.add('ASSET_BLOCKED');
+        }
+        if (
+          node.tagName === 'meta' &&
+          node.attrs.some(
+            ({ name, value }) => name === 'http-equiv' && value.toLowerCase() === 'refresh',
+          )
+        ) {
+          const content = node.attrs.find(({ name }) => name === 'content');
+          if (content) content.value = '';
+          warnings.add('ASSET_BLOCKED');
+        }
+
+        for (const attribute of node.attrs) {
+          const attributeName = attribute.name.toLowerCase();
+          if (HTML_URL_ATTRIBUTES.has(attributeName)) {
+            const rewritten = rewriteLocalAssetUrl(
+              attribute.value,
+              virtualBaseUrl,
+              virtualBaseUrl,
+            );
+            if (rewritten === null) {
+              attribute.value = 'data:,blocked';
+              warnings.add('ASSET_BLOCKED');
+            } else {
+              attribute.value = rewritten;
+            }
+          } else if (attributeName === 'srcset' || attributeName === 'ping') {
+            attribute.value = '';
+            warnings.add('ASSET_BLOCKED');
+          } else if (attributeName === 'srcdoc') {
+            attribute.value = '';
+            warnings.add('ASSET_BLOCKED');
+          } else if (attributeName === 'style') {
+            attribute.value = this.rewriteCssAssetReferences(
+              attribute.value,
+              virtualBaseUrl,
+              virtualBaseUrl,
+              'declarationList',
+              warnings,
+            );
+          } else if (SVG_CSS_URL_ATTRIBUTES.has(attributeName)) {
+            attribute.value = this.rewriteCssAssetReferences(
+              attribute.value,
+              virtualBaseUrl,
+              virtualBaseUrl,
+              'value',
+              warnings,
+            );
+          }
+        }
+
+        if (node.tagName === 'style') {
+          const stylesheet = node.childNodes
+            .filter(isHtmlTextNode)
+            .map(({ value }) => value)
+            .join('');
+          node.childNodes = [
+            {
+              nodeName: '#text',
+              parentNode: node,
+              value: this.rewriteCssAssetReferences(
+                stylesheet,
+                virtualBaseUrl,
+                virtualBaseUrl,
+                'stylesheet',
+                warnings,
+              ),
+            },
+          ];
+        }
+        if (node.tagName === 'template' && 'content' in node) {
+          visit(node.content);
+        }
+      }
+      if ('childNodes' in node) {
+        for (const child of node.childNodes) visit(child);
+      }
+    };
+    visit(document);
+    return serializeHtml(document);
+  }
+
+  private rewriteCssAssetReferences(
+    css: string,
+    resolutionBaseUrl: string,
+    virtualAssetRootUrl: string,
+    context: 'stylesheet' | 'declarationList' | 'value',
+    warnings: Set<HtmlRenderWarningCode>,
+  ): string {
+    let malformed = false;
+    let ast: cssTree.CssNode;
+    try {
+      ast = cssTree.parse(css, {
+        context,
+        parseCustomProperty: true,
+        onParseError: () => {
+          malformed = true;
+        },
+      });
+    } catch {
+      warnings.add('ASSET_BLOCKED');
+      return '';
+    }
+    cssTree.walk(ast, function (node) {
+      if (node.type === 'Raw') {
+        malformed = true;
+        return;
+      }
+      const stringIsAssetUrl =
+        node.type === 'String' &&
+        (this.atrule?.name.toLowerCase() === 'import' ||
+          this.function?.name.toLowerCase() === 'image-set' ||
+          this.function?.name.toLowerCase() === '-webkit-image-set');
+      if (node.type !== 'Url' && !stringIsAssetUrl) return;
+      const rewritten = rewriteLocalAssetUrl(
+        node.value,
+        resolutionBaseUrl,
+        virtualAssetRootUrl,
+      );
+      if (rewritten === null) {
+        node.value = 'data:,blocked';
+        warnings.add('ASSET_BLOCKED');
+      } else {
+        node.value = rewritten;
+      }
+    });
+    if (malformed) {
+      warnings.add('ASSET_BLOCKED');
+      return '';
+    }
+    return cssTree.generate(ast);
+  }
+
   private async replaceBlockedNavigation(page: Page): Promise<void> {
     await page.goto('about:blank', { waitUntil: 'commit' });
     await page.setContent(
@@ -425,4 +672,63 @@ export class HtmlRenderer {
       await session.detach().catch(() => undefined);
     }
   }
+}
+
+function isHtmlElement(
+  node: DefaultTreeAdapterTypes.Node,
+): node is DefaultTreeAdapterTypes.Element | DefaultTreeAdapterTypes.Template {
+  return 'tagName' in node;
+}
+
+function isHtmlTextNode(
+  node: DefaultTreeAdapterTypes.ChildNode,
+): node is DefaultTreeAdapterTypes.TextNode {
+  return node.nodeName === '#text';
+}
+
+function rewriteLocalAssetUrl(
+  rawUrl: string,
+  resolutionBaseUrl: string,
+  virtualAssetRootUrl: string,
+): string | null {
+  const candidate = rawUrl.trim();
+  if (candidate.startsWith('#') || candidate.toLowerCase().startsWith('data:')) {
+    return candidate;
+  }
+  if (candidate.length === 0 || containsTraversalAfterDecoding(candidate)) {
+    return null;
+  }
+  try {
+    const url = new URL(candidate, resolutionBaseUrl);
+    const virtualRoot = new URL(virtualAssetRootUrl);
+    if (
+      url.origin !== virtualRoot.origin ||
+      !url.pathname.startsWith(virtualRoot.pathname) ||
+      url.username !== '' ||
+      url.password !== ''
+    ) {
+      return null;
+    }
+    return url.href;
+  } catch {
+    return null;
+  }
+}
+
+function containsTraversalAfterDecoding(rawUrl: string): boolean {
+  let decoded = rawUrl;
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (decoded.includes('\0') || decoded.includes('\\')) return true;
+    const path = decoded.split(/[?#]/u, 1)[0] ?? '';
+    if (path.startsWith('/') || path.split('/').includes('..')) return true;
+    let next: string;
+    try {
+      next = decodeURIComponent(decoded);
+    } catch {
+      return true;
+    }
+    if (next === decoded) return false;
+    decoded = next;
+  }
+  return true;
 }

@@ -106,4 +106,55 @@ Google Chrome for Testing 145.0.7632.6
 ## Concerns
 
 - The 500 KB screenshot target is intentionally not enforced here; the brief assigns guaranteed processing/encoding to Task 5. Task 4 emits WebP at quality 80 with the required dimensions.
-- The allowed-font integration fixture copies the macOS system Symbol font; the current Codex desktop target is macOS. A cross-platform CI environment would need a checked-in redistributable font fixture.
+
+## Round 1 security follow-up
+
+All four Important review findings were addressed with focused RED/GREEN cycles:
+
+| Finding | Focused RED | GREEN implementation/evidence |
+| --- | --- | --- |
+| Asset reads allocated the complete file before checking limits | `AuthorizedAsset.read(1024)` returned all 1025 bytes instead of rejecting | `PathPolicy` now opens and stats the file, then reads at most `limit + 1` in 64 KiB chunks; `AssetReadLimitError` is preserved across filesystem normalization |
+| Parallel requests raced the 50 MiB cumulative check | Six simulated 9 MiB reads ran concurrently (`peakReads = 6`) | Per-render `AssetBudget` serializes reservation/read/commit, passes the remaining individual/total bound before I/O, and the regression observes `peakReads = 1` with the sixth request bounded to 5 MiB |
+| Contexts were untracked during `newContext()` / `clearPermissions()` | A context returned after timeout still entered `clearPermissions()`; a context was visible while delayed permission clearing timed out | Context is recorded immediately after creation, each awaited setup step is followed by an abort check, and setup failures close their own context; both delayed regressions observe zero live contexts without adding a production test hook |
+| Font fixture/application and CORS were not demonstrated | Browser-observed font response reported `access-control-allow-origin: null` | Route fulfillment now emits `Access-Control-Allow-Origin: *`; the checked-in Abel fixture visibly changes text metrics/pixels and `document.fonts.ready` completes in real Chromium |
+| Browser URL normalization erased raw traversal evidence | Raw, percent-encoded, inline-CSS, and CSS-escaped nested traversal produced no warning and read the sibling asset | `parse5` walks HTML attributes before content load and `css-tree` walks inline/external CSS URL AST nodes before fulfillment; allowed relative references are rewritten to the per-render virtual capability origin, traversal is decoded repeatedly and denied before Chromium sees it, and six real-browser cases observe that sibling bytes are never read |
+
+The traversal boundary also neutralizes user `<base>`, meta refresh, `srcset`, `ping`, and `srcdoc` capabilities before content loading. Invalid/unparsed CSS is default-denied instead of being passed through. The implementation still uses Playwright routing directly and introduces no HTTP server or proxy.
+
+### Portable font fixture
+
+- Fixture: `tests/fixtures/fonts/abel/Abel-Regular.ttf`
+- License: SIL Open Font License 1.1, copied at `tests/fixtures/fonts/abel/OFL.txt`
+- Provenance and SHA-256 are fixed in `tests/fixtures/fonts/abel/SOURCE.md`
+- Font SHA-256: `8809dcad25318225052f88333e208c5aad4adcb7b2c934c135735ec19aa410b4`
+- The former macOS system-font concern is resolved; the integration test no longer depends on `/System/Library/Fonts`.
+
+### Round 1 verification
+
+Focused security verification:
+
+```text
+pnpm exec vitest run tests/security/html-isolation.test.ts tests/security/path-policy.test.ts
+Test Files  2 passed (2)
+Tests       61 passed (61)
+```
+
+Binding full verification:
+
+```text
+pnpm lint
+passed
+
+pnpm typecheck
+passed
+
+pnpm test
+Test Files  8 passed (8)
+Tests       86 passed (86)
+
+pnpm build
+vite build: passed
+tsc --project tsconfig.server.json: passed
+```
+
+Round 1 fix and report are committed together in the follow-up commit.

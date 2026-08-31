@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { access, lstat, readFile, readdir, realpath, stat } from 'node:fs/promises';
+import { access, lstat, open, readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 const SUPPORTED_EXTENSIONS = new Set(['.html', '.htm', '.md']);
@@ -52,7 +52,14 @@ export interface AuthorizedDirectory {
 export interface AuthorizedAsset {
   readonly canonicalPath: string;
   readonly mimeType: string;
-  read(): Promise<Buffer>;
+  read(maxBytes?: number): Promise<Buffer>;
+}
+
+export class AssetReadLimitError extends Error {
+  constructor(readonly maxBytes: number) {
+    super('Asset read limit exceeded');
+    this.name = 'AssetReadLimitError';
+  }
 }
 
 export interface MissingPath {
@@ -123,9 +130,11 @@ export class PathPolicy {
     return {
       canonicalPath,
       mimeType: mimeTypeFor(canonicalPath),
-      read: () =>
+      read: (maxBytes) =>
         normalizeFilesystemOperation(requestedPath, async () =>
-          readFile(await this.validateReadableFile(requestedPath)),
+          maxBytes === undefined
+            ? readFile(await this.validateReadableFile(requestedPath))
+            : readFileBounded(await this.validateReadableFile(requestedPath), maxBytes),
         ),
     };
   }
@@ -353,6 +362,37 @@ async function normalizeFilesystemOperation<T>(
   try {
     return await operation();
   } catch (error) {
+    if (error instanceof AssetReadLimitError) {
+      throw error;
+    }
     throw classifyFilesystemError(error, requestedPath);
+  }
+}
+
+async function readFileBounded(sourcePath: string, maxBytes: number): Promise<Buffer> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new AssetReadLimitError(maxBytes);
+  }
+  const handle = await open(sourcePath, 'r');
+  try {
+    const status = await handle.stat();
+    if (status.size > maxBytes) {
+      throw new AssetReadLimitError(maxBytes);
+    }
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    while (totalBytes <= maxBytes) {
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1 - totalBytes));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.byteLength, null);
+      if (bytesRead === 0) break;
+      chunks.push(chunk.subarray(0, bytesRead));
+      totalBytes += bytesRead;
+    }
+    if (totalBytes > maxBytes) {
+      throw new AssetReadLimitError(maxBytes);
+    }
+    return Buffer.concat(chunks, totalBytes);
+  } finally {
+    await handle.close();
   }
 }
