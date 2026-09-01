@@ -141,3 +141,10 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Playwright output
+test-results/
+playwright-report/
+
+# Local runtime state (the default lives outside the repository)
+.artifact-gallery/

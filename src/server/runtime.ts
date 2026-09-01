@@ -1,0 +1,195 @@
+import { mkdir } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path'
+
+import type Database from 'better-sqlite3'
+
+import { buildApp, DEFAULT_LISTEN_OPTIONS, type LocalApiApp } from './app.js'
+import { openDatabase } from './db/database.js'
+import { ArtifactProcessor } from './processing/artifact-processor.js'
+import { createPlatformAdapter, type SourcePlatformAdapter } from './platform/platform-adapter.js'
+import { WebpThumbnailOptimizer } from './processing/thumbnail-optimizer.js'
+import { reconcileStartup, type StartupReconciliationReport } from './processing/recovery.js'
+import { reconcileSourceStatuses } from './processing/source-status-reconciler.js'
+import { ImportWorker } from './processing/worker.js'
+import { HtmlRenderer } from './rendering/html-renderer.js'
+import { AllowedRootRepository } from './repositories/allowed-root-repository.js'
+import { DerivativePathPolicy } from './security/derivative-path-policy.js'
+import { PathPolicy } from './security/path-policy.js'
+
+export interface ServerRuntimeOptions {
+  readonly databaseFilename: string
+  readonly thumbnailDirectory: string
+  readonly allowedRoots: readonly string[]
+  readonly clientDirectory?: string
+  readonly port?: number
+  readonly platformAdapter?: SourcePlatformAdapter
+  readonly reportRecovery?: (report: StartupReconciliationReport) => void | Promise<void>
+}
+
+export async function createServerRuntime(options: ServerRuntimeOptions): Promise<LocalApiApp> {
+  await mkdir(dirname(options.databaseFilename), { recursive: true })
+  await mkdir(options.thumbnailDirectory, { recursive: true })
+  const database = openDatabase({ filename: options.databaseFilename })
+  try {
+    const recovery = await reconcileStartup(database, {
+      temporaryDerivativeDirectory: options.thumbnailDirectory,
+      interruptedAt: new Date().toISOString(),
+    })
+    await reportRecovery(options, recovery)
+    const allowedRoots = new AllowedRootRepository(database)
+    const persistedCapabilities = allowedRoots.list()
+    const pathPolicy = PathPolicy.restoreCapabilities(
+      persistedCapabilities.map(({ canonicalPath, kind }) => ({ canonicalPath, kind })),
+    )
+    for (const configuredRoot of options.allowedRoots) {
+      const capability = await pathPolicy.addSelectedCapability(configuredRoot, 'folder')
+      allowedRoots.add(capability.canonicalPath, capability.kind, new Date().toISOString())
+    }
+    backfillArtifactCapabilities(database, allowedRoots)
+    await reconcileSourceStatuses({
+      database,
+      authorizeFile: pathPolicy.authorizeFile.bind(pathPolicy),
+      timeoutMs: 250,
+    })
+    const derivativePathPolicy = await PathPolicy.create([options.thumbnailDirectory])
+    const derivativeMutationPolicy = await DerivativePathPolicy.create(options.thumbnailDirectory)
+    const htmlRenderer = new HtmlRenderer(pathPolicy)
+    const processor = new ArtifactProcessor({
+      database,
+      pathPolicy,
+      derivativePathPolicy: derivativeMutationPolicy,
+      htmlRenderer,
+      thumbnailDirectory: options.thumbnailDirectory,
+      thumbnailOptimizer: new WebpThumbnailOptimizer({
+        encode: (request) => htmlRenderer.encodeWebp(request),
+      }),
+    })
+    const importWorker = new ImportWorker({ processor, concurrency: 2, capacity: 64 })
+    const app = buildApp({
+      database,
+      pathPolicy,
+      derivativePathPolicy,
+      derivativeMutationPolicy,
+      importWorker,
+      thumbnailDirectory: options.thumbnailDirectory,
+      clientDirectory: options.clientDirectory,
+      trustedPort: options.port ?? DEFAULT_LISTEN_OPTIONS.port,
+      platformAdapter: options.platformAdapter ?? createPlatformAdapter(process.platform),
+    })
+    app.addHook('onClose', async () => {
+      await importWorker.close()
+      await htmlRenderer.close()
+      database.close()
+    })
+    return app
+  } catch (error) {
+    database.close()
+    throw error
+  }
+}
+
+async function reportRecovery(
+  options: ServerRuntimeOptions,
+  report: StartupReconciliationReport,
+): Promise<void> {
+  if (
+    report.interruptedRunIds.length === 0 &&
+    report.unstartedItems.length === 0 &&
+    report.removedTemporaryFiles.length === 0 &&
+    report.removedOrphanFiles.length === 0 &&
+    report.errors.length === 0
+  ) {
+    return
+  }
+  try {
+    if (options.reportRecovery) {
+      await options.reportRecovery(report)
+      return
+    }
+    process.stderr.write(`[artifact-gallery] startup-recovery ${JSON.stringify(report)}\n`)
+  } catch {
+    // Recovery reporting must not make a reconciled local catalog unavailable.
+  }
+}
+
+export function runtimeOptionsFromEnvironment(
+  environment: NodeJS.ProcessEnv = process.env,
+): ServerRuntimeOptions {
+  const stateDirectory = resolve(
+    environment.ARTIFACT_GALLERY_STATE_DIRECTORY ?? defaultStateDirectory(environment),
+  )
+  const configuredRoots = environment.ARTIFACT_GALLERY_ALLOWED_ROOTS
+  const configuredPort = Number(environment.PORT)
+  return {
+    databaseFilename: resolve(
+      environment.ARTIFACT_GALLERY_DATABASE ?? resolve(stateDirectory, 'catalog.sqlite'),
+    ),
+    thumbnailDirectory: resolve(
+      environment.ARTIFACT_GALLERY_THUMBNAILS ?? resolve(stateDirectory, 'thumbnails'),
+    ),
+    allowedRoots:
+      configuredRoots === undefined
+        ? []
+        : configuredRoots
+            .split(delimiter)
+            .map((root) => root.trim())
+            .filter(Boolean),
+    clientDirectory:
+      environment.ARTIFACT_GALLERY_DEVELOPMENT === '1'
+        ? undefined
+        : resolve(environment.ARTIFACT_GALLERY_CLIENT_DIRECTORY ?? 'dist'),
+    port:
+      Number.isSafeInteger(configuredPort) && configuredPort > 0 && configuredPort <= 65_535
+        ? configuredPort
+        : DEFAULT_LISTEN_OPTIONS.port,
+  }
+}
+
+function backfillArtifactCapabilities(
+  database: Database.Database,
+  repository: AllowedRootRepository,
+): void {
+  const capabilities = repository
+    .list()
+    .toSorted((left, right) => right.canonicalPath.length - left.canonicalPath.length)
+  const artifacts = database
+    .prepare(
+      `SELECT artifact.id, artifact.source_path
+       FROM artifact
+       LEFT JOIN artifact_allowed_root ON artifact_allowed_root.artifact_id = artifact.id
+       WHERE artifact_allowed_root.artifact_id IS NULL
+       ORDER BY artifact.id`,
+    )
+    .all() as Array<{ id: number; source_path: string }>
+  for (const artifact of artifacts) {
+    const capability = capabilities.find((candidate) =>
+      candidate.kind === 'file'
+        ? artifact.source_path === candidate.canonicalPath
+        : isContainedPath(candidate.canonicalPath, artifact.source_path),
+    )
+    if (capability) repository.linkArtifact(artifact.id, capability.id)
+  }
+}
+
+function isContainedPath(root: string, candidate: string): boolean {
+  const child = relative(root, candidate)
+  return child === '' || (!child.startsWith('..') && !isAbsolute(child))
+}
+
+function defaultStateDirectory(environment: NodeJS.ProcessEnv): string {
+  const homeDirectory = environment.HOME ?? homedir()
+  if (process.platform === 'darwin') {
+    return join(homeDirectory, 'Library', 'Application Support', 'Artifact Gallery')
+  }
+  if (process.platform === 'win32') {
+    return join(
+      environment.LOCALAPPDATA ?? environment.APPDATA ?? join(homeDirectory, 'AppData', 'Local'),
+      'Artifact Gallery',
+    )
+  }
+  return join(
+    environment.XDG_STATE_HOME ?? join(homeDirectory, '.local', 'state'),
+    'artifact-gallery',
+  )
+}
