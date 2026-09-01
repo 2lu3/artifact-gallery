@@ -1,11 +1,10 @@
 import { spawn, type ChildProcess } from 'node:child_process'
-import { once } from 'node:events'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createConnection, createServer } from 'node:net'
 import { cpus, tmpdir, totalmem } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
-import { chromium, type Browser, type Page } from 'playwright'
+import { chromium, type Browser, type BrowserContext, type Page } from 'playwright'
 
 import {
   buildIsolatedProductionEnvironment,
@@ -25,11 +24,18 @@ import {
   type DurationSummary,
   type PerformanceProfileName,
 } from './harness.js'
+import {
+  observeChildExit,
+  runManagedPerformanceScenario,
+  terminateChildProcess,
+} from './resource-lifecycle.js'
 
 const FIRST_PAGE_RUNS = 5
 const SEARCH_RUNS = 10
 const DEFAULT_RESULTS_PATH = 'test-results/performance/results.json'
-const PROCESS_TIMEOUT_MS = 15_000
+const PROCESS_READY_TIMEOUT_MS = 15_000
+const PROCESS_TERM_TIMEOUT_MS = 2_000
+const PROCESS_KILL_TIMEOUT_MS = 2_000
 
 interface SearchMeasurement {
   readonly query: string
@@ -45,7 +51,13 @@ interface SeededState {
 
 interface ProductionProcess {
   readonly baseUrl: string
-  readonly close: () => Promise<void>
+  readonly child: ChildProcess
+  readonly exited: Promise<unknown>
+}
+
+interface ThumbnailPreparation {
+  readonly sessionToken: string
+  readonly thumbnailPaths: readonly string[]
 }
 
 async function main(): Promise<void> {
@@ -138,45 +150,43 @@ async function measureColdFirstPages(options: {
   readonly sourcePaths: readonly string[]
 }): Promise<number[]> {
   return runIndependentColdMeasurements(FIRST_PAGE_RUNS, async (run) => {
-    const state = await createSeededState(options.root, `cold-${run}-`, options.sourcePaths)
     const port = await availablePort()
-    const production = await startProductionProcess(state, options.corpusDirectory, port)
-    let browser: Browser
-    try {
-      browser = await chromium.launch({ headless: true })
-    } catch (error) {
-      await production.close().catch(() => undefined)
-      await rm(state.root, { recursive: true, force: true })
-      throw error
-    }
     return {
       measure: async () => {
-        const context = await browser.newContext()
-        try {
-          const page = await context.newPage()
-          const startedAt = performance.now()
-          await page.goto(production.baseUrl)
-          await page.locator('.artifact-card').first().waitFor()
-          await page.waitForFunction(
-            () => document.querySelectorAll('.artifact-card').length === 30,
-          )
-          const catalog = await page.locator('.result-count').textContent()
-          if (catalog !== '100件') {
-            throw new Error('The independent cold run did not render the complete corpus count.')
-          }
-          return performance.now() - startedAt
-        } finally {
-          await context.close()
-        }
+        const state = await createSeededState(options.root, `cold-${run}-`, options.sourcePaths)
+        return runManagedPerformanceScenario<
+          ProductionProcess,
+          undefined,
+          Browser,
+          BrowserContext,
+          number
+        >({
+          spawnProcess: () => spawnProductionProcess(state, options.corpusDirectory, port),
+          waitForProcess: waitForProductionProcess,
+          prepare: async () => undefined,
+          launchBrowser: async () => chromium.launch({ headless: true }),
+          createContext: async (browser) => browser.newContext(),
+          execute: async ({ process: production, context }) => {
+            const page = await context.newPage()
+            const startedAt = performance.now()
+            await page.goto(production.baseUrl)
+            await page.locator('.artifact-card').first().waitFor()
+            await page.waitForFunction(
+              () => document.querySelectorAll('.artifact-card').length === 30,
+            )
+            const catalog = await page.locator('.result-count').textContent()
+            if (catalog !== '100件') {
+              throw new Error('The independent cold run did not render the complete corpus count.')
+            }
+            return performance.now() - startedAt
+          },
+          closeContext: async (context) => context.close(),
+          closeBrowser: async (browser) => browser.close(),
+          stopProcess: stopProductionProcess,
+          removeState: async () => rm(state.root, { recursive: true, force: true }),
+        })
       },
-      close: async () => {
-        await browser.close().catch(() => undefined)
-        try {
-          await production.close()
-        } finally {
-          await rm(state.root, { recursive: true, force: true })
-        }
-      },
+      close: async () => undefined,
     }
   })
 }
@@ -191,54 +201,64 @@ async function measureInteractiveSearches(options: {
   acceptedToRender: SearchMeasurement[]
   userObservedFillToRender: SearchMeasurement[]
 }> {
-  const state = await createSeededState(options.root, 'search-', options.sourcePaths)
   const port = await availablePort()
-  const production = await startProductionProcess(state, options.corpusDirectory, port)
-  const browser = await chromium.launch({ headless: true })
-  const context = await browser.newContext()
-  try {
-    const page = await context.newPage()
-    await page.goto(production.baseUrl)
-    await page.locator('.artifact-card').first().waitFor()
-    const searchbox = page.getByRole('searchbox', { name: '生成物を検索' })
-    const acceptedByQuery = new Map(options.queries.map((query) => [query, [] as number[]]))
-    const observedByQuery = new Map(options.queries.map((query) => [query, [] as number[]]))
-    let measurementCount = 0
-    for (const query of buildSearchRunSequence(options.queries, SEARCH_RUNS)) {
-      const fillStartedAt = performance.now()
-      await searchbox.fill(query)
-      measurementCount += 1
-      await page.waitForFunction(
-        (expectedCount) =>
-          performance.getEntriesByName('artifact-gallery-search').length >= expectedCount,
-        measurementCount,
-      )
-      const acceptedDuration = await page.evaluate(
-        () => performance.getEntriesByName('artifact-gallery-search').at(-1)?.duration,
-      )
-      if (typeof acceptedDuration !== 'number') {
-        throw new Error('The accepted-to-render UI search measure is unavailable.')
+  const state = await createSeededState(options.root, 'search-', options.sourcePaths)
+  return runManagedPerformanceScenario<
+    ProductionProcess,
+    undefined,
+    Browser,
+    BrowserContext,
+    { acceptedToRender: SearchMeasurement[]; userObservedFillToRender: SearchMeasurement[] }
+  >({
+    spawnProcess: () => spawnProductionProcess(state, options.corpusDirectory, port),
+    waitForProcess: waitForProductionProcess,
+    prepare: async () => undefined,
+    launchBrowser: async () => chromium.launch({ headless: true }),
+    createContext: async (browser) => browser.newContext(),
+    execute: async ({ process: production, context }) => {
+      const page = await context.newPage()
+      await page.goto(production.baseUrl)
+      await page.locator('.artifact-card').first().waitFor()
+      const searchbox = page.getByRole('searchbox', { name: '生成物を検索' })
+      const acceptedByQuery = new Map(options.queries.map((query) => [query, [] as number[]]))
+      const observedByQuery = new Map(options.queries.map((query) => [query, [] as number[]]))
+      let measurementCount = 0
+      for (const query of buildSearchRunSequence(options.queries, SEARCH_RUNS)) {
+        const fillStartedAt = performance.now()
+        await searchbox.fill(query)
+        measurementCount += 1
+        await page.waitForFunction(
+          (expectedCount) =>
+            performance.getEntriesByName('artifact-gallery-search').length >= expectedCount,
+          measurementCount,
+        )
+        const acceptedDuration = await page.evaluate(
+          () => performance.getEntriesByName('artifact-gallery-search').at(-1)?.duration,
+        )
+        if (typeof acceptedDuration !== 'number') {
+          throw new Error('The accepted-to-render UI search measure is unavailable.')
+        }
+        acceptedByQuery.get(query)?.push(acceptedDuration)
+        observedByQuery.get(query)?.push(performance.now() - fillStartedAt)
       }
-      acceptedByQuery.get(query)?.push(acceptedDuration)
-      observedByQuery.get(query)?.push(performance.now() - fillStartedAt)
-    }
-    return {
-      acceptedToRender: summarizeSearches(options.queries, acceptedByQuery, options.searchTargetMs),
-      userObservedFillToRender: summarizeSearches(
-        options.queries,
-        observedByQuery,
-        options.searchTargetMs,
-      ),
-    }
-  } finally {
-    await context.close().catch(() => undefined)
-    await browser.close().catch(() => undefined)
-    try {
-      await production.close()
-    } finally {
-      await rm(state.root, { recursive: true, force: true })
-    }
-  }
+      return {
+        acceptedToRender: summarizeSearches(
+          options.queries,
+          acceptedByQuery,
+          options.searchTargetMs,
+        ),
+        userObservedFillToRender: summarizeSearches(
+          options.queries,
+          observedByQuery,
+          options.searchTargetMs,
+        ),
+      }
+    },
+    closeContext: async (context) => context.close(),
+    closeBrowser: async (browser) => browser.close(),
+    stopProcess: stopProductionProcess,
+    removeState: async () => rm(state.root, { recursive: true, force: true }),
+  })
 }
 
 async function measureThumbnailCases(options: {
@@ -246,44 +266,55 @@ async function measureThumbnailCases(options: {
   readonly corpusDirectory: string
   readonly sourcePaths: readonly string[]
 }): Promise<{ coldMs: number; warmMs: number }> {
-  const state = await createSeededState(options.root, 'thumbnails-', options.sourcePaths)
   const port = await availablePort()
-  const production = await startProductionProcess(state, options.corpusDirectory, port)
-  const bootstrapResponse = await fetch(production.baseUrl)
-  if (!bootstrapResponse.ok) throw new Error('The thumbnail bootstrap is unavailable.')
-  const sessionToken = extractBootstrapToken(await bootstrapResponse.text())
-  const galleryResponse = await fetch(`${production.baseUrl}/api/gallery`, {
-    headers: { 'x-artifact-gallery-token': sessionToken },
+  const state = await createSeededState(options.root, 'thumbnails-', options.sourcePaths)
+  return runManagedPerformanceScenario<
+    ProductionProcess,
+    ThumbnailPreparation,
+    Browser,
+    BrowserContext,
+    { coldMs: number; warmMs: number }
+  >({
+    spawnProcess: () => spawnProductionProcess(state, options.corpusDirectory, port),
+    waitForProcess: waitForProductionProcess,
+    prepare: async (production) => {
+      const bootstrapResponse = await fetch(production.baseUrl)
+      if (!bootstrapResponse.ok) throw new Error('The thumbnail bootstrap is unavailable.')
+      const sessionToken = extractBootstrapToken(await bootstrapResponse.text())
+      const galleryResponse = await fetch(`${production.baseUrl}/api/gallery`, {
+        headers: { 'x-artifact-gallery-token': sessionToken },
+      })
+      if (!galleryResponse.ok) throw new Error('The thumbnail benchmark gallery is unavailable.')
+      const gallery = (await galleryResponse.json()) as GalleryPage
+      return {
+        sessionToken,
+        thumbnailPaths: gallery.items
+          .map(({ thumbnailUrl }) => thumbnailUrl)
+          .filter((path): path is string => path !== null),
+      }
+    },
+    launchBrowser: async () => chromium.launch({ headless: true }),
+    createContext: async (browser, _production, preparation) =>
+      browser.newContext({
+        extraHTTPHeaders: { 'x-artifact-gallery-token': preparation.sessionToken },
+      }),
+    execute: async ({ process: production, prepared, context }) => {
+      const page = await context.newPage()
+      const session = await context.newCDPSession(page)
+      await session.send('Network.enable')
+      await session.send('Network.setCacheDisabled', { cacheDisabled: true })
+      const health = await page.goto(`${production.baseUrl}/api/health`)
+      if (!health?.ok()) throw new Error('The thumbnail browser origin is unavailable.')
+      return {
+        coldMs: await measureThumbnailBatch(page, prepared.thumbnailPaths),
+        warmMs: await measureThumbnailBatch(page, prepared.thumbnailPaths),
+      }
+    },
+    closeContext: async (context) => context.close(),
+    closeBrowser: async (browser) => browser.close(),
+    stopProcess: stopProductionProcess,
+    removeState: async () => rm(state.root, { recursive: true, force: true }),
   })
-  if (!galleryResponse.ok) throw new Error('The thumbnail benchmark gallery is unavailable.')
-  const gallery = (await galleryResponse.json()) as GalleryPage
-  const thumbnailPaths = gallery.items
-    .map(({ thumbnailUrl }) => thumbnailUrl)
-    .filter((path): path is string => path !== null)
-  const browser = await chromium.launch({ headless: true })
-  const context = await browser.newContext({
-    extraHTTPHeaders: { 'x-artifact-gallery-token': sessionToken },
-  })
-  try {
-    const page = await context.newPage()
-    const session = await context.newCDPSession(page)
-    await session.send('Network.enable')
-    await session.send('Network.setCacheDisabled', { cacheDisabled: true })
-    const health = await page.goto(`${production.baseUrl}/api/health`)
-    if (!health?.ok()) throw new Error('The thumbnail browser origin is unavailable.')
-    return {
-      coldMs: await measureThumbnailBatch(page, thumbnailPaths),
-      warmMs: await measureThumbnailBatch(page, thumbnailPaths),
-    }
-  } finally {
-    await context.close().catch(() => undefined)
-    await browser.close().catch(() => undefined)
-    try {
-      await production.close()
-    } finally {
-      await rm(state.root, { recursive: true, force: true })
-    }
-  }
 }
 
 async function createSeededState(
@@ -335,11 +366,11 @@ async function seedCorpus(
   }
 }
 
-async function startProductionProcess(
+function spawnProductionProcess(
   state: SeededState,
   corpusDirectory: string,
   port: number,
-): Promise<ProductionProcess> {
+): ProductionProcess {
   const child = spawn(process.execPath, [resolve('dist/server/server/index.js')], {
     env: buildIsolatedProductionEnvironment(
       process.env,
@@ -354,34 +385,17 @@ async function startProductionProcess(
     ),
     stdio: 'ignore',
   })
-  const exited = childExit(child)
-  const baseUrl = `http://127.0.0.1:${port}`
-  try {
-    await waitForProductionPort(port, exited)
-    return {
-      baseUrl,
-      close: () => stopProductionProcess(child, exited),
-    }
-  } catch (error) {
-    await stopProductionProcess(child, exited).catch(() => undefined)
-    throw error
-  }
+  const exited = observeChildExit(child)
+  return { baseUrl: `http://127.0.0.1:${port}`, child, exited }
 }
 
-function childExit(
-  child: ChildProcess,
-): Promise<{ code: number | null; signal: NodeJS.Signals | null; error: unknown }> {
-  return Promise.race([
-    once(child, 'exit').then(([code, signal]) => ({ code, signal, error: null })),
-    once(child, 'error').then(([error]) => ({ code: null, signal: null, error })),
-  ])
+async function waitForProductionProcess(production: ProductionProcess): Promise<void> {
+  const port = Number(new URL(production.baseUrl).port)
+  await waitForProductionPort(port, production.exited)
 }
 
-async function waitForProductionPort(
-  port: number,
-  exited: Promise<{ code: number | null; signal: NodeJS.Signals | null; error: unknown }>,
-): Promise<void> {
-  const deadline = Date.now() + PROCESS_TIMEOUT_MS
+async function waitForProductionPort(port: number, exited: Promise<unknown>): Promise<void> {
+  const deadline = Date.now() + PROCESS_READY_TIMEOUT_MS
   while (Date.now() < deadline) {
     const attempt = new Promise<boolean>((resolveAttempt) => {
       const socket = createConnection({ host: '127.0.0.1', port })
@@ -407,25 +421,12 @@ async function waitForProductionPort(
   throw new Error('Timed out waiting for a production performance process.')
 }
 
-async function stopProductionProcess(
-  child: ChildProcess,
-  exited: Promise<{ code: number | null; signal: NodeJS.Signals | null; error: unknown }>,
-): Promise<void> {
-  if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM')
-  let timer: ReturnType<typeof setTimeout> | undefined
-  const timeout = new Promise<null>((resolveTimeout) => {
-    timer = setTimeout(() => resolveTimeout(null), PROCESS_TIMEOUT_MS)
+async function stopProductionProcess(production: ProductionProcess): Promise<void> {
+  await terminateChildProcess(production.child, {
+    exited: production.exited,
+    sigtermTimeoutMs: PROCESS_TERM_TIMEOUT_MS,
+    sigkillTimeoutMs: PROCESS_KILL_TIMEOUT_MS,
   })
-  const outcome = await Promise.race([exited, timeout])
-  if (timer) clearTimeout(timer)
-  if (outcome === null) {
-    child.kill('SIGKILL')
-    await exited
-    throw new Error('A production performance process did not stop gracefully.')
-  }
-  if (outcome.error || outcome.signal !== null || outcome.code !== 0) {
-    throw new Error('A production performance process exited unsuccessfully.')
-  }
 }
 
 async function measureThumbnailBatch(page: Page, paths: readonly string[]): Promise<number> {

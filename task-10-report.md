@@ -6,6 +6,7 @@
 - Prettier `3.8.2` と `format` / `format:check` を追加し、既存ソースを一度整形した。`pnpm-lock.yaml`、履歴レポート、生成物、font/image/SQLite fixture は `.prettierignore` で除外した。
 - GitHub Actions を8ケースの least-privilege matrix として追加した。30分 timeout、同一 ref の concurrency cancellation、Node/pnpm/lock hash を含む pnpm cache key、Playwright `1.58.2`/lock hash を含む Chromium cache keyを設定した。
 - 100件の固定性能コーパス、中央値・最大値・2倍外れ値ゲートを追加した。first page の5回は各回を新規 state、production Node process、Chromium process/context で起動し、navigationから30カードまでを測る。固定10検索は各10回、debounce後→render と入力前の外部 `performance.now()`→render の両方を記録・強制する。thumbnail は別の新規派生ディレクトリ、新規 context、cache disabled でcold、その同一リソース再読でwarmを測る。Task 9 の実 Chromium RSS・2 context・キャンセル harness も両 profile から再利用した。
+- performance runner のproduction childを同期spawn直後から一つのresource scopeで所有するようにした。readiness、bootstrap/gallery、Chromium、context、計測本体のどこで失敗しても、取得済みcontext/browser、child、stateを順に回収する。childはSIGTERMを待った後、時間制限付きSIGKILLへ移行し、cleanup自体が複数失敗しても後続回収を継続する。
 - production smoke は親環境の DB/thumbnail/state/root/client/port/development override を除去し、絶対パスの一時 DB・thumbnail・state だけでビルド済み server を loopback 起動する。bootstrap token を取得して health と空 gallery を認証付きで確認し、SIGTERM の正常終了を待つ。token と child output はログへ出さない。
 - CI failure artifact は credential scanner を通過した performance JSON だけに限定した。Playwright は line reporter のみで、HTML/trace/video/screenshot を生成・uploadしない。テストのtoken非出力検査も actual token ではなく boolean/redacted assertion にした。
 - runtime state の既定値をリポジトリ内 `.artifact-gallery` から OS 標準のユーザーデータ領域へ移した。環境変数による DB/thumbnail/root/port の上書きは維持した。
@@ -28,14 +29,15 @@
 | smoke environment isolation | 親環境の user DB/root override がchildへ残り、gallery itemsが1件となって失敗 | overrideを除去して絶対一時DB/thumbnail/stateを明示し、非空gallery自体も失敗にした |
 | token-free artifact | scanner CLIが存在せず失敗 | metricsは許可し、bootstrap marker、token header、`sessionToken`、40文字以上のtoken候補を固定文だけで拒否 |
 | Node pin consistency | package enginesが旧pinのため失敗 | `.nvmrc`、package engines、CIの3箇所、READMEを24.20.0へ統一し、metadata testが通過 |
-| Node 24.20 parallel timing | full suiteで既存30ms worker fixtureがrender到達前のextract timeoutとなり1件失敗。単独実行はrender timeoutで通過 | production上限は変えずtest fixtureだけ250msへ拡張し、full suite 226/226でrender timeoutとdurable terminal stateを再確認 |
+| Node 24.20 parallel timing | full suiteで既存30ms worker fixtureがrender到達前のextract timeoutとなり1件失敗。production smoke fixtureも600msで閉じるstalled socketに対し100msのshutdown猶予では並列時だけ不足 | production上限は変えずworker fixtureを250ms、smoke fixtureを400ms（総rejectは1秒未満）へ拡張し、full suite 238/238でdurable terminal stateとgraceful child終了を再確認 |
+| performance resource lifecycle | 新規 lifecycle module が無いためfailure-injection suiteがimport時にRED。その後、未選択の終了監視listener 1件も全12ケースでRED | coldのreadiness/browser/context/navigationとthumbnailのreadiness/bootstrap/gallery/browser/context/batchを注入失敗させ、child終了、取得済みbrowser/context close、temp削除、active ChildProcess/Timeout非増加、終了listener 0件、1秒未満rejectを各ケースで確認。cleanup競合とSIGKILL fallbackを含む12/12が通過 |
 
 ## Clean install evidence
 
 - 元の `node_modules`（約212MB）は削除・再リンクしていない。
-- 最終ソースを `/tmp/artifact-gallery-round1-clean.glt8Lk` へ `node_modules` / `.git` / build・test出力を除外してコピーした。
+- round2最終ソースを `/tmp/artifact-gallery-round2-clean.r6RhTY` へ `node_modules` / `.git` / build・test出力を除外してコピーした。
 - miseへNode.js `24.20.0`とpnpm `11.21.0`を導入し、その指定版で一時コピーの `pnpm install --frozen-lockfile --store-dir /Users/rainly/.local/share/pnpm/store/v11` を実行した。lockfile unchanged、352 packages reused、exit 0。
-- 同じ指定版・一時コピーで `format:check`、`lint`、`typecheck` がexit 0。ホストの再帰package-manager shimを避けて同じbuild構成の `pnpm exec vite build` と `pnpm exec tsc --project tsconfig.server.json` を直接実行し、client 18 modulesとserver outputを確認した。
+- 同じ指定版・一時コピーで `format:check`、`lint`、`typecheck`、`pnpm build` がexit 0。client 18 modulesとserver outputを確認した。
 
 ## CI matrix
 
@@ -58,34 +60,35 @@
 
 | Profile / measurement | Median | Max | Gate |
 | --- | ---: | ---: | --- |
-| acceptance first page（5 independent production cold starts） | 80.70ms | 83.88ms | 1,000ms |
-| acceptance search accepted→render（worst query） | 13.05ms | 18.50ms | 200ms |
-| acceptance search user-observed fill→render（worst query） | 126.23ms | 136.35ms | 200ms |
-| acceptance thumbnail cold / warm（30件） | 38.90ms / 30.40ms | 同左 | 記録値 |
-| CI smoke first page（5 independent production cold starts） | 81.57ms | 81.92ms | 5,000ms |
-| CI smoke search accepted→render（worst query） | 12.45ms | 19.30ms | 1,000ms |
-| CI smoke search user-observed fill→render（worst query） | 125.71ms | 139.74ms | 1,000ms |
-| CI smoke thumbnail cold / warm（30件） | 37.60ms / 28.60ms | 同左 | 記録値 |
+| acceptance first page（5 independent production cold starts） | 78.82ms | 81.28ms | 1,000ms |
+| acceptance search accepted→render（worst query） | 12.15ms | 19.40ms | 200ms |
+| acceptance search user-observed fill→render（worst query） | 126.03ms | 137.52ms | 200ms |
+| acceptance thumbnail cold / warm（30件） | 40.60ms / 34.40ms | 同左 | 記録値 |
+| CI smoke first page（5 independent production cold starts） | 81.76ms | 87.94ms | 5,000ms |
+| CI smoke search accepted→render（worst query） | 12.80ms | 19.60ms | 1,000ms |
+| CI smoke search user-observed fill→render（worst query） | 126.07ms | 135.58ms | 1,000ms |
+| CI smoke thumbnail cold / warm（30件） | 47.10ms / 31.20ms | 同左 | 記録値 |
 
 最大値が各 profile target の2倍を超えた項目はない。
 
 Task 9 harness 再利用結果:
 
-- acceptance: Chromium peak RSS 315.7MiB、5 samples、2 contexts、cancel 64.2ms、commit critical max 1.04ms。
-- CI smoke: Chromium peak RSS 320.4MiB、5 samples、2 contexts、cancel 62.6ms、commit critical max 1.15ms。
+- acceptance: Chromium peak RSS 315.3MiB、5 samples、2 contexts、cancel 63.9ms、commit critical max 0.92ms。
+- CI smoke: Chromium peak RSS 355.5MiB、5 samples、2 contexts、cancel 62.4ms、commit critical max 0.83ms。
 
 ## Verification
 
 - `pnpm dev`: API / worker / Vite の3 process を起動。API `127.0.0.1:3000` と UI `127.0.0.1:5173` は本文/tokenを表示せず HTTP 200 を確認し、Ctrl-C で停止。
 - 指定toolchain: Node.js `24.20.0` / pnpm `11.21.0`。
-- `pnpm test`: 32 files / 226 tests passed。search 20/20、median 0.155ms、max 7.362ms。実 Chromium reliability 7/7、peak RSS 315.9MiB、cancel 60.8ms、commit critical max 0.96ms。実 Chromium isolation 39/39。
+- `pnpm test`: 33 files / 238 tests passed。search 20/20、median 0.214ms、max 10.088ms。実 Chromium reliability 7/7、peak RSS 317.4MiB、cancel 86.5ms、commit critical max 1.42ms。実 Chromium isolation 39/39。
 - `pnpm test:e2e`: line reporterで19/19 passed。HTML/trace/video/screenshotなし。
 - `pnpm perf:smoke`: independent production cold、両検索系列、thumbnail cold/warmがpassed。Task 9 reliability selected test passed。
 - `pnpm perf:acceptance`: 同上、Apple Silicon acceptanceがpassed。Task 9 reliability selected test passed。
 - `pnpm build`: Vite client 18 modules と TypeScript server build passed。
 - `pnpm smoke:prod`: 親runtime overrideを継承せず、bootstrap / health / empty gallery / graceful shutdown passed、token非出力。
 - `pnpm artifacts:check`: performance JSONのcredential scan passed。
-- 一時clean copyで `pnpm install --frozen-lockfile`、`format:check`、`lint`、`typecheck`、`build` passed。
+- failure injection: cold/thumbnailの10段階、cleanup競合、SIGKILL fallbackの12/12 passed。各失敗は1秒未満でrejectし、child/state/取得済みbrowser・contextと追加active resourceを残さない。
+- round2最終一時clean copyで `pnpm install --frozen-lockfile`、`format:check`、`lint`、`typecheck`、`build` passed。
 - CI YAML parse と `git diff --check`: passed。
 
 ## Concerns

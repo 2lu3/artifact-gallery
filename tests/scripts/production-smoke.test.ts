@@ -183,12 +183,12 @@ process.on('SIGTERM', () => server.close(async () => {
           allowedRoots: [directory],
           clientDirectory: join(directory, 'client'),
         },
-        timeoutMs: 100,
+        timeoutMs: 400,
         log: () => undefined,
       }),
     ).rejects.toThrow(/Timed out/u)
 
-    expect(performance.now() - startedAt).toBeLessThan(400)
+    expect(performance.now() - startedAt).toBeLessThan(1_000)
     await expect(access(marker)).resolves.toBeUndefined()
   })
 })
