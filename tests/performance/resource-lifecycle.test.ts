@@ -179,6 +179,75 @@ describe('performance resource lifecycle', () => {
     await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate))
     expectNoAdditionalOwnedResources(activeBefore)
   })
+
+  it('bounds each stalled browser cleanup before stopping the child and removing state', async () => {
+    const temporaryState = await mkdtemp(join(tmpdir(), 'artifact-gallery-perf-stalled-close-'))
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => undefined, 1_000)'], {
+      stdio: 'ignore',
+    })
+    const contextClose = deferred<void>()
+    const browserClose = deferred<void>()
+    let contextCloseCalled = false
+    let browserCloseCalled = false
+    let childStopped = false
+    let stateRemoved = false
+    const activeBefore = ownedActiveResources()
+    const startedAt = performance.now()
+    const scenario = runManagedPerformanceScenario<
+      TestProcess,
+      undefined,
+      FakeBrowser,
+      FakeContext,
+      number
+    >({
+      spawnProcess: () => ({ child }),
+      waitForProcess: async () => undefined,
+      prepare: async () => undefined,
+      launchBrowser: async () => ({ closed: false }),
+      createContext: async () => ({ closed: false }),
+      execute: async () => {
+        throw injectedFailure('execute')
+      },
+      cleanupTimeoutMs: 25,
+      closeContext: async () => {
+        contextCloseCalled = true
+        return contextClose.promise
+      },
+      closeBrowser: async () => {
+        browserCloseCalled = true
+        return browserClose.promise
+      },
+      stopProcess: async ({ child: processChild }) => {
+        await terminateChildProcess(processChild, {
+          sigtermTimeoutMs: 50,
+          sigkillTimeoutMs: 250,
+        })
+        childStopped = true
+      },
+      removeState: async () => {
+        await rm(temporaryState, { force: true, recursive: true })
+        stateRemoved = true
+      },
+    })
+
+    const promptOutcome = await settlePromptly(scenario, 200)
+    const stoppedBeforeReleasingCloses = childStopped
+    const removedBeforeReleasingCloses = stateRemoved
+    contextClose.resolve()
+    browserClose.resolve()
+    await scenario.catch(() => undefined)
+
+    expect(promptOutcome).toBe('rejected')
+    expect(performance.now() - startedAt).toBeLessThan(500)
+    expect(contextCloseCalled).toBe(true)
+    expect(browserCloseCalled).toBe(true)
+    expect(stoppedBeforeReleasingCloses).toBe(true)
+    expect(removedBeforeReleasingCloses).toBe(true)
+    expect(child.exitCode !== null || child.signalCode !== null).toBe(true)
+    await expect(access(temporaryState)).rejects.toThrow()
+    await new Promise<void>((resolveImmediate) => setImmediate(resolveImmediate))
+    expectNoAdditionalOwnedResources(activeBefore)
+  })
 })
 
 function injectedFailure(stage: FailureStage): Error {
@@ -199,4 +268,35 @@ function expectNoAdditionalOwnedResources(
   const after = ownedActiveResources()
   expect(after.ChildProcess).toBeLessThanOrEqual(baseline.ChildProcess)
   expect(after.Timeout).toBeLessThanOrEqual(baseline.Timeout)
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value?: T) => void } {
+  let resolvePromise: (value: T) => void = () => undefined
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve
+  })
+  return {
+    promise,
+    resolve: (value) => resolvePromise(value as T),
+  }
+}
+
+async function settlePromptly(
+  operation: Promise<unknown>,
+  timeoutMs: number,
+): Promise<'rejected' | 'resolved' | 'stalled'> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      operation.then(
+        () => 'resolved' as const,
+        () => 'rejected' as const,
+      ),
+      new Promise<'stalled'>((resolveTimeout) => {
+        timer = setTimeout(() => resolveTimeout('stalled'), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
 }

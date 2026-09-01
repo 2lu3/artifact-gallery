@@ -4,15 +4,12 @@ import { createConnection, createServer } from 'node:net'
 import { cpus, tmpdir, totalmem } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
-import { chromium, type Browser, type BrowserContext, type Page } from 'playwright'
+import { chromium, type Browser, type BrowserContext } from 'playwright'
 
 import {
   buildIsolatedProductionEnvironment,
   extractBootstrapToken,
 } from '../../scripts/production-smoke.js'
-import { openDatabase } from '../../src/server/db/database.js'
-import { ArtifactProcessor } from '../../src/server/processing/artifact-processor.js'
-import { PathPolicy } from '../../src/server/security/path-policy.js'
 import type { GalleryPage } from '../../src/shared/contracts.js'
 import {
   assertPerformanceGate,
@@ -25,10 +22,14 @@ import {
   type PerformanceProfileName,
 } from './harness.js'
 import {
+  fetchWithinPerformanceDeadline,
+  measureThumbnailBatchWithinDeadline,
   observeChildExit,
+  remainingPerformanceBudget,
   runManagedPerformanceScenario,
   terminateChildProcess,
 } from './resource-lifecycle.js'
+import { createSeededPerformanceState, type SeededState } from './seed-state.js'
 
 const FIRST_PAGE_RUNS = 5
 const SEARCH_RUNS = 10
@@ -36,17 +37,12 @@ const DEFAULT_RESULTS_PATH = 'test-results/performance/results.json'
 const PROCESS_READY_TIMEOUT_MS = 15_000
 const PROCESS_TERM_TIMEOUT_MS = 2_000
 const PROCESS_KILL_TIMEOUT_MS = 2_000
+const PERFORMANCE_HTTP_SETUP_TIMEOUT_MS = 15_000
+const RESOURCE_CLEANUP_TIMEOUT_MS = 2_000
 
 interface SearchMeasurement {
   readonly query: string
   readonly summary: DurationSummary
-}
-
-interface SeededState {
-  readonly root: string
-  readonly stateDirectory: string
-  readonly databaseFilename: string
-  readonly thumbnailDirectory: string
 }
 
 interface ProductionProcess {
@@ -58,6 +54,7 @@ interface ProductionProcess {
 interface ThumbnailPreparation {
   readonly sessionToken: string
   readonly thumbnailPaths: readonly string[]
+  readonly deadlineAt: number
 }
 
 async function main(): Promise<void> {
@@ -153,7 +150,11 @@ async function measureColdFirstPages(options: {
     const port = await availablePort()
     return {
       measure: async () => {
-        const state = await createSeededState(options.root, `cold-${run}-`, options.sourcePaths)
+        const state = await createSeededPerformanceState(
+          options.root,
+          `cold-${run}-`,
+          options.sourcePaths,
+        )
         return runManagedPerformanceScenario<
           ProductionProcess,
           undefined,
@@ -180,6 +181,7 @@ async function measureColdFirstPages(options: {
             }
             return performance.now() - startedAt
           },
+          cleanupTimeoutMs: RESOURCE_CLEANUP_TIMEOUT_MS,
           closeContext: async (context) => context.close(),
           closeBrowser: async (browser) => browser.close(),
           stopProcess: stopProductionProcess,
@@ -202,7 +204,7 @@ async function measureInteractiveSearches(options: {
   userObservedFillToRender: SearchMeasurement[]
 }> {
   const port = await availablePort()
-  const state = await createSeededState(options.root, 'search-', options.sourcePaths)
+  const state = await createSeededPerformanceState(options.root, 'search-', options.sourcePaths)
   return runManagedPerformanceScenario<
     ProductionProcess,
     undefined,
@@ -254,6 +256,7 @@ async function measureInteractiveSearches(options: {
         ),
       }
     },
+    cleanupTimeoutMs: RESOURCE_CLEANUP_TIMEOUT_MS,
     closeContext: async (context) => context.close(),
     closeBrowser: async (browser) => browser.close(),
     stopProcess: stopProductionProcess,
@@ -267,7 +270,7 @@ async function measureThumbnailCases(options: {
   readonly sourcePaths: readonly string[]
 }): Promise<{ coldMs: number; warmMs: number }> {
   const port = await availablePort()
-  const state = await createSeededState(options.root, 'thumbnails-', options.sourcePaths)
+  const state = await createSeededPerformanceState(options.root, 'thumbnails-', options.sourcePaths)
   return runManagedPerformanceScenario<
     ProductionProcess,
     ThumbnailPreparation,
@@ -278,16 +281,26 @@ async function measureThumbnailCases(options: {
     spawnProcess: () => spawnProductionProcess(state, options.corpusDirectory, port),
     waitForProcess: waitForProductionProcess,
     prepare: async (production) => {
-      const bootstrapResponse = await fetch(production.baseUrl)
+      const deadlineAt = performance.now() + PERFORMANCE_HTTP_SETUP_TIMEOUT_MS
+      const bootstrapResponse = await fetchWithinPerformanceDeadline(
+        production.baseUrl,
+        {},
+        deadlineAt,
+        'thumbnail bootstrap',
+      )
       if (!bootstrapResponse.ok) throw new Error('The thumbnail bootstrap is unavailable.')
       const sessionToken = extractBootstrapToken(await bootstrapResponse.text())
-      const galleryResponse = await fetch(`${production.baseUrl}/api/gallery`, {
-        headers: { 'x-artifact-gallery-token': sessionToken },
-      })
+      const galleryResponse = await fetchWithinPerformanceDeadline(
+        `${production.baseUrl}/api/gallery`,
+        { headers: { 'x-artifact-gallery-token': sessionToken } },
+        deadlineAt,
+        'thumbnail gallery',
+      )
       if (!galleryResponse.ok) throw new Error('The thumbnail benchmark gallery is unavailable.')
       const gallery = (await galleryResponse.json()) as GalleryPage
       return {
         sessionToken,
+        deadlineAt,
         thumbnailPaths: gallery.items
           .map(({ thumbnailUrl }) => thumbnailUrl)
           .filter((path): path is string => path !== null),
@@ -303,67 +316,29 @@ async function measureThumbnailCases(options: {
       const session = await context.newCDPSession(page)
       await session.send('Network.enable')
       await session.send('Network.setCacheDisabled', { cacheDisabled: true })
-      const health = await page.goto(`${production.baseUrl}/api/health`)
+      const health = await page.goto(`${production.baseUrl}/api/health`, {
+        timeout: remainingPerformanceBudget(prepared.deadlineAt, 'thumbnail health'),
+      })
       if (!health?.ok()) throw new Error('The thumbnail browser origin is unavailable.')
       return {
-        coldMs: await measureThumbnailBatch(page, prepared.thumbnailPaths),
-        warmMs: await measureThumbnailBatch(page, prepared.thumbnailPaths),
+        coldMs: await measureThumbnailBatchWithinDeadline(
+          page,
+          prepared.thumbnailPaths,
+          prepared.deadlineAt,
+        ),
+        warmMs: await measureThumbnailBatchWithinDeadline(
+          page,
+          prepared.thumbnailPaths,
+          prepared.deadlineAt,
+        ),
       }
     },
+    cleanupTimeoutMs: RESOURCE_CLEANUP_TIMEOUT_MS,
     closeContext: async (context) => context.close(),
     closeBrowser: async (browser) => browser.close(),
     stopProcess: stopProductionProcess,
     removeState: async () => rm(state.root, { recursive: true, force: true }),
   })
-}
-
-async function createSeededState(
-  root: string,
-  prefix: string,
-  sourcePaths: readonly string[],
-): Promise<SeededState> {
-  const stateRoot = await mkdtemp(join(root, prefix))
-  const stateDirectory = join(stateRoot, 'state')
-  const databaseFilename = join(stateDirectory, 'catalog.sqlite')
-  const thumbnailDirectory = join(stateDirectory, 'thumbnails')
-  await mkdir(stateDirectory, { recursive: true })
-  await seedCorpus(databaseFilename, thumbnailDirectory, sourcePaths)
-  return { root: stateRoot, stateDirectory, databaseFilename, thumbnailDirectory }
-}
-
-async function seedCorpus(
-  databaseFilename: string,
-  thumbnailDirectory: string,
-  sourcePaths: readonly string[],
-): Promise<void> {
-  const database = openDatabase({ filename: databaseFilename })
-  const pathPolicy = await PathPolicy.create([dirname(sourcePaths[0] as string)])
-  const processor = new ArtifactProcessor({
-    database,
-    pathPolicy,
-    htmlRenderer: {
-      render: async ({ html }) => ({
-        screenshot: Buffer.from(`RIFF${html.slice(0, 64)}WEBP`),
-        width: 1200,
-        height: 800,
-        warnings: [],
-      }),
-    },
-    thumbnailDirectory,
-    thumbnailOptimizer: {
-      optimize: async ({ bytes, width, height }) => ({ bytes, width, height, quality: 80 }),
-    },
-  })
-  try {
-    for (const sourcePath of sourcePaths) {
-      const result = await processor.register({ sourcePath })
-      if (result.outcome !== 'completed') {
-        throw new Error('Unable to index a performance corpus item.')
-      }
-    }
-  } finally {
-    database.close()
-  }
 }
 
 function spawnProductionProcess(
@@ -427,18 +402,6 @@ async function stopProductionProcess(production: ProductionProcess): Promise<voi
     sigtermTimeoutMs: PROCESS_TERM_TIMEOUT_MS,
     sigkillTimeoutMs: PROCESS_KILL_TIMEOUT_MS,
   })
-}
-
-async function measureThumbnailBatch(page: Page, paths: readonly string[]): Promise<number> {
-  return page.evaluate(async (thumbnailPaths) => {
-    const startedAt = performance.now()
-    for (const path of thumbnailPaths) {
-      const response = await fetch(path)
-      if (!response.ok) throw new Error('A benchmark thumbnail was unavailable.')
-      await response.arrayBuffer()
-    }
-    return performance.now() - startedAt
-  }, paths)
 }
 
 function summarizeSearches(
