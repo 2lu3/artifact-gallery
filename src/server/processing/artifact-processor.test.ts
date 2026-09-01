@@ -1,5 +1,5 @@
 import { existsSync, renameSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -110,6 +110,40 @@ describe('ArtifactProcessor staged pipeline', () => {
     harness.database.close()
   })
 
+  it('reports a missing source through inspect when restoring its persisted file capability', async () => {
+    const harness = await makeHarness()
+    await writeFile(harness.sourcePath, '# Last successful source')
+    const canonicalPath = await realpath(harness.sourcePath)
+    const capability = { canonicalPath, kind: 'file' as const }
+    const first = await harness.processor.register({
+      sourcePath: canonicalPath,
+      capability,
+    })
+    const artifactId = requireResultNumber(first.artifactId)
+    const activeBefore = activeGenerationId(harness.database, artifactId)
+    await rm(harness.sourcePath)
+    const imports = new ImportRepository(harness.database)
+    const run = imports.createRun([canonicalPath])
+
+    const result = await harness.processor.refresh({
+      sourcePath: canonicalPath,
+      runId: run.id,
+      itemId: run.itemIds[0],
+      capability,
+    })
+
+    expect(result).toMatchObject({
+      outcome: 'failed',
+      artifactId: null,
+      generationId: null,
+      errors: [expect.objectContaining({ code: 'SOURCE_MISSING', stage: 'inspect' })],
+    })
+    expect(activeGenerationId(harness.database, artifactId)).toBe(activeBefore)
+    expect(imports.getRun(run.id).status).toBe('failed')
+    expect(imports.getItem(run.itemIds[0]).status).toBe('failed')
+    harness.database.close()
+  })
+
   it('applies user title, document title, then filename fallback in precedence order', async () => {
     const harness = await makeHarness({ sourceName: 'fallback-name.html' })
     await writeFile(
@@ -145,6 +179,36 @@ describe('ArtifactProcessor staged pipeline', () => {
 
     harness.database.close()
   })
+
+  it.each([
+    {
+      sourceName: 'long-title.html',
+      source: (title: string) => `<title>${title}</title><p>Body</p>`,
+    },
+    {
+      sourceName: 'long-title.md',
+      source: (title: string) => `# ${title}\n\nBody`,
+    },
+  ])(
+    'clamps a derived $sourceName title to a grapheme boundary within 256 code points',
+    async ({ sourceName, source }) => {
+      const harness = await makeHarness({ sourceName })
+      const leading = '😀'.repeat(255)
+      const family = '👨‍👩‍👧‍👦'
+      await writeFile(harness.sourcePath, source(`${leading}${family}tail`))
+
+      const result = await harness.processor.register({ sourcePath: harness.sourcePath })
+      const stored = readTitle(
+        harness.database,
+        requireResultNumber(result.artifactId),
+      ).derived_title
+
+      expect(stored).toBe(leading)
+      if (stored === null) throw new Error('The derived title was not stored.')
+      expect(Array.from(stored).length).toBeLessThanOrEqual(256)
+      harness.database.close()
+    },
+  )
 
   it('maps inspect, extract, render, and index failures while committing independent partial results', async () => {
     const inspectHarness = await makeHarness()
@@ -206,11 +270,12 @@ describe('ArtifactProcessor staged pipeline', () => {
     await writeFile(indexHarness.sourcePath, '# Index failure')
     const index = await indexHarness.processor.register({ sourcePath: indexHarness.sourcePath })
     expect(index).toMatchObject({
-      outcome: 'partial',
-      contentStatus: 'ready',
-      renderStatus: 'ready',
+      outcome: 'failed',
+      contentStatus: 'failed',
+      renderStatus: 'failed',
       indexStatus: 'failed',
     })
+    expect(indexHarness.database.prepare('SELECT COUNT(*) FROM artifact').pluck().get()).toBe(0)
     expect(index.errors).toMatchObject([{ code: 'INDEX_UPDATE_FAILED', stage: 'index' }])
     indexHarness.database.close()
   })
@@ -247,6 +312,43 @@ describe('ArtifactProcessor staged pipeline', () => {
       expect(imports.getRun(run.id)).toMatchObject({ status: 'cancelled' })
       expect(
         (await readdir(harness.derivedDirectory)).filter((name) => name.includes('.tmp')),
+      ).toEqual([])
+      expect(
+        (await readdir(harness.derivedDirectory)).filter((name) => name.endsWith('.webp')),
+      ).toEqual([])
+      expect(harness.database.prepare('SELECT COUNT(*) FROM artifact').pluck().get()).toBe(0)
+      harness.database.close()
+    },
+  )
+
+  it.each(['inspect', 'extract', 'render', 'index', 'commit'] as const)(
+    'rolls back an empty new artifact when a timeout lands at %s',
+    async (timedOutStage) => {
+      const harness = await makeHarness()
+      await writeFile(harness.sourcePath, '# Timeout rollback')
+      const imports = new ImportRepository(harness.database)
+      const run = imports.createRun([harness.sourcePath])
+      const timeout = new AbortController()
+      const abort = () => timeout.abort(new ArtifactProcessingError('TIMEOUT', timedOutStage))
+
+      harness.controls.timeoutDuringInspect = timedOutStage === 'inspect' ? abort : undefined
+      harness.controls.timeoutDuringExtract = timedOutStage === 'extract' ? abort : undefined
+      harness.controls.timeoutDuringRender = timedOutStage === 'render' ? abort : undefined
+      harness.controls.timeoutDuringIndex = timedOutStage === 'index' ? abort : undefined
+      harness.controls.timeoutDuringCommit = timedOutStage === 'commit' ? abort : undefined
+
+      const result = await harness.processor.register({
+        sourcePath: harness.sourcePath,
+        runId: run.id,
+        itemId: run.itemIds[0],
+        signal: timeout.signal,
+      })
+
+      expect(result.outcome).toBe('failed')
+      expect(result.errors.at(-1)).toMatchObject({ code: 'TIMEOUT', stage: timedOutStage })
+      expect(harness.database.prepare('SELECT COUNT(*) FROM artifact').pluck().get()).toBe(0)
+      expect(
+        (await readdir(harness.derivedDirectory)).filter((name) => name.endsWith('.webp')),
       ).toEqual([])
       harness.database.close()
     },
@@ -329,7 +431,7 @@ describe('ArtifactProcessor staged pipeline', () => {
         .prepare('SELECT job_status FROM artifact_generation WHERE id = ?')
         .pluck()
         .get(result.generationId),
-    ).toBe('interrupted')
+    ).toBeUndefined()
     harness.database.close()
   })
 
@@ -378,7 +480,7 @@ describe('ArtifactProcessor staged pipeline', () => {
         .prepare('SELECT job_status FROM artifact_generation WHERE id = ?')
         .pluck()
         .get(result.generationId),
-    ).toBe('interrupted')
+    ).toBeUndefined()
     harness.database.close()
   })
 
@@ -530,6 +632,7 @@ describe('ArtifactProcessor staged pipeline', () => {
 
     expect(result).toMatchObject({
       outcome: 'failed',
+      artifactId: null,
       errors: [expect.objectContaining({ code: 'TIMEOUT', stage: 'commit' })],
     })
     expect(renamed).toBe(false)
@@ -539,7 +642,7 @@ describe('ArtifactProcessor staged pipeline', () => {
         .prepare('SELECT active_generation_id FROM artifact WHERE id = ?')
         .pluck()
         .get(result.artifactId),
-    ).toBeNull()
+    ).toBeUndefined()
     harness.database.close()
   })
 
@@ -627,7 +730,7 @@ describe('ArtifactProcessor staged pipeline', () => {
     harness.database.close()
   })
 
-  it('restores prior diagnostics and item error relations after post-commit expiry', async () => {
+  it('restores the prior generation and warnings while clearing repaired-stage errors after expiry', async () => {
     const harness = await makeHarness({
       render: async () => rendered(Buffer.from('RIFF-warning-WEBP'), [{ code: 'CONTENT_CLIPPED' }]),
     })
@@ -661,9 +764,6 @@ describe('ArtifactProcessor staged pipeline', () => {
     harness.database
       .prepare('UPDATE import_item SET error_id = ? WHERE id = ?')
       .run(oldErrorId, previousItemId)
-    const priorErrors = harness.database
-      .prepare('SELECT * FROM artifact_error WHERE artifact_id = ? ORDER BY id')
-      .all(artifactId)
     const priorWarnings = harness.database
       .prepare('SELECT * FROM artifact_warning WHERE artifact_id = ? ORDER BY id')
       .all(artifactId)
@@ -697,7 +797,7 @@ describe('ArtifactProcessor staged pipeline', () => {
            WHERE artifact_id = ? AND code <> 'TIMEOUT' ORDER BY id`,
         )
         .all(artifactId),
-    ).toEqual(priorErrors)
+    ).toEqual([])
     expect(
       harness.database
         .prepare('SELECT * FROM artifact_warning WHERE artifact_id = ? ORDER BY id')
@@ -708,7 +808,7 @@ describe('ArtifactProcessor staged pipeline', () => {
         .prepare('SELECT error_id FROM import_item WHERE id = ?')
         .pluck()
         .get(previousItemId),
-    ).toBe(oldErrorId)
+    ).toBeNull()
     expect(
       harness.database
         .prepare('SELECT COUNT(*) FROM artifact_warning WHERE id <> ? AND artifact_id = ?')
@@ -729,7 +829,7 @@ describe('ArtifactProcessor staged pipeline', () => {
            WHERE artifact_generation.id = ?`,
         )
         .get(result.generationId),
-    ).toEqual({ job_status: 'interrupted', state: 'staged' })
+    ).toBeUndefined()
     expect(imports.getItem(run.itemIds[0]).status).toBe('failed')
     expect(imports.getRun(run.id).status).toBe('failed')
     harness.database.close()
@@ -803,6 +903,86 @@ describe('ArtifactProcessor staged pipeline', () => {
 
     expect(failed.outcome).toBe('failed')
     expect(visibleText).toBe('First searchable text')
+    harness.database.close()
+  })
+
+  it('rolls back an index-stage refresh before title, active generation, thumbnail, or search visibility change', async () => {
+    let visibleText: string | null = null
+    let rejectIndex = false
+    const harness = await makeHarness({
+      indexer: {
+        prepare: async ({ text }) => {
+          if (rejectIndex) throw new Error('index unavailable')
+          const previous = visibleText
+          return {
+            commit: () => {
+              visibleText = text
+            },
+            rollback: async () => {
+              visibleText = previous
+            },
+            quarantine: async () => {
+              visibleText = null
+            },
+          }
+        },
+      },
+    })
+    await writeFile(harness.sourcePath, '# Previous title\n\nPrevious searchable body')
+    const first = await harness.processor.register({ sourcePath: harness.sourcePath })
+    const artifactId = requireResultNumber(first.artifactId)
+    const previousThumbnail = first.thumbnailPath as string
+    rejectIndex = true
+    await writeFile(harness.sourcePath, '# Replacement title\n\nReplacement hidden body')
+
+    const failed = await harness.processor.refresh({ sourcePath: harness.sourcePath })
+
+    expect(failed).toMatchObject({
+      outcome: 'failed',
+      contentStatus: 'failed',
+      renderStatus: 'failed',
+      indexStatus: 'failed',
+    })
+    expect(activeGenerationId(harness.database, artifactId)).toBe(first.generationId)
+    expect(readTitle(harness.database, artifactId).derived_title).toBe('Previous title')
+    expect(visibleText).toBe('Previous title\nPrevious searchable body')
+    expect(existsSync(previousThumbnail)).toBe(true)
+    expect(
+      (await readdir(harness.derivedDirectory)).filter((name) => name.endsWith('.webp')),
+    ).toEqual([previousThumbnail.split('/').at(-1)])
+    harness.database.close()
+  })
+
+  it('clears errors for repaired stages even when a later index stage fails', async () => {
+    let renderFails = true
+    let indexFails = false
+    const harness = await makeHarness({
+      render: async () => {
+        if (renderFails)
+          throw Object.assign(new Error('render failed'), { code: 'HTML_RENDER_FAILED' })
+        return rendered(Buffer.from('RIFF-repaired-WEBP'))
+      },
+      indexer: {
+        prepare: async () => {
+          if (indexFails) throw new Error('index failed')
+          return preparedIndex()
+        },
+      },
+    })
+    await writeFile(harness.sourcePath, '# Repair stages')
+    const first = await harness.processor.register({ sourcePath: harness.sourcePath })
+    const artifactId = requireResultNumber(first.artifactId)
+    expect(new ArtifactRepository(harness.database).listErrors(artifactId)).toContainEqual(
+      expect.objectContaining({ code: 'HTML_RENDER_FAILED', stage: 'render' }),
+    )
+
+    renderFails = false
+    indexFails = true
+    await harness.processor.retry({ sourcePath: harness.sourcePath })
+
+    expect(new ArtifactRepository(harness.database).listErrors(artifactId)).toEqual([
+      expect.objectContaining({ code: 'INDEX_UPDATE_FAILED', stage: 'index' }),
+    ])
     harness.database.close()
   })
 
@@ -912,7 +1092,7 @@ describe('ArtifactProcessor staged pipeline', () => {
            WHERE artifact_id = ? AND generation_id = ?`,
         )
         .get(artifactId, failed.generationId),
-    ).toEqual({ state: 'quarantined' })
+    ).toBeUndefined()
     expect(new ArtifactRepository(harness.database).listWarnings(artifactId)).toContainEqual({
       code: 'INDEX_REPAIR_PENDING',
       detail: 'Search index repair is pending.',
@@ -938,23 +1118,14 @@ describe('ArtifactProcessor staged pipeline', () => {
     const failed = await harness.processor.register({ sourcePath: harness.sourcePath })
 
     expect(failed.outcome).toBe('failed')
+    expect(failed.artifactId).toBeNull()
     expect(failed.errors.at(-1)).toMatchObject({ code: 'INDEX_UPDATE_FAILED', stage: 'index' })
-    expect({
-      content_status: failed.contentStatus,
-      render_status: failed.renderStatus,
-      index_status: failed.indexStatus,
-    }).toEqual(
-      harness.database
-        .prepare(
-          `SELECT content_status, render_status, index_status
-           FROM artifact_generation WHERE id = ?`,
-        )
-        .get(failed.generationId),
-    )
-    expect(failed.indexStatus).toBe('failed')
     expect(
-      new ArtifactRepository(harness.database).listErrors(requireResultNumber(failed.artifactId)),
-    ).toContainEqual(expect.objectContaining({ code: 'INDEX_UPDATE_FAILED', stage: 'index' }))
+      harness.database
+        .prepare('SELECT id FROM artifact_generation WHERE id = ?')
+        .get(failed.generationId),
+    ).toBeUndefined()
+    expect(failed.indexStatus).toBe('failed')
     harness.database.close()
   })
 
@@ -1282,13 +1453,16 @@ async function makeHarness(
     pathPolicy: {
       authorizeFile: async (path: string) => {
         const authorized = await realPolicy.authorizeFile(path)
+        controls.timeoutDuringInspect?.()
         controls.cancelAfterInspect?.()
         return authorized
       },
+      authorizeAsset: realPolicy.authorizeAsset.bind(realPolicy),
     },
     markdownRenderer: {
       render: (source: string) => {
         const result = markdown.render(source)
+        controls.timeoutDuringExtract?.()
         controls.cancelAfterExtract?.()
         return result
       },
@@ -1296,6 +1470,7 @@ async function makeHarness(
     htmlRenderer: {
       render: async (request: { html: string; sourcePath: string }) => {
         const result = await render(request)
+        controls.timeoutDuringRender?.()
         controls.cancelAfterRender?.()
         return result
       },
@@ -1306,14 +1481,21 @@ async function makeHarness(
           indexer: {
             prepare: async (request: Parameters<ArtifactIndexer['prepare']>[0]) => {
               const prepared = await indexer.prepare(request)
+              controls.timeoutDuringIndex?.()
               controls.cancelAfterIndex?.()
               return prepared
             },
           },
         }),
     thumbnailDirectory: derivedDirectory,
-    thumbnailOptimizer: overrides.optimizer ?? defaultOptimizer,
-    fileSystem: overrides.fileSystem ?? realFileSystem,
+    thumbnailOptimizer: {
+      optimize: async (request: Parameters<ThumbnailOptimizer['optimize']>[0]) => {
+        const result = await (overrides.optimizer ?? defaultOptimizer).optimize(request)
+        controls.timeoutDuringCommit?.()
+        return result
+      },
+    },
+    derivativePathPolicy: overrides.fileSystem ?? realFileSystem,
     now: () => NOW,
     reportOperationalError: async (error: ProcessingOperationalError) => {
       operationalErrors.push(error)
@@ -1342,6 +1524,11 @@ interface Controls {
   cancelAfterExtract?: () => void
   cancelAfterRender?: () => void
   cancelAfterIndex?: () => void
+  timeoutDuringInspect?: () => void
+  timeoutDuringExtract?: () => void
+  timeoutDuringRender?: () => void
+  timeoutDuringIndex?: () => void
+  timeoutDuringCommit?: () => void
 }
 
 interface ArtifactProcessorConstructor {
@@ -1377,7 +1564,7 @@ function activeGenerationId(database: ReturnType<typeof openDatabase>, artifactI
 function readTitle(database: ReturnType<typeof openDatabase>, artifactId: number) {
   return database
     .prepare('SELECT user_title, derived_title FROM artifact WHERE id = ?')
-    .get(artifactId)
+    .get(artifactId) as { user_title: string | null; derived_title: string | null }
 }
 
 function requireResultNumber(value: number | null): number {

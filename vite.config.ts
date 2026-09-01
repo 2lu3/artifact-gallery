@@ -1,8 +1,11 @@
+import { randomBytes } from 'node:crypto'
+
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 const apiOrigin = process.env.ARTIFACT_GALLERY_API_ORIGIN ?? 'http://127.0.0.1:3000'
 const BOOTSTRAP_PROXY_HEADER = 'x-artifact-gallery-bootstrap-proxy'
+const DEVELOPMENT_CSP_NONCE = randomBytes(18).toString('base64url')
 
 export default defineConfig({
   plugins: [
@@ -35,14 +38,16 @@ export default defineConfig({
               await upstream.text(),
             )
             response.statusCode = 200
-            for (const header of [
-              'content-type',
-              'content-security-policy',
-              'cache-control',
-              'pragma',
-            ]) {
+            for (const header of ['content-type', 'cache-control', 'pragma']) {
               const value = upstream.headers.get(header)
               if (value) response.setHeader(header, value)
+            }
+            const contentSecurityPolicy = upstream.headers.get('content-security-policy')
+            if (contentSecurityPolicy) {
+              response.setHeader(
+                'content-security-policy',
+                authorizeViteNonce(contentSecurityPolicy, DEVELOPMENT_CSP_NONCE),
+              )
             }
             response.setHeader('cache-control', 'no-store')
             response.end(transformed)
@@ -53,13 +58,36 @@ export default defineConfig({
       },
     },
   ],
+  html: { cspNonce: DEVELOPMENT_CSP_NONCE },
   server: {
     host: '127.0.0.1',
+    port: 5173,
+    strictPort: true,
     proxy: {
-      '/api': { target: apiOrigin },
+      '/api': { target: apiOrigin, changeOrigin: true },
     },
   },
 })
+
+function authorizeViteNonce(policy: string, nonce: string): string {
+  return authorizeDirectiveNonce(
+    authorizeDirectiveNonce(policy, 'script-src', nonce),
+    'style-src',
+    nonce,
+  )
+}
+
+function authorizeDirectiveNonce(policy: string, directive: string, nonce: string): string {
+  const nonceSource = `'nonce-${nonce}'`
+  const expression = new RegExp(`${directive}\\s+([^;]*)`, 'iu')
+  if (expression.test(policy)) {
+    return policy.replace(expression, (_matched, sources: string) => {
+      if (sources.split(/\s+/u).includes(nonceSource)) return `${directive} ${sources.trim()}`
+      return `${directive} ${sources.trim()} ${nonceSource}`.trim()
+    })
+  }
+  return `${policy.replace(/;?\s*$/u, '')}; ${directive} 'self' ${nonceSource}`
+}
 
 function sendBootstrapUnavailable(response: {
   statusCode: number

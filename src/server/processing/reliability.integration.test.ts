@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -12,6 +12,7 @@ import { chromium, type Browser } from 'playwright'
 import { openDatabase } from '../db/database.js'
 import { HtmlRenderer } from '../rendering/html-renderer.js'
 import { ImportRepository } from '../repositories/import-repository.js'
+import { DerivativePathPolicy } from '../security/derivative-path-policy.js'
 import { PathPolicy } from '../security/path-policy.js'
 import { createServerRuntime } from '../runtime.js'
 import type { ProcessingStage } from '../../shared/errors.js'
@@ -94,6 +95,65 @@ describe('production crash recovery matrix', () => {
     },
     20_000,
   )
+
+  it.each(['rename-before-db', 'db-before-old-cleanup'] as const)(
+    'force-terminates at the %s thumbnail window and removes only the orphan after restart',
+    async (crashPoint) => {
+      const root = await mkdtemp(join(tmpdir(), `artifact-gallery-crash-${crashPoint}-`))
+      temporaryDirectories.push(root)
+      const sourcePath = join(root, 'source.html')
+      const thumbnailDirectory = join(root, 'derived')
+      const databaseFilename = join(root, 'gallery.sqlite')
+      await mkdir(thumbnailDirectory)
+      await writeFile(sourcePath, '<h1>Crash window</h1>')
+      const fixture = fileURLToPath(
+        new URL('../../../tests/fixtures/reliability-forced-termination.ts', import.meta.url),
+      )
+      const child = spawn(process.execPath, [
+        '--import',
+        'tsx',
+        fixture,
+        crashPoint,
+        databaseFilename,
+        sourcePath,
+        thumbnailDirectory,
+      ])
+      const state = await readReadyState(child, crashPoint)
+      expect(state.orphanPath).toEqual(expect.any(String))
+      await expect(access(state.orphanPath as string)).resolves.toBeUndefined()
+
+      expect(child.kill('SIGKILL')).toBe(true)
+      await once(child, 'exit')
+
+      const reports: Array<{ removedOrphanFiles: readonly string[] }> = []
+      const app = await createServerRuntime({
+        databaseFilename,
+        thumbnailDirectory,
+        allowedRoots: [root],
+        port: 4173,
+        reportRecovery: (report) => {
+          reports.push(report)
+        },
+      })
+      expect(reports.at(-1)?.removedOrphanFiles).toContain(state.orphanPath)
+      await expect(access(state.orphanPath as string)).rejects.toThrow()
+      if (state.activePath) await expect(access(state.activePath)).resolves.toBeUndefined()
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/imports/${state.runId}`,
+        headers: {
+          host: '127.0.0.1:4173',
+          'x-artifact-gallery-token': app.sessionToken,
+        },
+      })
+      expect(response.json().status).toBe(
+        crashPoint === 'rename-before-db' ? 'interrupted' : 'completed',
+      )
+      await app.close()
+    },
+    20_000,
+  )
 })
 
 describe('production worker with real Chromium', () => {
@@ -128,39 +188,42 @@ describe('production worker with real Chromium', () => {
     const launchedBrowsers: Browser[] = []
     const commitCriticalSectionMs: number[] = []
     let peakContexts = 0
-    const renderer = new HtmlRenderer(
-      {
-        authorizeAsset: async (requestedPath) => {
-          const asset = await realPolicy.authorizeAsset(requestedPath)
-          const itemId = Number(/gate-(\d+)\.css$/u.exec(requestedPath)?.[1])
-          return {
-            canonicalPath: asset.canonicalPath,
-            mimeType: asset.mimeType,
-            read: async (maxBytes?: number) => {
-              readsStarted += 1
-              peakContexts = Math.max(
-                peakContexts,
-                ...launchedBrowsers.map((browser) => browser.contexts().length),
-              )
-              if (readsStarted === 2) resolveFirstTwo()
-              if (readsStarted === 3) resolveThird()
-              await new Promise<void>((resolve) => releases.set(itemId, resolve))
-              return asset.read(maxBytes)
-            },
-          }
-        },
+    const controlledAssetPolicy = {
+      authorizeAsset: async (requestedPath: string) => {
+        const asset = await realPolicy.authorizeAsset(requestedPath)
+        const itemId = Number(/gate-(\d+)\.css$/u.exec(requestedPath)?.[1])
+        return {
+          canonicalPath: asset.canonicalPath,
+          mimeType: asset.mimeType,
+          read: async (maxBytes?: number) => {
+            readsStarted += 1
+            peakContexts = Math.max(
+              peakContexts,
+              ...launchedBrowsers.map((browser) => browser.contexts().length),
+            )
+            if (readsStarted === 2) resolveFirstTwo()
+            if (readsStarted === 3) resolveThird()
+            await new Promise<void>((resolve) => releases.set(itemId, resolve))
+            return asset.read(maxBytes)
+          },
+        }
       },
-      {
-        launchBrowser: async () => {
-          const browser = await chromium.launch({ headless: true })
-          launchedBrowsers.push(browser)
-          return browser
-        },
+    }
+    const renderer = new HtmlRenderer(controlledAssetPolicy, {
+      launchBrowser: async () => {
+        const browser = await chromium.launch({ headless: true })
+        launchedBrowsers.push(browser)
+        return browser
       },
-    )
+    })
+    const derivativePathPolicy = await DerivativePathPolicy.create(thumbnailDirectory)
     const processor = new ArtifactProcessor({
       database,
-      pathPolicy: realPolicy,
+      pathPolicy: {
+        authorizeFile: realPolicy.authorizeFile.bind(realPolicy),
+        authorizeAsset: controlledAssetPolicy.authorizeAsset,
+      },
+      derivativePathPolicy,
       htmlRenderer: renderer,
       thumbnailDirectory,
       reportCommitCriticalSection: ({ durationMs }) => {
@@ -237,28 +300,31 @@ describe('production worker with real Chromium', () => {
     const realPolicy = await PathPolicy.create([root])
     const launchedBrowsers: Browser[] = []
     let crashed = false
-    const renderer = new HtmlRenderer(
-      {
-        authorizeAsset: async (requestedPath) => {
-          const asset = await realPolicy.authorizeAsset(requestedPath)
-          if (!crashed) {
-            crashed = true
-            await launchedBrowsers[0]?.close()
-          }
-          return asset
-        },
+    const crashAssetPolicy = {
+      authorizeAsset: async (requestedPath: string) => {
+        const asset = await realPolicy.authorizeAsset(requestedPath)
+        if (!crashed) {
+          crashed = true
+          await launchedBrowsers[0]?.close()
+        }
+        return asset
       },
-      {
-        launchBrowser: async () => {
-          const browser = await chromium.launch({ headless: true })
-          launchedBrowsers.push(browser)
-          return browser
-        },
+    }
+    const renderer = new HtmlRenderer(crashAssetPolicy, {
+      launchBrowser: async () => {
+        const browser = await chromium.launch({ headless: true })
+        launchedBrowsers.push(browser)
+        return browser
       },
-    )
+    })
+    const derivativePathPolicy = await DerivativePathPolicy.create(thumbnailDirectory)
     const processor = new ArtifactProcessor({
       database,
-      pathPolicy: realPolicy,
+      pathPolicy: {
+        authorizeFile: realPolicy.authorizeFile.bind(realPolicy),
+        authorizeAsset: crashAssetPolicy.authorizeAsset,
+      },
+      derivativePathPolicy,
       htmlRenderer: renderer,
       thumbnailDirectory,
     })
@@ -291,15 +357,30 @@ describe('production worker with real Chromium', () => {
 
 async function readReadyState(
   child: ReturnType<typeof spawn>,
-  expectedStage: ProcessingStage,
-): Promise<{ runId: number; itemId: number }> {
+  expectedStage: string,
+): Promise<{ runId: number; itemId: number; orphanPath?: string; activePath?: string }> {
   if (!child.stdout) throw new Error('Fixture stdout is not piped.')
+  let stderr = ''
+  child.stderr?.on('data', (chunk: Buffer) => {
+    stderr += chunk.toString('utf8')
+  })
+  let timer: NodeJS.Timeout | undefined
   const event = await Promise.race([
     once(child.stdout, 'data').then(([chunk]) => ({ chunk: chunk as Buffer })),
     once(child, 'exit').then(([code]) => ({ code })),
+    new Promise<{ timeout: true }>((resolveTimeout) => {
+      timer = setTimeout(() => resolveTimeout({ timeout: true }), 5_000)
+      timer.unref()
+    }),
   ])
+  if (timer) clearTimeout(timer)
+  if ('timeout' in event) {
+    child.kill('SIGKILL')
+    await once(child, 'exit')
+    throw new Error(`Fixture did not reach READY. ${stderr}`)
+  }
   if (!('chunk' in event)) {
-    throw new Error(`Fixture exited ${String(event.code)} before READY.`)
+    throw new Error(`Fixture exited ${String(event.code)} before READY. ${stderr}`)
   }
   const chunk = event.chunk
   const line = chunk.toString('utf8').trim()
@@ -310,6 +391,8 @@ async function readReadyState(
     runId: number
     itemId: number
     stage: ProcessingStage
+    orphanPath?: string
+    activePath?: string
   }
   expect(state.stage).toBe(expectedStage)
   return state

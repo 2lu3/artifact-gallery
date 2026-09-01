@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path'
 
 import { openDatabase } from '../../src/server/db/database.js'
 import { ArtifactProcessor } from '../../src/server/processing/artifact-processor.js'
+import { DerivativePathPolicy } from '../../src/server/security/derivative-path-policy.js'
 import { PathPolicy } from '../../src/server/security/path-policy.js'
 
 export interface SeededState {
@@ -48,9 +49,12 @@ async function seedPerformanceCorpus(
     const pathPolicy = await (dependencies.createPathPolicy ?? PathPolicy.create)([
       dirname(sourcePaths[0] as string),
     ])
+    await mkdir(thumbnailDirectory, { recursive: true })
+    const derivativePathPolicy = await DerivativePathPolicy.create(thumbnailDirectory)
     const processor = new ArtifactProcessor({
       database,
       pathPolicy,
+      derivativePathPolicy,
       htmlRenderer: {
         render: async ({ html }) => ({
           screenshot: Buffer.from(`RIFF${html.slice(0, 64)}WEBP`),

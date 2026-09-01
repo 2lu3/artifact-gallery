@@ -82,6 +82,19 @@ afterEach(async () => {
 })
 
 describe('PathPolicy', () => {
+  test('keeps the folder-policy factory callable as an injected unbound function', async () => {
+    const root = await makeTemporaryDirectory()
+    const source = join(root, 'artifact.md')
+    await writeFile(source, '# Artifact')
+    const createPolicy = PathPolicy.create
+
+    const policy = await createPolicy([root])
+
+    await expect(policy.authorizeFile(source)).resolves.toMatchObject({
+      canonicalPath: await realpath(source),
+    })
+  })
+
   test('normalizes a missing allowed root during policy creation', async () => {
     const parent = await makeTemporaryDirectory()
     const missingRoot = join(parent, 'missing-root')
@@ -116,6 +129,44 @@ describe('PathPolicy', () => {
 
     expect(authorized.canonicalPath).toBe(await realpath(source))
     await expect(authorized.read('utf8')).resolves.toBe('<h1>Artifact</h1>')
+  })
+
+  test('keeps a selected-file capability exact while a selected folder permits contained assets', async () => {
+    const root = await makeTemporaryDirectory()
+    const source = join(root, 'artifact.html')
+    const sibling = join(root, 'style.css')
+    await writeFile(source, '<link rel="stylesheet" href="style.css">')
+    await writeFile(sibling, 'body {}')
+
+    const filePolicy = await PathPolicy.createCapabilities([{ path: source, kind: 'file' }])
+    await expect(filePolicy.authorizeFile(source)).resolves.toMatchObject({
+      canonicalPath: await realpath(source),
+    })
+    await expect(filePolicy.authorizeAsset(sibling)).rejects.toMatchObject({
+      code: 'OUTSIDE_ALLOWED_ROOT',
+    })
+
+    const folderPolicy = await PathPolicy.createCapabilities([{ path: root, kind: 'folder' }])
+    await expect(folderPolicy.authorizeAsset(sibling)).resolves.toMatchObject({
+      canonicalPath: await realpath(sibling),
+    })
+  })
+
+  test('adds a validated selected capability dynamically without widening earlier file grants', async () => {
+    const root = await makeTemporaryDirectory()
+    const first = join(root, 'first.md')
+    const second = join(root, 'second.md')
+    await writeFile(first, '# First')
+    await writeFile(second, '# Second')
+    const policy = await PathPolicy.createCapabilities([])
+
+    const granted = await policy.addSelectedCapability(first, 'file')
+
+    expect(granted).toEqual({ canonicalPath: await realpath(first), kind: 'file' })
+    await expect(policy.authorizeFile(first)).resolves.toBeDefined()
+    await expect(policy.authorizeFile(second)).rejects.toMatchObject({
+      code: 'OUTSIDE_ALLOWED_ROOT',
+    })
   })
 
   test('bounds a real source read before loading an oversized file', async () => {
@@ -378,12 +429,15 @@ describe('PathPolicy', () => {
     })
   })
 
-  test('does not descend into hidden entries during enumeration', async () => {
+  test('silently skips hidden and unsupported entries during enumeration', async () => {
     const root = await makeTemporaryDirectory()
     const folder = join(root, 'artifacts')
     const hidden = join(folder, '.hidden')
     await mkdir(hidden, { recursive: true })
     await writeFile(join(hidden, 'concealed.html'), '<h1>Concealed</h1>')
+    await writeFile(join(folder, 'style.css'), 'body {}')
+    await writeFile(join(folder, 'image.png'), 'image')
+    await writeFile(join(folder, 'font.woff2'), 'font')
     const visible = join(folder, 'visible.html')
     await writeFile(visible, '<h1>Visible</h1>')
     const policy = await PathPolicy.create([root])
@@ -391,9 +445,40 @@ describe('PathPolicy', () => {
     const result = await policy.enumerateFolder(folder)
 
     expect(result.files.map((file) => file.canonicalPath)).toEqual([await realpath(visible)])
-    expect(result.errors).toEqual([
-      { path: join(await realpath(folder), '.hidden'), code: 'UNREADABLE_SOURCE' },
-    ])
+    expect(result.errors).toEqual([])
+  })
+
+  test('stops recursive enumeration at the configured bound', async () => {
+    const root = await makeTemporaryDirectory()
+    const folder = join(root, 'artifacts')
+    await mkdir(folder)
+    for (const name of ['a.md', 'b.md', 'c.md']) await writeFile(join(folder, name), name)
+    const policy = await PathPolicy.create([root])
+
+    await expect(policy.enumerateFolder(folder, { maxItems: 2 })).rejects.toMatchObject({
+      name: 'FolderEnumerationLimitError',
+      maxItems: 2,
+    })
+  })
+
+  test('checks AbortSignal, deadline, and durable cancellation while traversing', async () => {
+    const root = await makeTemporaryDirectory()
+    const folder = join(root, 'artifacts')
+    await mkdir(folder)
+    await writeFile(join(folder, 'a.md'), '# A')
+    const policy = await PathPolicy.create([root])
+    const aborted = new AbortController()
+    aborted.abort()
+
+    await expect(policy.enumerateFolder(folder, { signal: aborted.signal })).rejects.toMatchObject({
+      name: 'FolderEnumerationCancelledError',
+    })
+    await expect(
+      policy.enumerateFolder(folder, { deadlineAt: Date.now() - 1 }),
+    ).rejects.toMatchObject({ name: 'FolderEnumerationDeadlineError' })
+    await expect(policy.enumerateFolder(folder, { isCancelled: () => true })).rejects.toMatchObject(
+      { name: 'FolderEnumerationCancelledError' },
+    )
   })
 
   test('rechecks containment when an authorized file is replaced before read', async () => {

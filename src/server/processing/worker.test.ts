@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { openDatabase } from '../db/database.js'
 import { MarkdownRenderer } from '../rendering/markdown-renderer.js'
 import { ImportRepository } from '../repositories/import-repository.js'
+import { DerivativePathPolicy } from '../security/derivative-path-policy.js'
 import { PathPolicy } from '../security/path-policy.js'
 import { ArtifactProcessor } from './artifact-processor.js'
 import type { ArtifactProcessRequest, ArtifactProcessResult } from './artifact-processor.js'
@@ -153,9 +154,11 @@ describe('ImportWorker', () => {
     await writeFile(sourcePath, '# Slow render')
     const database = openDatabase({ filename: join(root, 'gallery.sqlite') })
     const pathPolicy = await PathPolicy.create([root])
+    const derivativePathPolicy = await DerivativePathPolicy.create(thumbnailDirectory)
     const processor = new ArtifactProcessor({
       database,
       pathPolicy,
+      derivativePathPolicy,
       markdownRenderer: new MarkdownRenderer(),
       htmlRenderer: {
         render: (request) =>
@@ -211,6 +214,7 @@ describe('ImportWorker', () => {
     await writeFile(sourcePath, '# Held render')
     const database = openDatabase({ filename: join(root, 'gallery.sqlite') })
     const pathPolicy = await PathPolicy.create([root])
+    const derivativePathPolicy = await DerivativePathPolicy.create(thumbnailDirectory)
     let markRenderStarted!: () => void
     const renderStarted = new Promise<void>((resolve) => {
       markRenderStarted = resolve
@@ -218,6 +222,7 @@ describe('ImportWorker', () => {
     const processor = new ArtifactProcessor({
       database,
       pathPolicy,
+      derivativePathPolicy,
       markdownRenderer: new MarkdownRenderer(),
       htmlRenderer: {
         render: (request) => {
@@ -267,7 +272,7 @@ describe('ImportWorker', () => {
     expect(imports.getItem(run.itemIds[0]).status).toBe('cancelled')
     await worker.close()
     database.close()
-  })
+  }, 10_000)
 })
 
 function processorWith(

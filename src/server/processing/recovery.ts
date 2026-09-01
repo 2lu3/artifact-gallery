@@ -1,7 +1,9 @@
-import { readdir, unlink } from 'node:fs/promises'
-import { join } from 'node:path'
+import { readdir } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 
 import type Database from 'better-sqlite3'
+
+import { DerivativePathPolicy } from '../security/derivative-path-policy.js'
 
 export interface StartupReconciliationOptions {
   temporaryDerivativeDirectory: string
@@ -16,7 +18,10 @@ export interface UnstartedImportItem {
 
 export interface StartupReconciliationError {
   code: 'TEMPORARY_DERIVATIVE_UNREADABLE'
-  operation: 'scan-temporary-derivatives' | 'remove-temporary-derivative'
+  operation:
+    | 'scan-temporary-derivatives'
+    | 'remove-temporary-derivative'
+    | 'remove-orphan-derivative'
   path: string
   detail: string | null
 }
@@ -27,6 +32,7 @@ export interface StartupReconciliationReport {
   interruptedGenerationIds: number[]
   unstartedItems: UnstartedImportItem[]
   removedTemporaryFiles: string[]
+  removedOrphanFiles: string[]
   errors: StartupReconciliationError[]
 }
 
@@ -43,7 +49,8 @@ interface ItemRow {
  *      +--> SQLite transaction: queued/running ----------------> interrupted
  *      |                         completed/active generation ---> preserved
  *      `--> derivative root: direct *.tmp -> remove | structured error
- *                              nested/permanent -> preserve
+ *                              unreferenced artifact-*.webp -> remove
+ *                              active/nested/unrelated -> preserve
  *      |
  *      `--> report queued/unstarted items; never silently resume
  */
@@ -101,7 +108,7 @@ export async function reconcileStartup(
     }
   })()
 
-  const cleanup = await removeTemporaryDerivativeFiles(options.temporaryDerivativeDirectory)
+  const cleanup = await reconcileDerivativeFiles(database, options.temporaryDerivativeDirectory)
   return { ...interrupted, ...cleanup }
 }
 
@@ -109,37 +116,79 @@ function selectIds(database: Database.Database, sql: string): number[] {
   return (database.prepare(sql).all() as Array<{ id: number }>).map((row) => row.id)
 }
 
-async function removeTemporaryDerivativeFiles(
+async function reconcileDerivativeFiles(
+  database: Database.Database,
   directory: string,
-): Promise<Pick<StartupReconciliationReport, 'removedTemporaryFiles' | 'errors'>> {
+): Promise<
+  Pick<StartupReconciliationReport, 'removedTemporaryFiles' | 'removedOrphanFiles' | 'errors'>
+> {
   let entries
   try {
     entries = await readdir(directory, { withFileTypes: true })
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      return { removedTemporaryFiles: [], errors: [] }
+      return { removedTemporaryFiles: [], removedOrphanFiles: [], errors: [] }
     }
     return {
       removedTemporaryFiles: [],
+      removedOrphanFiles: [],
       errors: [recoveryError('scan-temporary-derivatives', directory, error)],
     }
   }
 
-  const paths = entries
+  let policy: DerivativePathPolicy
+  try {
+    policy = await DerivativePathPolicy.create(directory)
+  } catch (error) {
+    return {
+      removedTemporaryFiles: [],
+      removedOrphanFiles: [],
+      errors: [recoveryError('scan-temporary-derivatives', directory, error)],
+    }
+  }
+  const temporaryPaths = entries
     .filter((entry) => entry.isFile() && entry.name.endsWith('.tmp'))
     .map((entry) => join(directory, entry.name))
     .sort()
+  const referenced = new Set(
+    (
+      database
+        .prepare(
+          `SELECT artifact_generation.thumbnail_path
+           FROM artifact
+           JOIN artifact_generation ON artifact_generation.id = artifact.active_generation_id
+           WHERE artifact_generation.thumbnail_path IS NOT NULL`,
+        )
+        .pluck()
+        .all() as string[]
+    ).map((path) => resolve(path)),
+  )
+  const orphanPaths = entries
+    .filter(
+      (entry) =>
+        entry.isFile() &&
+        /^artifact-\d+-generation-\d+\.webp$/u.test(entry.name) &&
+        !referenced.has(resolve(directory, entry.name)),
+    )
+    .map((entry) => join(directory, entry.name))
+    .sort()
   const removedTemporaryFiles: string[] = []
+  const removedOrphanFiles: string[] = []
   const errors: StartupReconciliationError[] = []
-  for (const path of paths) {
-    try {
-      await unlink(path)
-      removedTemporaryFiles.push(path)
-    } catch (error) {
-      errors.push(recoveryError('remove-temporary-derivative', path, error))
+  for (const [operation, paths, removed] of [
+    ['remove-temporary-derivative', temporaryPaths, removedTemporaryFiles],
+    ['remove-orphan-derivative', orphanPaths, removedOrphanFiles],
+  ] as const) {
+    for (const path of paths) {
+      try {
+        await policy.remove(path)
+        removed.push(path)
+      } catch (error) {
+        errors.push(recoveryError(operation, path, error))
+      }
     }
   }
-  return { removedTemporaryFiles, errors }
+  return { removedTemporaryFiles, removedOrphanFiles, errors }
 }
 
 function recoveryError(

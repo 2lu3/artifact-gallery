@@ -1,11 +1,11 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { rm } from 'node:fs/promises'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { basename, extname, relative, resolve } from 'node:path'
+import { basename, extname } from 'node:path'
 
 import type Database from 'better-sqlite3'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 
+import { normalizeArtifactTitle } from '../../shared/artifact-title.js'
 import {
   GALLERY_PAGE_SIZE,
   type ApiError,
@@ -25,12 +25,15 @@ import {
   type PublicProcessingError,
 } from '../../shared/errors.js'
 import { MAX_THUMBNAIL_BYTES } from '../processing/thumbnail-optimizer.js'
+import { reconcileSourceStatuses } from '../processing/source-status-reconciler.js'
+import { PlatformActionError } from '../platform/platform-adapter.js'
 import type {
   ArtifactProcessOperation,
   ImportWorker,
   ImportWorkerCallbacks,
   ImportWorkerContext,
 } from '../processing/worker.js'
+import { MAX_PROCESSING_ATTEMPT_MS } from '../processing/worker.js'
 import {
   ArtifactRepository,
   deriveCardPresentation,
@@ -40,20 +43,27 @@ import {
   type GenerationJobStatus,
   type SourceStatus,
 } from '../repositories/artifact-repository.js'
+import { AllowedRootRepository } from '../repositories/allowed-root-repository.js'
 import { ImportRepository, type ImportRunStatus } from '../repositories/import-repository.js'
 import { GalleryRepository } from '../repositories/gallery-repository.js'
-import type { PathPolicy, PathPolicyItemError } from '../security/path-policy.js'
+import type { DerivativePathPolicy } from '../security/derivative-path-policy.js'
+import {
+  FolderEnumerationCancelledError,
+  FolderEnumerationDeadlineError,
+  FolderEnumerationLimitError,
+  type CanonicalPathCapability,
+  PathPolicy,
+  type PathPolicyItemError,
+} from '../security/path-policy.js'
 import { normalizeSearchText } from '../search/search-query.js'
-import { SearchRepository } from '../search/search-repository.js'
+import { SearchRepository, type SearchResult } from '../search/search-repository.js'
 import { CursorCodec, StaleCursorError, type CursorContext } from './cursor.js'
 import { InvalidResourceTokenError, ThumbnailResourceCodec } from './resource-token.js'
 
 const MAX_PATH_LENGTH = 4096
 const MAX_QUERY_LENGTH = 512
 const MAX_CURSOR_LENGTH = 4096
-const MAX_TITLE_LENGTH = 256
 const MAX_FOLDER_FILES = 1000
-const MAX_SEARCH_RESULTS = 200
 
 const CURSOR_STALE_ERROR: ApiError = {
   code: 'CURSOR_STALE',
@@ -69,8 +79,12 @@ export interface PlatformAdapter {
 
 export interface ApiRouteDependencies {
   readonly database: Database.Database
-  readonly pathPolicy: Pick<PathPolicy, 'authorizeFile' | 'enumerateFolder'>
+  readonly pathPolicy: Pick<
+    PathPolicy,
+    'addSelectedCapability' | 'authorizeFile' | 'enumerateFolder'
+  >
   readonly derivativePathPolicy: Pick<PathPolicy, 'authorizeAsset'>
+  readonly derivativeMutationPolicy: Pick<DerivativePathPolicy, 'remove'>
   readonly importWorker: Pick<ImportWorker, 'enqueue' | 'enqueueTask' | 'close'>
   readonly thumbnailDirectory: string
   readonly cursorSecret?: Buffer
@@ -107,6 +121,7 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
   const gallery = new GalleryRepository(dependencies.database)
   const imports = new ImportRepository(dependencies.database)
   const artifacts = new ArtifactRepository(dependencies.database)
+  const allowedRoots = new AllowedRootRepository(dependencies.database)
   const now = dependencies.now ?? (() => new Date().toISOString())
   const worker = dependencies.importWorker
   app.addHook('onClose', () => worker.close())
@@ -116,11 +131,18 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
     runId: number,
     itemId: number,
     sourcePath: string,
+    capability?: { readonly recordId: number; readonly value: CanonicalPathCapability },
     onResult?: ImportWorkerCallbacks['onResult'],
   ): boolean =>
     worker.enqueue(
       operation,
-      { sourcePath, runId, itemId },
+      {
+        sourcePath,
+        runId,
+        itemId,
+        capability: capability?.value,
+        capabilityId: capability?.recordId,
+      },
       {
         onResult,
         onError: (error) => {
@@ -163,17 +185,8 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
   app.get('/api/search', async (request, reply) => {
     try {
       const query = readPageQuery(request.query, true)
-      const results = search.search(query.query, { limit: MAX_SEARCH_RESULTS })
-      const ids = results.map(({ artifactId }) => artifactId)
-      return pageResponse(
-        dependencies.database,
-        cursorCodec,
-        thumbnailCodec,
-        gallery,
-        query,
-        `search:${normalizeSearchText(query.query)}`,
-        ids,
-      )
+      const results = search.search(query.query, { limit: Number.MAX_SAFE_INTEGER })
+      return searchPageResponse(dependencies.database, cursorCodec, thumbnailCodec, query, results)
     } catch (error) {
       return sendBoundaryError(reply, error)
     }
@@ -182,7 +195,17 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
   app.get('/api/artifacts/:id', async (request, reply) => {
     try {
       const artifactId = readPositiveId(request.params)
-      const row = readArtifactRows(dependencies.database, [artifactId])[0]
+      let row = readArtifactRows(dependencies.database, [artifactId])[0]
+      if (!row) return sendNotFound(reply)
+      const sourcePolicy = artifactPathPolicy(allowedRoots, artifactId, dependencies.pathPolicy)
+      await reconcileSourceStatuses({
+        database: dependencies.database,
+        artifactIds: [artifactId],
+        authorizeFile: sourcePolicy.authorizeFile.bind(sourcePolicy),
+        timeoutMs: 250,
+        now,
+      })
+      row = readArtifactRows(dependencies.database, [artifactId])[0]
       if (!row) return sendNotFound(reply)
       return toArtifactDetail(dependencies.database, row, thumbnailCodec)
     } catch (error) {
@@ -225,10 +248,14 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
       const body = readObject(request.body)
       assertKeys(body, ['path'])
       const sourcePath = readPath(body.path)
-      const authorized = await dependencies.pathPolicy.authorizeFile(sourcePath)
-      const canonicalPath = authorized.canonicalPath
+      const granted = await dependencies.pathPolicy.addSelectedCapability(sourcePath, 'file')
+      const persisted = allowedRoots.add(granted.canonicalPath, granted.kind, now())
+      const canonicalPath = granted.canonicalPath
       const run = imports.createRun([canonicalPath])
-      const accepted = enqueueItem('register', run.id, run.itemIds[0] as number, canonicalPath)
+      const accepted = enqueueItem('register', run.id, run.itemIds[0] as number, canonicalPath, {
+        recordId: persisted.id,
+        value: granted,
+      })
       if (!accepted) {
         persistBackgroundFailure(
           dependencies.database,
@@ -257,6 +284,8 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
       const body = readObject(request.body)
       assertKeys(body, ['path'])
       const folderPath = readPath(body.path)
+      const granted = await dependencies.pathPolicy.addSelectedCapability(folderPath, 'folder')
+      const persisted = allowedRoots.add(granted.canonicalPath, granted.kind, now())
       const run = imports.createRun([])
       const accepted = worker.enqueueTask(
         async (context) => {
@@ -266,7 +295,8 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
             artifacts,
             pathPolicy: dependencies.pathPolicy,
             runId: run.id,
-            folderPath,
+            folderPath: granted.canonicalPath,
+            capability: { recordId: persisted.id, value: granted },
             now,
             process: context.process,
           })
@@ -277,7 +307,7 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
             imports,
             artifacts,
             run.id,
-            folderPath,
+            granted.canonicalPath,
             error,
             now(),
           )
@@ -330,31 +360,30 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
         const artifactId = readPositiveId(request.params)
         const artifact = readArtifactIdentity(dependencies.database, artifactId)
         if (!artifact) return sendNotFound(reply)
+        const persistedCapability = allowedRoots.findForArtifact(artifactId)
         const run = imports.createRun([artifact.sourcePath])
         const accepted = enqueueItem(
           operation,
           run.id,
           run.itemIds[0] as number,
           artifact.sourcePath,
+          persistedCapability
+            ? {
+                recordId: persistedCapability.id,
+                value: {
+                  canonicalPath: persistedCapability.canonicalPath,
+                  kind: persistedCapability.kind,
+                },
+              }
+            : undefined,
           (result) => {
-            const missingError = result.errors.find(({ code }) => code === 'SOURCE_MISSING')
-            if (missingError) {
-              dependencies.database
-                .prepare(
-                  "UPDATE artifact SET source_status = 'missing', updated_at = ? WHERE id = ?",
-                )
-                .run(now(), artifactId)
-              artifacts.recordError({
-                artifactId,
-                generationId: null,
-                code: missingError.code,
-                stage: missingError.stage,
-                retryable: missingError.retryable,
-                userMessage: missingError.message,
-                technicalDetail: null,
-                occurredAt: now(),
-              })
-            }
+            persistExistingArtifactInspectErrors(
+              dependencies.database,
+              artifacts,
+              artifactId,
+              result.errors,
+              now(),
+            )
           },
         )
         if (!accepted) {
@@ -388,10 +417,14 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
       if (!artifact) return sendNotFound(reply)
       const body = readObject(request.body)
       assertKeys(body, ['sourcePath'])
-      const authorized = await dependencies.pathPolicy.authorizeFile(readPath(body.sourcePath))
-      if (formatFor(authorized.canonicalPath) !== artifact.format) {
+      const granted = await dependencies.pathPolicy.addSelectedCapability(
+        readPath(body.sourcePath),
+        'file',
+      )
+      if (formatFor(granted.canonicalPath) !== artifact.format) {
         throw new ArtifactProcessingError('UNSUPPORTED_FORMAT', 'inspect')
       }
+      const persisted = allowedRoots.add(granted.canonicalPath, granted.kind, now())
       try {
         dependencies.database.transaction(() => {
           dependencies.database
@@ -400,7 +433,8 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
                SET source_path = ?, source_status = 'available', updated_at = ?
                WHERE id = ?`,
             )
-            .run(authorized.canonicalPath, now(), artifactId)
+            .run(granted.canonicalPath, now(), artifactId)
+          allowedRoots.linkArtifact(artifactId, persisted.id)
           dependencies.database
             .prepare(
               `UPDATE artifact_search_document
@@ -408,7 +442,7 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
                WHERE artifact_id = ?
                  AND generation_id = (SELECT active_generation_id FROM artifact WHERE id = ?)`,
             )
-            .run(authorized.canonicalPath, artifactId, artifactId)
+            .run(granted.canonicalPath, artifactId, artifactId)
         })()
       } catch {
         throw invalidRequest()
@@ -464,9 +498,9 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
         .all(artifactId) as string[]
       dependencies.database.prepare('DELETE FROM artifact WHERE id = ?').run(artifactId)
       await Promise.all(
-        thumbnailPaths
-          .filter((path) => isContained(dependencies.thumbnailDirectory, path))
-          .map((path) => rm(path, { force: true })),
+        thumbnailPaths.map((path) =>
+          dependencies.derivativeMutationPolicy.remove(path).catch(() => undefined),
+        ),
       )
       return reply.code(204).send()
     } catch (error) {
@@ -483,7 +517,8 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
         const artifactId = readPositiveId(request.params)
         const artifact = readArtifactIdentity(dependencies.database, artifactId)
         if (!artifact) return sendNotFound(reply)
-        const authorized = await dependencies.pathPolicy.authorizeFile(artifact.sourcePath)
+        const sourcePolicy = artifactPathPolicy(allowedRoots, artifactId, dependencies.pathPolicy)
+        const authorized = await sourcePolicy.authorizeFile(artifact.sourcePath)
         const adapter = dependencies.platformAdapter?.[adapterMethod]
         if (!adapter) {
           return sendError(reply, 501, {
@@ -493,12 +528,33 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
             message: 'This action is not supported on the current platform.',
           })
         }
-        return adapter(authorized.canonicalPath)
+        return await adapter(authorized.canonicalPath)
       } catch (error) {
+        if (error instanceof PlatformActionError) {
+          return sendError(reply, 502, {
+            code: 'PLATFORM_ACTION_FAILED',
+            stage: 'request',
+            retryable: true,
+            message: error.message,
+          })
+        }
         return sendBoundaryError(reply, error)
       }
     })
   }
+}
+
+function artifactPathPolicy(
+  allowedRoots: AllowedRootRepository,
+  artifactId: number,
+  fallback: Pick<PathPolicy, 'authorizeFile'>,
+): Pick<PathPolicy, 'authorizeFile'> {
+  const capability = allowedRoots.findForArtifact(artifactId)
+  return capability
+    ? PathPolicy.restoreCapabilities([
+        { canonicalPath: capability.canonicalPath, kind: capability.kind },
+      ])
+    : fallback
 }
 
 interface FolderRunDependencies {
@@ -508,6 +564,7 @@ interface FolderRunDependencies {
   readonly pathPolicy: Pick<PathPolicy, 'enumerateFolder'>
   readonly runId: number
   readonly folderPath: string
+  readonly capability: { readonly recordId: number; readonly value: CanonicalPathCapability }
   readonly now: () => string
   readonly process: ImportWorkerContext['process']
 }
@@ -522,14 +579,27 @@ async function processFolderRun(dependencies: FolderRunDependencies): Promise<vo
 
   let enumeration: Awaited<ReturnType<FolderRunDependencies['pathPolicy']['enumerateFolder']>>
   try {
-    enumeration = await dependencies.pathPolicy.enumerateFolder(folderPath)
+    enumeration = await dependencies.pathPolicy.enumerateFolder(folderPath, {
+      maxItems: MAX_FOLDER_FILES,
+      deadlineAt: Date.now() + MAX_PROCESSING_ATTEMPT_MS,
+      isCancelled: () => imports.getRun(runId).cancelRequestedAt !== null,
+    })
   } catch (error) {
-    if (imports.getRun(runId).cancelRequestedAt !== null) {
+    if (
+      error instanceof FolderEnumerationCancelledError ||
+      imports.getRun(runId).cancelRequestedAt !== null
+    ) {
       cancelOutstandingRun(database, imports, runId, now())
       return
     }
     const [itemId] = imports.addItems(runId, [folderPath])
-    persistItemFailure(imports, artifacts, itemId as number, error, now())
+    const mapped =
+      error instanceof FolderEnumerationLimitError
+        ? new ArtifactProcessingError('INPUT_TOO_LARGE', 'inspect')
+        : error instanceof FolderEnumerationDeadlineError
+          ? new ArtifactProcessingError('TIMEOUT', 'inspect')
+          : error
+    persistItemFailure(imports, artifacts, itemId as number, mapped, now())
     finishImportRun(database, imports, runId, now())
     return
   }
@@ -571,6 +641,8 @@ async function processFolderRun(dependencies: FolderRunDependencies): Promise<vo
       sourcePath: file.canonicalPath,
       runId,
       itemId: fileItemIds[index] as number,
+      capability: dependencies.capability.value,
+      capabilityId: dependencies.capability.recordId,
     })
   }
   finishImportRun(database, imports, runId, now())
@@ -663,6 +735,40 @@ function persistBackgroundFailure(
   finishImportRun(database, imports, runId, occurredAt)
 }
 
+function persistExistingArtifactInspectErrors(
+  database: Database.Database,
+  artifacts: ArtifactRepository,
+  artifactId: number,
+  errors: readonly PublicProcessingError[],
+  occurredAt: string,
+): void {
+  const inspectErrors = errors.filter(({ stage }) => stage === 'inspect')
+  if (inspectErrors.length === 0) return
+  database.transaction(() => {
+    database
+      .prepare(
+        `DELETE FROM artifact_error
+         WHERE artifact_id = ? AND generation_id IS NULL AND stage = 'inspect'`,
+      )
+      .run(artifactId)
+    for (const error of inspectErrors) {
+      if (error.code === 'SOURCE_MISSING') {
+        artifacts.setSourceStatus(artifactId, 'missing', occurredAt)
+      }
+      artifacts.recordError({
+        artifactId,
+        generationId: null,
+        code: error.code,
+        stage: error.stage,
+        retryable: error.retryable,
+        userMessage: error.message,
+        technicalDetail: null,
+        occurredAt,
+      })
+    }
+  })()
+}
+
 function cancelOutstandingRun(
   database: Database.Database,
   imports: ImportRepository,
@@ -745,6 +851,69 @@ function pageResponse(
           })
         : null,
     ...counts,
+  }
+}
+
+function searchPageResponse(
+  database: Database.Database,
+  codec: CursorCodec,
+  thumbnailCodec: ThumbnailResourceCodec,
+  query: PageQuery,
+  results: readonly SearchResult[],
+): GalleryPage {
+  const context = cursorContext(database, query, `search:${normalizeSearchText(query.query)}`)
+  const cursor = query.cursor ? codec.decode(query.cursor, context) : null
+  const rowsById = new Map(
+    readArtifactRowsInBatches(
+      database,
+      results.map(({ artifactId }) => artifactId),
+    ).map((row) => [row.id, row]),
+  )
+  const statusMatched = results.filter((result) => {
+    const row = rowsById.get(result.artifactId)
+    return row && (query.status === 'all' || presentationFor(row) === query.status)
+  })
+  const formatCounts = {
+    all: statusMatched.length,
+    html: statusMatched.filter(({ format }) => format === 'html').length,
+    markdown: statusMatched.filter(({ format }) => format === 'markdown').length,
+  }
+  const filtered = statusMatched.filter(
+    ({ format }) => query.filter === 'all' || format === query.filter,
+  )
+  let start = 0
+  if (cursor) {
+    const previous = filtered.findIndex(
+      ({ artifactId, relevanceKey }) =>
+        artifactId === cursor.lastId && relevanceKey === cursor.lastSortKey,
+    )
+    if (previous === -1) throw new StaleCursorError()
+    start = previous + 1
+  }
+  const window = filtered.slice(start, start + GALLERY_PAGE_SIZE + 1)
+  const page = window.slice(0, GALLERY_PAGE_SIZE)
+  const last = page.at(-1)
+  return {
+    items: page.map((result) => {
+      const row = rowsById.get(result.artifactId)
+      if (!row) throw new StaleCursorError()
+      return {
+        ...toArtifactCard(row, thumbnailCodec),
+        match: { reason: result.matchReason, snippet: result.snippet },
+      }
+    }),
+    nextCursor:
+      window.length > GALLERY_PAGE_SIZE && last
+        ? codec.encode({
+            version: 1,
+            ...context,
+            lastSortKey: last.relevanceKey,
+            lastId: last.artifactId,
+          })
+        : null,
+    catalogTotal: database.prepare('SELECT COUNT(*) FROM artifact').pluck().get() as number,
+    filteredTotal: query.filter === 'all' ? formatCounts.all : formatCounts[query.filter],
+    formatCounts,
   }
 }
 
@@ -848,14 +1017,29 @@ function readArtifactRows(database: Database.Database, ids: readonly number[]): 
     .all(...ids) as ArtifactRow[]
 }
 
-function toArtifactCard(row: ArtifactRow, thumbnailCodec: ThumbnailResourceCodec): ArtifactCard {
-  const status = deriveCardPresentation({
+function readArtifactRowsInBatches(
+  database: Database.Database,
+  ids: readonly number[],
+): ArtifactRow[] {
+  const rows: ArtifactRow[] = []
+  for (let offset = 0; offset < ids.length; offset += 500) {
+    rows.push(...readArtifactRows(database, ids.slice(offset, offset + 500)))
+  }
+  return rows
+}
+
+function presentationFor(row: ArtifactRow): CardPresentation {
+  return deriveCardPresentation({
     source_status: row.source_status,
     job_status: row.job_status,
     content_status: row.content_status,
     render_status: row.render_status,
     index_status: row.index_status,
   })
+}
+
+function toArtifactCard(row: ArtifactRow, thumbnailCodec: ThumbnailResourceCodec): ArtifactCard {
+  const status = presentationFor(row)
   return {
     id: row.id,
     title: row.user_title ?? row.derived_title ?? basename(row.source_path),
@@ -1059,9 +1243,8 @@ function readPositiveId(params: unknown): number {
 
 function readTitle(value: unknown): string | null {
   if (value === null) return null
-  if (typeof value !== 'string' || value.length > MAX_TITLE_LENGTH) throw invalidRequest()
-  const normalized = value.trim()
-  return normalized.length === 0 ? null : normalized
+  if (typeof value !== 'string') throw invalidRequest()
+  return normalizeArtifactTitle(value)
 }
 
 function formatFor(sourcePath: string): ArtifactFormat {
@@ -1114,9 +1297,4 @@ function sendNotFound(reply: FastifyReply) {
 
 function sendError(reply: FastifyReply, status: number, error: ApiError) {
   return reply.code(status).send({ error })
-}
-
-function isContained(root: string, candidate: string): boolean {
-  const path = relative(resolve(root), resolve(candidate))
-  return path === '' || (!path.startsWith('..') && !path.startsWith('/'))
 }

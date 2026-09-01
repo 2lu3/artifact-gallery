@@ -22,9 +22,9 @@ describe('AllowedRootRepository', () => {
     const filename = join(directory, 'gallery.sqlite')
     const database = openDatabase({ filename })
     const repository = new AllowedRootRepository(database)
-    const first = repository.add('/canonical/b', '2026-08-31T00:00:00.000Z')
-    const duplicate = repository.add('/canonical/b', '2026-08-31T00:01:00.000Z')
-    const second = repository.add('/canonical/a', '2026-08-31T00:02:00.000Z')
+    const first = repository.add('/canonical/b', 'folder', '2026-08-31T00:00:00.000Z')
+    const duplicate = repository.add('/canonical/b', 'folder', '2026-08-31T00:01:00.000Z')
+    const second = repository.add('/canonical/a/file.md', 'file', '2026-08-31T00:02:00.000Z')
 
     expect(duplicate.id).toBe(first.id)
     database.close()
@@ -33,12 +33,14 @@ describe('AllowedRootRepository', () => {
     expect(new AllowedRootRepository(reopened).list()).toEqual([
       {
         id: second.id,
-        canonicalPath: '/canonical/a',
+        canonicalPath: '/canonical/a/file.md',
+        kind: 'file',
         createdAt: '2026-08-31T00:02:00.000Z',
       },
       {
         id: first.id,
         canonicalPath: '/canonical/b',
+        kind: 'folder',
         createdAt: '2026-08-31T00:00:00.000Z',
       },
     ])

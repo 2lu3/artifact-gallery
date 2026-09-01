@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -15,6 +15,7 @@ test.describe.serial('Artifact Gallery', () => {
   let sourceDirectory: string
   let thumbnailDirectory: string
   let databaseFilename: string
+  let sourceActions: Array<{ action: 'open-source' | 'reveal'; sourcePath: string }>
 
   test.beforeAll(async () => {
     root = await mkdtemp(join(tmpdir(), 'artifact-gallery-e2e-'))
@@ -24,12 +25,23 @@ test.describe.serial('Artifact Gallery', () => {
     await mkdir(thumbnailDirectory)
     const port = await availablePort()
     databaseFilename = join(root, 'catalog.sqlite')
+    sourceActions = []
     const options: ServerRuntimeOptions = {
       databaseFilename,
       thumbnailDirectory,
       allowedRoots: [sourceDirectory],
       clientDirectory: join(process.cwd(), 'dist'),
       port,
+      platformAdapter: {
+        openSource: async (sourcePath) => {
+          sourceActions.push({ action: 'open-source', sourcePath })
+          return { supported: true }
+        },
+        revealSource: async (sourcePath) => {
+          sourceActions.push({ action: 'reveal', sourcePath })
+          return { supported: true }
+        },
+      },
     }
     application = await createServerRuntime(options)
     await application.listen({ host: '127.0.0.1', port })
@@ -332,6 +344,7 @@ test.describe.serial('Artifact Gallery', () => {
   }) => {
     const sourcePath = join(sourceDirectory, 'lightbox-actions.md')
     await writeFile(sourcePath, '# Action Card\n\nVersion one.')
+    const canonicalSourcePath = await realpath(sourcePath)
     await page.goto(baseURL)
     await registerPath(page, sourcePath, 'file')
     await page.getByRole('button', { name: '登録画面を閉じる' }).click()
@@ -348,13 +361,18 @@ test.describe.serial('Artifact Gallery', () => {
     await expect(renamedLightbox.getByRole('heading', { name: 'Renamed Artifact' })).toBeVisible()
 
     await renamedLightbox.getByRole('button', { name: '元ファイルを開く' }).click()
-    await expect(renamedLightbox.getByRole('alert')).toHaveText(
-      'This action is not supported on the current platform.',
-    )
+    await expect
+      .poll(() => sourceActions)
+      .toEqual([{ action: 'open-source', sourcePath: canonicalSourcePath }])
+    await expect(renamedLightbox.getByRole('alert')).toHaveCount(0)
     await renamedLightbox.getByRole('button', { name: 'Finderで表示' }).click()
-    await expect(renamedLightbox.getByRole('alert')).toHaveText(
-      'This action is not supported on the current platform.',
-    )
+    await expect
+      .poll(() => sourceActions)
+      .toEqual([
+        { action: 'open-source', sourcePath: canonicalSourcePath },
+        { action: 'reveal', sourcePath: canonicalSourcePath },
+      ])
+    await expect(renamedLightbox.getByRole('alert')).toHaveCount(0)
   })
 
   test('keeps the last preview while missing and validates relink before retrying', async ({

@@ -35,6 +35,7 @@ describe('openDatabase', () => {
     expect(tables).toEqual([
       'allowed_root',
       'artifact',
+      'artifact_allowed_root',
       'artifact_error',
       'artifact_generation',
       'artifact_search_document',
@@ -107,6 +108,7 @@ describe('openDatabase', () => {
       'derived_title_normalized',
       'body_normalized',
       'path_segments_normalized',
+      'format_normalized',
     ])
     const searchIndexSql = database
       .prepare(
@@ -123,7 +125,8 @@ describe('openDatabase', () => {
       'detail',
       'occurred_at',
     ])
-    expect(columnNames('allowed_root')).toEqual(['id', 'canonical_path', 'created_at'])
+    expect(columnNames('allowed_root')).toEqual(['id', 'canonical_path', 'created_at', 'kind'])
+    expect(columnNames('artifact_allowed_root')).toEqual(['artifact_id', 'allowed_root_id'])
     expect(columnNames('import_run')).toEqual([
       'id',
       'status',
@@ -502,6 +505,8 @@ describe('openDatabase', () => {
         { version: '002_error_ownership.sql' },
         { version: '003_search_visibility.sql' },
         { version: '004_search.sql' },
+        { version: '005_capabilities.sql' },
+        { version: '006_search_contract.sql' },
       ],
     )
     expect(
@@ -555,6 +560,16 @@ describe('openDatabase', () => {
         )
         .get(),
     ).toEqual({ artifact_id: artifactId, generation: 1 })
+    expect(
+      upgraded
+        .prepare(
+          `SELECT allowed_root.canonical_path, allowed_root.kind
+           FROM artifact_allowed_root
+           JOIN allowed_root ON allowed_root.id = artifact_allowed_root.allowed_root_id
+           WHERE artifact_allowed_root.artifact_id = ?`,
+        )
+        .get(artifactId),
+    ).toEqual({ canonical_path: '/canonical/legacy.md', kind: 'file' })
     expect(() =>
       upgraded
         .prepare(
@@ -654,6 +669,8 @@ describe('openDatabase', () => {
         { version: '002_error_ownership.sql' },
         { version: '003_search_visibility.sql' },
         { version: '004_search.sql' },
+        { version: '005_capabilities.sql' },
+        { version: '006_search_contract.sql' },
       ],
     )
     expect(

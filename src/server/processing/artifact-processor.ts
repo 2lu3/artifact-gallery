@@ -1,6 +1,4 @@
 import { randomUUID } from 'node:crypto'
-import { renameSync } from 'node:fs'
-import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { basename, extname, join } from 'node:path'
 
 import type Database from 'better-sqlite3'
@@ -12,6 +10,7 @@ import {
   type ProcessingStage,
   type PublicProcessingError,
 } from '../../shared/errors.js'
+import { normalizeArtifactTitle } from '../../shared/artifact-title.js'
 import type { HtmlRenderResult } from '../rendering/html-renderer.js'
 import { MarkdownRenderer, type MarkdownRenderResult } from '../rendering/markdown-renderer.js'
 import {
@@ -22,7 +21,12 @@ import {
 } from '../repositories/artifact-repository.js'
 import { ImportRepository, type ImportItemStage } from '../repositories/import-repository.js'
 import { SearchVisibilityRepository } from '../repositories/search-visibility-repository.js'
-import { AssetReadLimitError, type AuthorizedFile } from '../security/path-policy.js'
+import {
+  AssetReadLimitError,
+  PathPolicy,
+  type AuthorizedFile,
+  type CanonicalPathCapability,
+} from '../security/path-policy.js'
 import { SQLiteSearchIndexer } from '../search/sqlite-search-indexer.js'
 import {
   MAX_THUMBNAIL_BYTES,
@@ -155,7 +159,9 @@ export interface ArtifactProcessorDependencies {
   readonly database: Database.Database
   readonly pathPolicy: {
     authorizeFile(path: string): Promise<AuthorizedFile>
+    authorizeAsset(path: string): ReturnType<PathPolicy['authorizeAsset']>
   }
+  readonly derivativePathPolicy: ProcessorFileSystem
   readonly markdownRenderer?: {
     render(markdown: string): MarkdownRenderResult
   }
@@ -170,13 +176,13 @@ export interface ArtifactProcessorDependencies {
     render(request: {
       html: string
       sourcePath: string
+      assetPathPolicy?: Pick<PathPolicy, 'authorizeAsset'>
       signal?: AbortSignal
     }): Promise<HtmlRenderResult>
   }
   readonly indexer?: ArtifactIndexer
   readonly thumbnailDirectory: string
   readonly thumbnailOptimizer?: ThumbnailOptimizer
-  readonly fileSystem?: ProcessorFileSystem
   readonly now?: () => string
   readonly reportOperationalError?: (error: ProcessingOperationalError) => void | Promise<void>
   readonly reportCommitCriticalSection?: (measurement: CommitCriticalSectionMeasurement) => void
@@ -190,6 +196,8 @@ export interface ArtifactProcessRequest {
   readonly signal?: AbortSignal
   /** Epoch milliseconds. The worker owns this cooperative budget boundary. */
   readonly deadlineAt?: number
+  readonly capability?: CanonicalPathCapability
+  readonly capabilityId?: number
 }
 
 export type ProcessingOutcome = 'completed' | 'partial' | 'failed' | 'cancelled' | 'stale'
@@ -243,13 +251,6 @@ interface MutableAttempt {
   diagnosticSnapshot: ArtifactDiagnosticSnapshot | null
 }
 
-const nodeFileSystem: ProcessorFileSystem = {
-  mkdir,
-  writeFile,
-  rename: renameSync,
-  remove: (path) => rm(path, { force: true }),
-}
-
 export class ArtifactProcessor {
   private readonly artifacts: ArtifactRepository
   private readonly imports: ImportRepository
@@ -278,7 +279,7 @@ export class ArtifactProcessor {
         : { extract: extractSourceInWorker })
     this.indexer = dependencies.indexer ?? new SQLiteSearchIndexer(dependencies.database)
     this.optimizer = dependencies.thumbnailOptimizer ?? new WebpThumbnailOptimizer()
-    this.fileSystem = dependencies.fileSystem ?? nodeFileSystem
+    this.fileSystem = dependencies.derivativePathPolicy
     this.now = dependencies.now ?? (() => new Date().toISOString())
   }
 
@@ -301,6 +302,9 @@ export class ArtifactProcessor {
   // One durable pipeline for every entrypoint: inspect -> extract -> render -> index -> commit.
   async process(request: ArtifactProcessRequest): Promise<ArtifactProcessResult> {
     const run = this.prepareRun(request)
+    const attemptPathPolicy = request.capability
+      ? PathPolicy.restoreCapabilities([request.capability])
+      : this.dependencies.pathPolicy
     const attempt: MutableAttempt = {
       artifactId: null,
       generationId: null,
@@ -324,7 +328,7 @@ export class ArtifactProcessor {
       if (!this.startStage(run, 'inspect')) return this.cancel(run, attempt, 'inspect')
       this.assertWithinDeadline(request.deadlineAt, 'inspect')
       authorizedFile = await this.waitForAttempt(
-        this.dependencies.pathPolicy.authorizeFile(request.sourcePath),
+        attemptPathPolicy.authorizeFile(request.sourcePath),
         request.signal,
         'inspect',
       )
@@ -336,6 +340,15 @@ export class ArtifactProcessor {
         now: this.now(),
       })
       attempt.artifactId = artifact.id
+      if (request.capabilityId !== undefined) {
+        this.dependencies.database
+          .prepare(
+            `INSERT INTO artifact_allowed_root (artifact_id, allowed_root_id)
+             VALUES (?, ?)
+             ON CONFLICT(artifact_id) DO UPDATE SET allowed_root_id = excluded.allowed_root_id`,
+          )
+          .run(artifact.id, request.capabilityId)
+      }
       this.imports.attachArtifact(run.itemId, artifact.id)
       attempt.diagnosticSnapshot = this.captureArtifactDiagnostics(artifact.id)
       if (request.userTitle !== undefined) {
@@ -414,11 +427,16 @@ export class ArtifactProcessor {
     if (attempt.extraction) {
       try {
         this.assertWithinDeadline(request.deadlineAt, 'render')
-        attempt.renderResult = await this.dependencies.htmlRenderer.render({
-          html: attempt.extraction.html,
-          sourcePath: authorizedFile.canonicalPath,
-          signal: request.signal,
-        })
+        attempt.renderResult = await this.waitForAttempt(
+          this.dependencies.htmlRenderer.render({
+            html: attempt.extraction.html,
+            sourcePath: authorizedFile.canonicalPath,
+            assetPathPolicy: attemptPathPolicy,
+            signal: request.signal,
+          }),
+          request.signal,
+          'render',
+        )
         this.assertWithinDeadline(request.deadlineAt, 'render')
         attempt.renderStatus = 'ready'
       } catch (error) {
@@ -452,6 +470,15 @@ export class ArtifactProcessor {
         if (mapped.code === 'TIMEOUT') return this.timeout(run, attempt, 'index')
         this.recordError(attempt, mapped)
       }
+    }
+
+    if (attempt.errors.some(({ stage }) => stage === 'index')) {
+      const indexRecoveryError = await this.recoverPreparedIndex(attempt)
+      if (indexRecoveryError) this.recordError(attempt, indexRecoveryError)
+      this.reconcileStageErrors(attempt)
+      this.rollbackUncommittedGeneration(run, attempt)
+      this.failItemAndRun(run, attempt)
+      return this.result('failed', attempt)
     }
 
     if (!this.startStage(run, 'commit')) return this.cancel(run, attempt, 'commit')
@@ -567,6 +594,7 @@ export class ArtifactProcessor {
             .prepare('UPDATE artifact SET derived_title = ?, updated_at = ? WHERE id = ?')
             .run(attempt.title ?? basename(authorizedFile.canonicalPath), completedAt, artifactId)
           this.assertWithinDeadline(deadlineAt, 'commit')
+          this.reconcileStageErrors(attempt)
           if (cleanSuccess) {
             this.dependencies.database
               .prepare('DELETE FROM artifact_error WHERE artifact_id = ?')
@@ -635,18 +663,9 @@ export class ArtifactProcessor {
       if (mapped.code === 'TIMEOUT') {
         return this.timeout(run, attempt, 'commit', false)
       }
-      attempt.contentStatus = 'failed'
-      attempt.renderStatus = 'failed'
-      attempt.indexStatus = 'failed'
       this.recordError(attempt, mapped)
-      if (attempt.generationId !== null) {
-        this.artifacts.setGenerationState(attempt.generationId, {
-          jobStatus: mapped.code === 'STALE_GENERATION' ? 'interrupted' : 'idle',
-          contentStatus: 'failed',
-          renderStatus: 'failed',
-          indexStatus: 'failed',
-        })
-      }
+      this.reconcileStageErrors(attempt)
+      this.rollbackUncommittedGeneration(run, attempt)
       this.failItemAndRun(run, attempt)
       return this.result(mapped.code === 'STALE_GENERATION' ? 'stale' : 'failed', attempt)
     }
@@ -721,14 +740,8 @@ export class ArtifactProcessor {
     }
     const error = new ArtifactProcessingError('CANCELLED', stage)
     this.recordError(attempt, error)
-    if (attempt.generationId !== null) {
-      this.artifacts.setGenerationState(attempt.generationId, {
-        jobStatus: 'interrupted',
-        contentStatus: attempt.contentStatus,
-        renderStatus: attempt.renderStatus,
-        indexStatus: attempt.indexStatus,
-      })
-    }
+    this.reconcileStageErrors(attempt)
+    this.rollbackUncommittedGeneration(run, attempt)
     this.imports.cancelItem(run.itemId, this.now())
     this.finishRunIfTerminal(run.runId, this.now())
     return this.result('cancelled', attempt)
@@ -749,16 +762,86 @@ export class ArtifactProcessor {
     if (this.isCancellationRequested(run.runId)) {
       return this.cancel(run, attempt, stage, false)
     }
-    if (attempt.generationId !== null) {
-      this.artifacts.setGenerationState(attempt.generationId, {
-        jobStatus: 'interrupted',
-        contentStatus: attempt.contentStatus,
-        renderStatus: attempt.renderStatus,
-        indexStatus: attempt.indexStatus,
-      })
-    }
+    this.reconcileStageErrors(attempt)
+    this.rollbackUncommittedGeneration(run, attempt)
     this.failItemAndRun(run, attempt)
     return this.result('failed', attempt)
+  }
+
+  private reconcileStageErrors(attempt: MutableAttempt): void {
+    if (attempt.artifactId === null) return
+    const touchedStages: ProcessingStage[] = ['inspect']
+    for (const [stage, status] of [
+      ['extract', attempt.contentStatus],
+      ['render', attempt.renderStatus],
+      ['index', attempt.indexStatus],
+    ] as const) {
+      if (status === 'ready' || attempt.errors.some((error) => error.stage === stage)) {
+        touchedStages.push(stage)
+      }
+    }
+    if (attempt.errors.some((error) => error.stage === 'commit')) touchedStages.push('commit')
+    const keep = attempt.errorIds
+    const keepClause = keep.length > 0 ? `AND id NOT IN (${keep.map(() => '?').join(', ')})` : ''
+    this.dependencies.database
+      .prepare(
+        `DELETE FROM artifact_error
+         WHERE artifact_id = ?
+           AND stage IN (${touchedStages.map(() => '?').join(', ')})
+           ${keepClause}`,
+      )
+      .run(attempt.artifactId, ...touchedStages, ...keep)
+  }
+
+  private rollbackUncommittedGeneration(run: RunContext, attempt: MutableAttempt): void {
+    if (attempt.artifactId === null || attempt.generationId === null) return
+    const artifactId = attempt.artifactId
+    const generationId = attempt.generationId
+    const generation = attempt.generation
+    this.dependencies.database.transaction(() => {
+      const artifact = this.dependencies.database
+        .prepare('SELECT active_generation_id, generation_counter FROM artifact WHERE id = ?')
+        .get(artifactId) as
+        | { active_generation_id: number | null; generation_counter: number }
+        | undefined
+      if (!artifact) return
+      this.dependencies.database
+        .prepare('UPDATE artifact_error SET generation_id = NULL WHERE generation_id = ?')
+        .run(generationId)
+      this.dependencies.database
+        .prepare('UPDATE artifact_warning SET generation_id = NULL WHERE generation_id = ?')
+        .run(generationId)
+      if (artifact.active_generation_id === null) {
+        this.dependencies.database
+          .prepare('UPDATE import_item SET artifact_id = NULL WHERE id = ?')
+          .run(run.itemId)
+        this.dependencies.database
+          .prepare('UPDATE artifact_error SET artifact_id = NULL WHERE artifact_id = ?')
+          .run(artifactId)
+        this.dependencies.database.prepare('DELETE FROM artifact WHERE id = ?').run(artifactId)
+        attempt.artifactId = null
+        return
+      }
+      this.dependencies.database
+        .prepare('DELETE FROM artifact_generation WHERE id = ? AND artifact_id = ?')
+        .run(generationId, artifactId)
+      if (generation !== null && artifact.generation_counter === generation) {
+        this.dependencies.database
+          .prepare(
+            `UPDATE artifact
+             SET generation_counter = COALESCE(
+               (SELECT MAX(generation) FROM artifact_generation WHERE artifact_id = ?),
+               0
+             )
+             WHERE id = ?`,
+          )
+          .run(artifactId, artifactId)
+      }
+    })()
+    attempt.contentStatus = 'failed'
+    attempt.renderStatus = 'failed'
+    attempt.indexStatus = 'failed'
+    attempt.thumbnailPath = null
   }
 
   private assertWithinDeadline(deadlineAt: number | undefined, stage: ProcessingStage): void {
@@ -1259,8 +1342,7 @@ export class ArtifactProcessor {
 }
 
 function normalizeTitle(title: string | null | undefined): string | null {
-  const normalized = title?.trim()
-  return normalized ? normalized : null
+  return normalizeArtifactTitle(title)
 }
 
 function formatFor(path: string): ArtifactFormat {

@@ -184,6 +184,7 @@ function hasApiDependencies(options: BuildAppOptions): options is ApiRouteDepend
     options.database &&
     options.pathPolicy &&
     options.derivativePathPolicy &&
+    options.derivativeMutationPolicy &&
     options.importWorker &&
     options.thumbnailDirectory,
   )

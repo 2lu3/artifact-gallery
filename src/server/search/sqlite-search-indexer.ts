@@ -23,6 +23,7 @@ interface PreparedGenerationIndex {
 
 interface ArtifactIndexMetadata {
   readonly source_path: string
+  readonly format: 'html' | 'markdown'
   readonly user_title: string | null
   readonly derived_title: string | null
 }
@@ -146,7 +147,7 @@ export class SQLiteSearchIndexer implements ArtifactIndexer {
 
   private readMetadata(artifactId: number): ArtifactIndexMetadata {
     const metadata = this.database
-      .prepare('SELECT source_path, user_title, derived_title FROM artifact WHERE id = ?')
+      .prepare('SELECT source_path, format, user_title, derived_title FROM artifact WHERE id = ?')
       .get(artifactId) as ArtifactIndexMetadata | undefined
     if (!metadata) throw new Error('The indexed artifact does not exist.')
     return metadata
@@ -167,15 +168,17 @@ export class SQLiteSearchIndexer implements ArtifactIndexer {
            user_title_normalized,
            derived_title_normalized,
            body_normalized,
-           path_segments_normalized
-         ) VALUES (?, ?, ?, ?, ?, ?, ?)
+           path_segments_normalized,
+           format_normalized
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(generation_id) DO UPDATE SET
            artifact_id = excluded.artifact_id,
            generation = excluded.generation,
            user_title_normalized = excluded.user_title_normalized,
            derived_title_normalized = excluded.derived_title_normalized,
            body_normalized = excluded.body_normalized,
-           path_segments_normalized = excluded.path_segments_normalized`,
+           path_segments_normalized = excluded.path_segments_normalized,
+           format_normalized = excluded.format_normalized`,
       )
       .run(
         source.generationId,
@@ -185,6 +188,7 @@ export class SQLiteSearchIndexer implements ArtifactIndexer {
         normalizeSearchText(derivedTitle),
         source.bodyNormalized,
         normalizePathSegments(metadata.source_path),
+        normalizeSearchText(metadata.format),
       )
   }
 

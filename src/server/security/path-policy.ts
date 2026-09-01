@@ -76,9 +76,50 @@ export interface FolderEnumeration {
   readonly errors: PathPolicyItemError[]
 }
 
+export type PathCapabilityKind = 'file' | 'folder'
+
+export interface PathCapability {
+  readonly path: string
+  readonly kind: PathCapabilityKind
+}
+
+export interface CanonicalPathCapability {
+  readonly canonicalPath: string
+  readonly kind: PathCapabilityKind
+}
+
+export interface FolderEnumerationOptions {
+  readonly maxItems?: number
+  readonly signal?: AbortSignal
+  readonly deadlineAt?: number
+  readonly isCancelled?: () => boolean
+}
+
+export class FolderEnumerationLimitError extends Error {
+  constructor(readonly maxItems: number) {
+    super('Folder enumeration limit exceeded.')
+    this.name = 'FolderEnumerationLimitError'
+  }
+}
+
+export class FolderEnumerationCancelledError extends Error {
+  constructor() {
+    super('Folder enumeration was cancelled.')
+    this.name = 'FolderEnumerationCancelledError'
+  }
+}
+
+export class FolderEnumerationDeadlineError extends Error {
+  constructor() {
+    super('Folder enumeration deadline exceeded.')
+    this.name = 'FolderEnumerationDeadlineError'
+  }
+}
+
 interface AllowedRoot {
   readonly requestedPath: string
   readonly canonicalPath: string
+  readonly kind: PathCapabilityKind
 }
 
 interface DirectorySnapshot {
@@ -94,24 +135,54 @@ interface FileSnapshot {
 }
 
 export class PathPolicy {
-  private constructor(private readonly allowedRoots: readonly AllowedRoot[]) {}
+  private constructor(private readonly allowedRoots: AllowedRoot[]) {}
 
   static async create(allowedRoots: readonly string[]): Promise<PathPolicy> {
-    const roots = await Promise.all(
-      allowedRoots.map(async (root) => {
-        try {
-          return {
-            requestedPath: resolve(root),
-            canonicalPath: await realpath(root),
-          }
-        } catch (error) {
-          throw classifyFilesystemError(error, root)
-        }
-      }),
-    )
+    return PathPolicy.createCapabilities(allowedRoots.map((path) => ({ path, kind: 'folder' })))
+  }
+
+  static async createCapabilities(capabilities: readonly PathCapability[]): Promise<PathPolicy> {
+    const policy = new PathPolicy([])
+    for (const capability of capabilities) {
+      await policy.addSelectedCapability(capability.path, capability.kind)
+    }
+    return policy
+  }
+
+  static restoreCapabilities(capabilities: readonly CanonicalPathCapability[]): PathPolicy {
     return new PathPolicy(
-      roots.toSorted((left, right) => right.requestedPath.length - left.requestedPath.length),
+      capabilities
+        .map((capability) => ({
+          requestedPath: resolve(capability.canonicalPath),
+          canonicalPath: resolve(capability.canonicalPath),
+          kind: capability.kind,
+        }))
+        .toSorted((left, right) => right.requestedPath.length - left.requestedPath.length),
     )
+  }
+
+  async addSelectedCapability(
+    requestedPath: string,
+    kind: PathCapabilityKind,
+  ): Promise<CanonicalPathCapability> {
+    const capability = await canonicalizeCapability(requestedPath, kind)
+    const existing = this.allowedRoots.find(
+      (root) => root.canonicalPath === capability.canonicalPath,
+    )
+    if (existing) {
+      if (existing.kind === 'file' && kind === 'folder') {
+        this.allowedRoots.splice(this.allowedRoots.indexOf(existing), 1)
+      } else {
+        return { canonicalPath: existing.canonicalPath, kind: existing.kind }
+      }
+    }
+    this.allowedRoots.push({
+      requestedPath: resolve(requestedPath),
+      canonicalPath: capability.canonicalPath,
+      kind,
+    })
+    this.allowedRoots.sort((left, right) => right.requestedPath.length - left.requestedPath.length)
+    return capability
   }
 
   async authorizeFile(requestedPath: string): Promise<AuthorizedFile> {
@@ -196,13 +267,18 @@ export class PathPolicy {
     throw new PathPolicyError('UNREADABLE_SOURCE', requestedPath)
   }
 
-  async enumerateFolder(requestedPath: string): Promise<FolderEnumeration> {
+  async enumerateFolder(
+    requestedPath: string,
+    options: FolderEnumerationOptions = {},
+  ): Promise<FolderEnumeration> {
+    assertEnumerationActive(options)
     const directory = await this.authorizeDirectory(requestedPath)
     const files: AuthorizedFile[] = []
     const errors: PathPolicyItemError[] = []
     try {
-      await this.walkFolder(directory.canonicalPath, files, errors)
+      await this.walkFolder(directory.canonicalPath, files, errors, options)
     } catch (error) {
+      if (isEnumerationControlError(error)) throw error
       throw classifyFilesystemError(error, requestedPath)
     }
     return { files, errors }
@@ -211,6 +287,13 @@ export class PathPolicy {
   private async validateExistingPath(requestedPath: string): Promise<string> {
     assertNoTraversal(requestedPath)
     const absolutePath = resolve(requestedPath)
+    try {
+      if ((await lstat(absolutePath)).isSymbolicLink()) {
+        throw new PathPolicyError('SYMLINK_REJECTED', requestedPath)
+      }
+    } catch (error) {
+      throw classifyFilesystemError(error, requestedPath)
+    }
     const lexicalRoot = this.findLexicalRoot(absolutePath)
     if (lexicalRoot) {
       const rootPath = isContained(lexicalRoot.requestedPath, absolutePath)
@@ -228,7 +311,7 @@ export class PathPolicy {
     } catch (error) {
       throw classifyFilesystemError(error, requestedPath)
     }
-    if (!this.allowedRoots.some((root) => isContained(root.canonicalPath, canonicalPath))) {
+    if (!this.allowedRoots.some((root) => capabilityContains(root, canonicalPath))) {
       throw new PathPolicyError('OUTSIDE_ALLOWED_ROOT', requestedPath)
     }
     if (!lexicalRoot) {
@@ -284,8 +367,7 @@ export class PathPolicy {
   private findLexicalRoot(absolutePath: string): AllowedRoot | undefined {
     return this.allowedRoots.find(
       (root) =>
-        isContained(root.requestedPath, absolutePath) ||
-        isContained(root.canonicalPath, absolutePath),
+        capabilityContainsRequested(root, absolutePath) || capabilityContains(root, absolutePath),
     )
   }
 
@@ -293,7 +375,9 @@ export class PathPolicy {
     directory: string,
     files: AuthorizedFile[],
     errors: PathPolicyItemError[],
+    options: FolderEnumerationOptions,
   ): Promise<void> {
+    assertEnumerationActive(options)
     const beforeRead = await this.validateDirectory(directory)
     const entries = (await readdir(beforeRead.canonicalPath, { withFileTypes: true })).toSorted(
       (left, right) => left.name.localeCompare(right.name),
@@ -303,25 +387,99 @@ export class PathPolicy {
       throw new PathPolicyError('UNREADABLE_SOURCE', directory)
     }
     for (const entry of entries) {
+      assertEnumerationActive(options)
       const entryPath = join(afterRead.canonicalPath, entry.name)
+      if (entry.name.startsWith('.')) continue
+      if (entry.isFile() && !SUPPORTED_EXTENSIONS.has(extname(entry.name).toLowerCase())) continue
       try {
-        if (entry.name.startsWith('.')) {
-          throw new PathPolicyError('UNREADABLE_SOURCE', entryPath)
-        }
         if (entry.isSymbolicLink()) {
           throw new PathPolicyError('SYMLINK_REJECTED', entryPath)
         }
         if (entry.isDirectory()) {
-          await this.walkFolder(entryPath, files, errors)
+          await this.walkFolder(entryPath, files, errors, options)
         } else {
+          assertEnumerationCapacity(files, errors, options)
           files.push(await this.authorizeFile(entryPath))
         }
       } catch (error) {
+        if (isEnumerationControlError(error)) throw error
+        assertEnumerationCapacity(files, errors, options)
         const policyError = classifyFilesystemError(error, entryPath)
         errors.push({ path: entryPath, code: policyError.code })
       }
     }
   }
+}
+
+async function canonicalizeCapability(
+  requestedPath: string,
+  kind: PathCapabilityKind,
+): Promise<CanonicalPathCapability> {
+  assertNoTraversal(requestedPath)
+  try {
+    const requestedStatus = await lstat(requestedPath)
+    if (requestedStatus.isSymbolicLink()) {
+      throw new PathPolicyError('SYMLINK_REJECTED', requestedPath)
+    }
+    const canonicalPath = await realpath(requestedPath)
+    const status = await stat(canonicalPath)
+    if (kind === 'file') {
+      if (!status.isFile()) throw new PathPolicyError('UNREADABLE_SOURCE', requestedPath)
+      if (!SUPPORTED_EXTENSIONS.has(extname(canonicalPath).toLowerCase())) {
+        throw new PathPolicyError('UNSUPPORTED_FORMAT', requestedPath)
+      }
+      await access(canonicalPath, constants.R_OK)
+    } else {
+      if (!status.isDirectory()) throw new PathPolicyError('UNREADABLE_SOURCE', requestedPath)
+      await access(canonicalPath, constants.R_OK | constants.X_OK)
+    }
+    return { canonicalPath, kind }
+  } catch (error) {
+    throw classifyFilesystemError(error, requestedPath)
+  }
+}
+
+function capabilityContains(root: AllowedRoot, candidate: string): boolean {
+  return root.kind === 'folder'
+    ? isContained(root.canonicalPath, candidate)
+    : root.canonicalPath === candidate
+}
+
+function capabilityContainsRequested(root: AllowedRoot, candidate: string): boolean {
+  return root.kind === 'folder'
+    ? isContained(root.requestedPath, candidate)
+    : root.requestedPath === candidate
+}
+
+function assertEnumerationActive(options: FolderEnumerationOptions): void {
+  if (options.signal?.aborted || options.isCancelled?.()) {
+    throw new FolderEnumerationCancelledError()
+  }
+  if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) {
+    throw new FolderEnumerationDeadlineError()
+  }
+}
+
+function assertEnumerationCapacity(
+  files: readonly AuthorizedFile[],
+  errors: readonly PathPolicyItemError[],
+  options: FolderEnumerationOptions,
+): void {
+  if (options.maxItems === undefined) return
+  if (!Number.isSafeInteger(options.maxItems) || options.maxItems < 1) {
+    throw new FolderEnumerationLimitError(options.maxItems)
+  }
+  if (files.length + errors.length >= options.maxItems) {
+    throw new FolderEnumerationLimitError(options.maxItems)
+  }
+}
+
+function isEnumerationControlError(error: unknown): boolean {
+  return (
+    error instanceof FolderEnumerationLimitError ||
+    error instanceof FolderEnumerationCancelledError ||
+    error instanceof FolderEnumerationDeadlineError
+  )
 }
 
 function assertNoTraversal(requestedPath: string): void {

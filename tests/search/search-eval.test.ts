@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import { openDatabase } from '../../src/server/db/database.js'
 import { ArtifactProcessor } from '../../src/server/processing/artifact-processor.js'
+import { DerivativePathPolicy } from '../../src/server/security/derivative-path-policy.js'
 import { PathPolicy } from '../../src/server/security/path-policy.js'
 import { normalizeSearchNeedle } from '../../src/server/search/search-query.js'
 import { SearchRepository } from '../../src/server/search/search-repository.js'
@@ -48,10 +49,14 @@ describe('fixed search quality evaluation', () => {
     temporaryDirectories.push(directory)
     const database = openDatabase({ filename: join(directory, 'gallery.sqlite') })
     const pathPolicy = await PathPolicy.create([CORPUS_DIRECTORY])
+    const thumbnailDirectory = join(directory, 'thumbnails')
+    await mkdir(thumbnailDirectory)
+    const derivativePathPolicy = await DerivativePathPolicy.create(thumbnailDirectory)
     let clock = 0
     const processor = new ArtifactProcessor({
       database,
       pathPolicy,
+      derivativePathPolicy,
       htmlRenderer: {
         render: async () => ({
           screenshot: Buffer.from('RIFF-search-eval-WEBP'),
@@ -60,7 +65,7 @@ describe('fixed search quality evaluation', () => {
           warnings: [],
         }),
       },
-      thumbnailDirectory: join(directory, 'thumbnails'),
+      thumbnailDirectory,
       thumbnailOptimizer: {
         optimize: async ({ bytes, width, height }) => ({
           bytes,

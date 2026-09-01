@@ -19,6 +19,7 @@ export type ApiErrorCode =
   | 'NOT_FOUND'
   | 'CURSOR_STALE'
   | 'UNSUPPORTED_PLATFORM'
+  | 'PLATFORM_ACTION_FAILED'
   | PublicProcessingError['code']
 
 export interface ApiError {
@@ -41,6 +42,10 @@ export interface ArtifactCard {
   readonly status: CardPresentation
   readonly thumbnailUrl: string | null
   readonly diagram: string
+  readonly match?: {
+    readonly reason: 'title' | 'body' | 'path' | 'format'
+    readonly snippet: string
+  }
 }
 
 export interface GalleryPage {

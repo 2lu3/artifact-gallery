@@ -35,6 +35,7 @@ export class HtmlRenderError extends Error {
 export interface HtmlRenderRequest {
   readonly html: string
   readonly sourcePath: string
+  readonly assetPathPolicy?: AssetPathPolicy
   readonly signal?: AbortSignal
 }
 
@@ -337,7 +338,13 @@ export class HtmlRenderer {
       }
       const assetToken = randomUUID()
       await context.route('**/*', (route) =>
-        this.handleRoute(route, request.sourcePath, assetToken, state),
+        this.handleRoute(
+          route,
+          request.sourcePath,
+          assetToken,
+          state,
+          request.assetPathPolicy ?? this.pathPolicy,
+        ),
       )
       await context.routeWebSocket('**/*', (webSocket) => {
         state.warnings.add('ASSET_BLOCKED')
@@ -500,6 +507,7 @@ export class HtmlRenderer {
     sourcePath: string,
     assetToken: string,
     state: RenderState,
+    pathPolicy: AssetPathPolicy,
   ): Promise<void> {
     /*
      * Default-deny decision tree:
@@ -516,7 +524,7 @@ export class HtmlRenderer {
       return
     }
     try {
-      const asset = await this.pathPolicy.authorizeAsset(assetPath)
+      const asset = await pathPolicy.authorizeAsset(assetPath)
       const bytes = await state.assetBudget.read(asset)
       const body = asset.mimeType.startsWith('text/css')
         ? Buffer.from(

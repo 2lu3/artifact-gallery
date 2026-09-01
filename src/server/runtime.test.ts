@@ -7,6 +7,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { openDatabase } from './db/database.js'
 import type { StartupReconciliationReport } from './processing/recovery.js'
 import { ImportRepository } from './repositories/import-repository.js'
+import { AllowedRootRepository } from './repositories/allowed-root-repository.js'
+import { ArtifactRepository } from './repositories/artifact-repository.js'
 import { createServerRuntime, runtimeOptionsFromEnvironment } from './runtime.js'
 
 const temporaryDirectories: string[] = []
@@ -121,5 +123,50 @@ describe('server composition root', () => {
     expect(options.thumbnailDirectory).toMatch(/^\/tmp\/artifact-gallery-user\//u)
     expect(options.databaseFilename).not.toContain(process.cwd())
     expect(options.thumbnailDirectory).not.toContain(process.cwd())
+    expect(options.allowedRoots).toEqual([])
+  })
+
+  it('restores persisted file capabilities and marks missing sources before serving', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'artifact-gallery-runtime-missing-'))
+    temporaryDirectories.push(root)
+    const databaseFilename = join(root, 'state', 'catalog.sqlite')
+    const sourcePath = join(root, 'selected.md')
+    await mkdir(join(root, 'state'))
+    await writeFile(sourcePath, '# Selected')
+    const seed = openDatabase({ filename: databaseFilename })
+    const artifact = new ArtifactRepository(seed).register({
+      sourcePath,
+      format: 'markdown',
+      now: '2026-09-01T00:00:00.000Z',
+    })
+    const capability = new AllowedRootRepository(seed).add(
+      sourcePath,
+      'file',
+      '2026-09-01T00:00:00.000Z',
+    )
+    new AllowedRootRepository(seed).linkArtifact(artifact.id, capability.id)
+    seed.close()
+    await rm(sourcePath)
+
+    const app = await createServerRuntime({
+      databaseFilename,
+      thumbnailDirectory: join(root, 'state', 'thumbnails'),
+      allowedRoots: [],
+      port: 4173,
+    })
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/artifacts/${artifact.id}`,
+      headers: {
+        host: '127.0.0.1:4173',
+        'x-artifact-gallery-token': app.sessionToken,
+      },
+    })
+
+    expect(response.json()).toMatchObject({
+      status: 'missing',
+      errors: [expect.objectContaining({ code: 'SOURCE_MISSING' })],
+    })
+    await app.close()
   })
 })

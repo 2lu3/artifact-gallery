@@ -13,6 +13,43 @@ afterEach(() => {
 })
 
 describe('trusted bootstrap Vite middleware', () => {
+  it('rewrites the proxied API origin and authorizes Vite inline transforms with one CSP nonce', async () => {
+    const config = viteConfig as {
+      html?: { cspNonce?: string }
+      server?: {
+        port?: number
+        strictPort?: boolean
+        proxy?: Record<string, { changeOrigin?: boolean }>
+      }
+    }
+    const nonce = config.html?.cspNonce
+
+    expect(config.server?.proxy?.['/api']?.changeOrigin).toBe(true)
+    expect(config.server).toMatchObject({ port: 5173, strictPort: true })
+    expect(nonce).toMatch(/^[A-Za-z0-9_-]{20,}$/u)
+
+    vi.stubGlobal(
+      'fetch',
+      async () =>
+        new Response('<!doctype html><html><head></head><body></body></html>', {
+          headers: {
+            'content-type': 'text/html; charset=utf-8',
+            'content-security-policy':
+              "default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'",
+          },
+        }),
+    )
+    const middleware = readBootstrapMiddleware(async (_url, html) => html)
+    const response = new TestResponse()
+
+    await middleware({ url: '/', headers: {} }, response, () => undefined)
+
+    expect(response.headers.get('content-security-policy')).toContain(`'nonce-${nonce}'`)
+    expect(response.headers.get('content-security-policy')).toMatch(
+      new RegExp(`style-src[^;]*'nonce-${nonce}'`, 'u'),
+    )
+  })
+
   it('recognizes bootstrap pathnames with queries and applies Vite HTML transforms', async () => {
     vi.stubGlobal(
       'fetch',

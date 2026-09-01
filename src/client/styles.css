@@ -233,6 +233,14 @@ main {
   font-size: 13px;
 }
 
+.artifact-card__body .search-match {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--muted);
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
 .load-more {
   display: block;
   min-width: 220px;

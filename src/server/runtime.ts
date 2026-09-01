@@ -1,14 +1,20 @@
 import { mkdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { delimiter, dirname, join, resolve } from 'node:path'
+import { delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path'
+
+import type Database from 'better-sqlite3'
 
 import { buildApp, DEFAULT_LISTEN_OPTIONS, type LocalApiApp } from './app.js'
 import { openDatabase } from './db/database.js'
 import { ArtifactProcessor } from './processing/artifact-processor.js'
+import { createPlatformAdapter, type SourcePlatformAdapter } from './platform/platform-adapter.js'
 import { WebpThumbnailOptimizer } from './processing/thumbnail-optimizer.js'
 import { reconcileStartup, type StartupReconciliationReport } from './processing/recovery.js'
+import { reconcileSourceStatuses } from './processing/source-status-reconciler.js'
 import { ImportWorker } from './processing/worker.js'
 import { HtmlRenderer } from './rendering/html-renderer.js'
+import { AllowedRootRepository } from './repositories/allowed-root-repository.js'
+import { DerivativePathPolicy } from './security/derivative-path-policy.js'
 import { PathPolicy } from './security/path-policy.js'
 
 export interface ServerRuntimeOptions {
@@ -17,6 +23,7 @@ export interface ServerRuntimeOptions {
   readonly allowedRoots: readonly string[]
   readonly clientDirectory?: string
   readonly port?: number
+  readonly platformAdapter?: SourcePlatformAdapter
   readonly reportRecovery?: (report: StartupReconciliationReport) => void | Promise<void>
 }
 
@@ -30,12 +37,28 @@ export async function createServerRuntime(options: ServerRuntimeOptions): Promis
       interruptedAt: new Date().toISOString(),
     })
     await reportRecovery(options, recovery)
-    const pathPolicy = await PathPolicy.create(options.allowedRoots)
+    const allowedRoots = new AllowedRootRepository(database)
+    const persistedCapabilities = allowedRoots.list()
+    const pathPolicy = PathPolicy.restoreCapabilities(
+      persistedCapabilities.map(({ canonicalPath, kind }) => ({ canonicalPath, kind })),
+    )
+    for (const configuredRoot of options.allowedRoots) {
+      const capability = await pathPolicy.addSelectedCapability(configuredRoot, 'folder')
+      allowedRoots.add(capability.canonicalPath, capability.kind, new Date().toISOString())
+    }
+    backfillArtifactCapabilities(database, allowedRoots)
+    await reconcileSourceStatuses({
+      database,
+      authorizeFile: pathPolicy.authorizeFile.bind(pathPolicy),
+      timeoutMs: 250,
+    })
     const derivativePathPolicy = await PathPolicy.create([options.thumbnailDirectory])
+    const derivativeMutationPolicy = await DerivativePathPolicy.create(options.thumbnailDirectory)
     const htmlRenderer = new HtmlRenderer(pathPolicy)
     const processor = new ArtifactProcessor({
       database,
       pathPolicy,
+      derivativePathPolicy: derivativeMutationPolicy,
       htmlRenderer,
       thumbnailDirectory: options.thumbnailDirectory,
       thumbnailOptimizer: new WebpThumbnailOptimizer({
@@ -47,10 +70,12 @@ export async function createServerRuntime(options: ServerRuntimeOptions): Promis
       database,
       pathPolicy,
       derivativePathPolicy,
+      derivativeMutationPolicy,
       importWorker,
       thumbnailDirectory: options.thumbnailDirectory,
       clientDirectory: options.clientDirectory,
       trustedPort: options.port ?? DEFAULT_LISTEN_OPTIONS.port,
+      platformAdapter: options.platformAdapter ?? createPlatformAdapter(process.platform),
     })
     app.addHook('onClose', async () => {
       await importWorker.close()
@@ -71,6 +96,8 @@ async function reportRecovery(
   if (
     report.interruptedRunIds.length === 0 &&
     report.unstartedItems.length === 0 &&
+    report.removedTemporaryFiles.length === 0 &&
+    report.removedOrphanFiles.length === 0 &&
     report.errors.length === 0
   ) {
     return
@@ -103,7 +130,7 @@ export function runtimeOptionsFromEnvironment(
     ),
     allowedRoots:
       configuredRoots === undefined
-        ? [process.cwd()]
+        ? []
         : configuredRoots
             .split(delimiter)
             .map((root) => root.trim())
@@ -117,6 +144,37 @@ export function runtimeOptionsFromEnvironment(
         ? configuredPort
         : DEFAULT_LISTEN_OPTIONS.port,
   }
+}
+
+function backfillArtifactCapabilities(
+  database: Database.Database,
+  repository: AllowedRootRepository,
+): void {
+  const capabilities = repository
+    .list()
+    .toSorted((left, right) => right.canonicalPath.length - left.canonicalPath.length)
+  const artifacts = database
+    .prepare(
+      `SELECT artifact.id, artifact.source_path
+       FROM artifact
+       LEFT JOIN artifact_allowed_root ON artifact_allowed_root.artifact_id = artifact.id
+       WHERE artifact_allowed_root.artifact_id IS NULL
+       ORDER BY artifact.id`,
+    )
+    .all() as Array<{ id: number; source_path: string }>
+  for (const artifact of artifacts) {
+    const capability = capabilities.find((candidate) =>
+      candidate.kind === 'file'
+        ? artifact.source_path === candidate.canonicalPath
+        : isContainedPath(candidate.canonicalPath, artifact.source_path),
+    )
+    if (capability) repository.linkArtifact(artifact.id, capability.id)
+  }
+}
+
+function isContainedPath(root: string, candidate: string): boolean {
+  const child = relative(root, candidate)
+  return child === '' || (!child.startsWith('..') && !isAbsolute(child))
 }
 
 function defaultStateDirectory(environment: NodeJS.ProcessEnv): string {

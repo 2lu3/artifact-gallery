@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
 
+import { normalizeArtifactTitle } from '../shared/artifact-title'
 import type {
   ArtifactCard,
   ArtifactDetail,
@@ -479,6 +480,11 @@ function ArtifactCardView({
             {' · '}
             {statusLabel(item.status)}
           </span>
+          {item.match ? (
+            <span className="search-match">
+              {searchReasonLabel(item.match.reason)}: {item.match.snippet}
+            </span>
+          ) : null}
         </span>
       </button>
     </article>
@@ -556,10 +562,12 @@ function ArtifactLightbox({
     setAlert(null)
     try {
       const response = await api.post<{ runId: number }>(`/api/artifacts/${item.id}/${operation}`)
-      await pollImport(response.runId, () => undefined)
+      const terminal = await pollImport(response.runId, () => undefined)
       const next = await api.get<ArtifactDetail>(`/api/artifacts/${item.id}`)
       setDetail(next)
       setTitle(next.title)
+      const terminalError = terminal.items.find(({ error }) => error)?.error
+      if (terminalError) setAlert(terminalError.message)
       onGalleryChanged()
     } catch (cause) {
       setAlert(safeErrorMessage(cause))
@@ -728,10 +736,9 @@ function ArtifactLightbox({
                 <span>タイトル</span>
                 <input
                   value={title}
-                  maxLength={256}
                   onChange={(event) => {
                     titleDirty.current = true
-                    setTitle(event.target.value)
+                    setTitle(normalizeArtifactTitle(event.target.value) ?? '')
                   }}
                 />
               </label>
@@ -980,6 +987,16 @@ function stageLabel(stage: string): string {
 function parentName(sourcePath: string): string {
   const parts = sourcePath.split(/[\\/]/u).filter(Boolean)
   return parts.at(-2) ?? 'ローカル'
+}
+
+function searchReasonLabel(reason: NonNullable<ArtifactCard['match']>['reason']): string {
+  const labels = {
+    title: 'タイトル',
+    body: '本文',
+    path: 'パス',
+    format: '形式',
+  } as const
+  return labels[reason]
 }
 
 function formatDate(value: string): string {

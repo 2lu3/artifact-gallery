@@ -155,6 +155,71 @@ describe('SearchRepository', () => {
     harness.database.close()
   })
 
+  it('combines long-term FTS candidates with short-term fallback using AND semantics', async () => {
+    const harness = await makeHarness()
+    const exact = await harness.seed({
+      sourcePath: '/mixed/exact.md',
+      derivedTitle: '猫の銀河',
+      text: 'galaxy archive',
+    })
+    await harness.seed({
+      sourcePath: '/mixed/long-only.md',
+      derivedTitle: 'Archive',
+      text: 'galaxy without the short term',
+    })
+    await harness.seed({
+      sourcePath: '/mixed/short-only.md',
+      derivedTitle: '猫 archive',
+      text: 'ordinary body',
+    })
+
+    expect(harness.search.search('galaxy 猫').map(({ artifactId }) => artifactId)).toEqual([
+      exact.artifactId,
+    ])
+    harness.database.close()
+  })
+
+  it('indexes format and returns a stable match reason and bounded snippet', async () => {
+    const harness = await makeHarness()
+    const markdown = await harness.seed({
+      sourcePath: '/formats/opaque-source.bin',
+      format: 'markdown',
+      derivedTitle: 'Opaque source',
+      text: 'A body with no format word.',
+    })
+    await harness.seed({
+      sourcePath: '/formats/other.bin',
+      format: 'html',
+      derivedTitle: 'Other source',
+      text: 'Another body with no format word.',
+    })
+
+    expect(harness.search.search('markdown')).toEqual([
+      expect.objectContaining({
+        artifactId: markdown.artifactId,
+        format: 'markdown',
+        matchReason: 'format',
+        snippet: 'markdown',
+        relevanceKey: expect.any(String),
+      }),
+    ])
+    harness.database.close()
+  })
+
+  it('does not impose a 200-result repository ceiling', async () => {
+    const harness = await makeHarness()
+    for (let index = 0; index < 205; index += 1) {
+      await harness.seed({
+        sourcePath: `/large/${index}.md`,
+        text: `unboundedneedle ${index}`,
+        registeredAt: timestamp(index),
+      })
+    }
+
+    expect(harness.search.search('unboundedneedle', { limit: 205 })).toHaveLength(205)
+    harness.database.close()
+  })
+
   it('returns visible indexed artifacts newest registered first for an empty query', async () => {
     const harness = await makeHarness()
     const oldest = await harness.seed({
@@ -373,6 +438,7 @@ async function makeHarness() {
   const seed = async (input: {
     sourcePath: string
     text: string
+    format?: 'html' | 'markdown'
     userTitle?: string | null
     derivedTitle?: string | null
     registeredAt?: string
@@ -381,7 +447,7 @@ async function makeHarness() {
     const registeredAt = input.registeredAt ?? timestamp(0)
     const artifact = artifacts.register({
       sourcePath: input.sourcePath,
-      format: 'markdown',
+      format: input.format ?? 'markdown',
       now: registeredAt,
     })
     database

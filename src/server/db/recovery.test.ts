@@ -78,6 +78,7 @@ describe('reconcileStartup', () => {
         },
       ],
       removedTemporaryFiles: [temporaryThumbnail],
+      removedOrphanFiles: [],
       errors: [],
     })
 
