@@ -211,8 +211,12 @@ test.describe.serial('Artifact Gallery', () => {
     await expect(page.getByRole('heading', { name: 'Artifact Gallery' })).toBeVisible()
 
     const request = apiRequests.find(({ url }) => url.includes('/api/gallery'))
-    expect(request?.token).toMatch(/^[A-Za-z0-9_-]{40,}$/u)
-    expect(request?.url).not.toContain(request?.token ?? 'missing-token')
+    const tokenIsValid =
+      typeof request?.token === 'string' && /^[A-Za-z0-9_-]{40,}$/u.test(request.token)
+    expect(tokenIsValid).toBe(true)
+    const tokenIsAbsentFromUrl =
+      typeof request?.token === 'string' && !request.url.includes(request.token)
+    expect(tokenIsAbsentFromUrl).toBe(true)
     expect(new URL(page.url()).search).toBe('')
     expect(
       await page.evaluate(() => ({
@@ -221,7 +225,10 @@ test.describe.serial('Artifact Gallery', () => {
         bootstrap: document.getElementById('artifact-gallery-bootstrap'),
       })),
     ).toEqual({ local: [], session: [], bootstrap: null })
-    expect(consoleMessages.join('\n')).not.toContain(request?.token ?? 'missing-token')
+    const tokenIsAbsentFromConsole =
+      typeof request?.token === 'string' &&
+      consoleMessages.every((message) => !message.includes(request.token as string))
+    expect(tokenIsAbsentFromConsole).toBe(true)
   })
 
   test('debounces search, cancels obsolete results, filters, sorts, and shows no results', async ({

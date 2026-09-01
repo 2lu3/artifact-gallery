@@ -42,6 +42,12 @@ export interface PerformanceGateInput {
   readonly hardware: PerformanceHardware
   readonly firstPage: DurationSummary
   readonly searches: readonly DurationSummary[]
+  readonly userObservedSearches: readonly DurationSummary[]
+}
+
+export interface IndependentColdMeasurement {
+  readonly measure: () => Promise<number>
+  readonly close: () => Promise<void>
 }
 
 const THEMES = [
@@ -137,6 +143,35 @@ export function assertPerformanceGate(input: PerformanceGateInput): void {
   if (measurements.some(({ maximumExceededDoubleTarget }) => maximumExceededDoubleTarget)) {
     throw new Error('A performance maximum exceeded twice its profile target.')
   }
+  if (input.userObservedSearches.some(({ medianPassed }) => !medianPassed)) {
+    throw new Error('A user-observed search median exceeded its profile target.')
+  }
+  if (
+    input.userObservedSearches.some(
+      ({ maximumExceededDoubleTarget }) => maximumExceededDoubleTarget,
+    )
+  ) {
+    throw new Error('A user-observed search maximum exceeded twice its profile target.')
+  }
+}
+
+export async function runIndependentColdMeasurements(
+  runs: number,
+  createMeasurement: (run: number) => Promise<IndependentColdMeasurement>,
+): Promise<number[]> {
+  if (!Number.isSafeInteger(runs) || runs < 1) {
+    throw new TypeError('Cold measurement count must be a positive integer.')
+  }
+  const durations: number[] = []
+  for (let run = 0; run < runs; run += 1) {
+    const measurement = await createMeasurement(run)
+    try {
+      durations.push(await measurement.measure())
+    } finally {
+      await measurement.close()
+    }
+  }
+  return durations
 }
 
 export function buildSearchRunSequence(queries: readonly string[], runsPerQuery: number): string[] {

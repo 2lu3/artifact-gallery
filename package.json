@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "engines": {
-    "node": "24.14.0",
+    "node": "24.20.0",
     "pnpm": "11.21.0"
   },
   "packageManager": "pnpm@11.21.0",
@@ -29,8 +29,9 @@
     "test:reliability:performance": "vitest run src/server/processing/reliability.integration.test.ts -t \"uses one browser and at most two contexts\"",
     "test:e2e": "pnpm build:client && playwright test",
     "smoke:prod": "tsx scripts/production-smoke.ts",
-    "perf:smoke": "vite build && tsx tests/performance/run.ts --profile=smoke && pnpm test:reliability:performance",
-    "perf:acceptance": "vite build && tsx tests/performance/run.ts --profile=acceptance && pnpm test:reliability:performance"
+    "artifacts:check": "tsx scripts/assert-token-free-artifact.ts test-results/performance/results.json",
+    "perf:smoke": "pnpm build && tsx tests/performance/run.ts --profile=smoke && pnpm test:reliability:performance",
+    "perf:acceptance": "pnpm build && tsx tests/performance/run.ts --profile=acceptance && pnpm test:reliability:performance"
   },
   "dependencies": {
     "better-sqlite3": "12.8.0",

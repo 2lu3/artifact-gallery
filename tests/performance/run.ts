@@ -1,20 +1,26 @@
-import { createServer } from 'node:net'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { once } from 'node:events'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { createConnection, createServer } from 'node:net'
 import { cpus, tmpdir, totalmem } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 
-import { chromium, type Browser } from 'playwright'
+import { chromium, type Browser, type Page } from 'playwright'
 
-import type { GalleryPage } from '../../src/shared/contracts.js'
+import {
+  buildIsolatedProductionEnvironment,
+  extractBootstrapToken,
+} from '../../scripts/production-smoke.js'
 import { openDatabase } from '../../src/server/db/database.js'
 import { ArtifactProcessor } from '../../src/server/processing/artifact-processor.js'
 import { PathPolicy } from '../../src/server/security/path-policy.js'
-import { createServerRuntime } from '../../src/server/runtime.js'
+import type { GalleryPage } from '../../src/shared/contracts.js'
 import {
   assertPerformanceGate,
   buildSearchRunSequence,
   createPerformanceCorpus,
   performanceProfile,
+  runIndependentColdMeasurements,
   summarizeDurations,
   type DurationSummary,
   type PerformanceProfileName,
@@ -23,10 +29,23 @@ import {
 const FIRST_PAGE_RUNS = 5
 const SEARCH_RUNS = 10
 const DEFAULT_RESULTS_PATH = 'test-results/performance/results.json'
+const PROCESS_TIMEOUT_MS = 15_000
 
 interface SearchMeasurement {
   readonly query: string
   readonly summary: DurationSummary
+}
+
+interface SeededState {
+  readonly root: string
+  readonly stateDirectory: string
+  readonly databaseFilename: string
+  readonly thumbnailDirectory: string
+}
+
+interface ProductionProcess {
+  readonly baseUrl: string
+  readonly close: () => Promise<void>
 }
 
 async function main(): Promise<void> {
@@ -34,42 +53,27 @@ async function main(): Promise<void> {
   const profile = performanceProfile(profileName)
   const root = await mkdtemp(join(tmpdir(), 'artifact-gallery-performance-'))
   const corpusDirectory = join(root, 'corpus')
-  const stateDirectory = join(root, 'state')
-  const databaseFilename = join(stateDirectory, 'catalog.sqlite')
-  const thumbnailDirectory = join(stateDirectory, 'thumbnails')
   const resultsPath = process.env.ARTIFACT_GALLERY_PERF_RESULTS ?? DEFAULT_RESULTS_PATH
   try {
     const corpus = await createPerformanceCorpus(corpusDirectory)
-    await mkdir(stateDirectory, { recursive: true })
-    await seedCorpus(
-      databaseFilename,
-      thumbnailDirectory,
-      corpus.files.map(({ absolutePath }) => absolutePath),
-    )
-    const browser = await chromium.launch({ headless: true })
-    let firstPageDurations: number[]
-    let searches: SearchMeasurement[]
-    let coldThumbnailMs: number
-    let warmThumbnailMs: number
-    try {
-      firstPageDurations = await measureColdFirstPages(browser, {
-        databaseFilename,
-        thumbnailDirectory,
-        corpusDirectory,
-      })
-      const interactive = await measureInteractiveCases(browser, {
-        databaseFilename,
-        thumbnailDirectory,
-        corpusDirectory,
-        queries: [...new Set(corpus.files.map(({ query }) => query))],
-        searchTargetMs: profile.searchTargetMs,
-      })
-      searches = interactive.searches
-      coldThumbnailMs = interactive.coldThumbnailMs
-      warmThumbnailMs = interactive.warmThumbnailMs
-    } finally {
-      await browser.close()
-    }
+    const sourcePaths = corpus.files.map(({ absolutePath }) => absolutePath)
+    const firstPageDurations = await measureColdFirstPages({
+      root,
+      corpusDirectory,
+      sourcePaths,
+    })
+    const interactive = await measureInteractiveSearches({
+      root,
+      corpusDirectory,
+      sourcePaths,
+      queries: [...new Set(corpus.files.map(({ query }) => query))],
+      searchTargetMs: profile.searchTargetMs,
+    })
+    const thumbnails = await measureThumbnailCases({
+      root,
+      corpusDirectory,
+      sourcePaths,
+    })
 
     const hardware = {
       platform: process.platform,
@@ -81,16 +85,27 @@ async function main(): Promise<void> {
     const report = {
       profile,
       hardware,
+      methodology: {
+        firstPage:
+          'Each run uses a freshly seeded state directory, independent production Node process, Chromium process, and browser context; timing is navigation start to 30 rendered cards.',
+        searches:
+          'acceptedToRender is the app measure after debounce; userObservedFillToRender is external runner performance.now before fill through rendered-result measure completion.',
+        thumbnails:
+          'A separately seeded derivative directory and new Chromium context use disabled browser cache; warm repeats the same resource paths after the cold batch.',
+      },
       corpus: {
         htmlFiles: corpus.files.filter(({ format }) => format === 'html').length,
         markdownFiles: corpus.files.filter(({ format }) => format === 'markdown').length,
         totalBytes: corpus.totalBytes,
       },
       firstPage: firstPageSummary,
-      searches,
+      searches: {
+        acceptedToRender: interactive.acceptedToRender,
+        userObservedFillToRender: interactive.userObservedFillToRender,
+      },
       thumbnails: {
-        cold: summarizeDurations([coldThumbnailMs], profile.firstPageTargetMs),
-        warm: summarizeDurations([warmThumbnailMs], profile.firstPageTargetMs),
+        cold: summarizeDurations([thumbnails.coldMs], profile.firstPageTargetMs),
+        warm: summarizeDurations([thumbnails.warmMs], profile.firstPageTargetMs),
       },
     }
     await mkdir(dirname(resultsPath), { recursive: true })
@@ -98,91 +113,99 @@ async function main(): Promise<void> {
     process.stdout.write(
       `performance-${profile.name} firstPageMedianMs=${firstPageSummary.medianMs.toFixed(2)} ` +
         `firstPageMaxMs=${firstPageSummary.maxMs.toFixed(2)} ` +
-        `searchWorstMedianMs=${Math.max(...searches.map(({ summary }) => summary.medianMs)).toFixed(2)} ` +
-        `searchMaxMs=${Math.max(...searches.map(({ summary }) => summary.maxMs)).toFixed(2)} ` +
-        `thumbnailColdMs=${coldThumbnailMs.toFixed(2)} thumbnailWarmMs=${warmThumbnailMs.toFixed(2)}\n`,
+        `searchAcceptedWorstMedianMs=${worstMedian(interactive.acceptedToRender).toFixed(2)} ` +
+        `searchAcceptedMaxMs=${worstMaximum(interactive.acceptedToRender).toFixed(2)} ` +
+        `searchObservedWorstMedianMs=${worstMedian(interactive.userObservedFillToRender).toFixed(2)} ` +
+        `searchObservedMaxMs=${worstMaximum(interactive.userObservedFillToRender).toFixed(2)} ` +
+        `thumbnailColdMs=${thumbnails.coldMs.toFixed(2)} ` +
+        `thumbnailWarmMs=${thumbnails.warmMs.toFixed(2)}\n`,
     )
     assertPerformanceGate({
       profile,
       hardware,
       firstPage: firstPageSummary,
-      searches: searches.map(({ summary }) => summary),
+      searches: interactive.acceptedToRender.map(({ summary }) => summary),
+      userObservedSearches: interactive.userObservedFillToRender.map(({ summary }) => summary),
     })
   } finally {
     await rm(root, { recursive: true, force: true })
   }
 }
 
-interface RuntimeMeasurementOptions {
-  readonly databaseFilename: string
-  readonly thumbnailDirectory: string
+async function measureColdFirstPages(options: {
+  readonly root: string
   readonly corpusDirectory: string
-}
-
-async function measureColdFirstPages(
-  browser: Browser,
-  options: RuntimeMeasurementOptions,
-): Promise<number[]> {
-  const durations: number[] = []
-  for (let run = 0; run < FIRST_PAGE_RUNS; run += 1) {
+  readonly sourcePaths: readonly string[]
+}): Promise<number[]> {
+  return runIndependentColdMeasurements(FIRST_PAGE_RUNS, async (run) => {
+    const state = await createSeededState(options.root, `cold-${run}-`, options.sourcePaths)
     const port = await availablePort()
-    const startedAt = performance.now()
-    const app = await createServerRuntime({
-      ...options,
-      allowedRoots: [options.corpusDirectory],
-      clientDirectory: resolve('dist'),
-      port,
-    })
-    const context = await browser.newContext()
+    const production = await startProductionProcess(state, options.corpusDirectory, port)
+    let browser: Browser
     try {
-      await app.listen({ host: '127.0.0.1', port })
-      const page = await context.newPage()
-      await page.goto(`http://127.0.0.1:${port}`)
-      await page.locator('.artifact-card').first().waitFor()
-      const counts = await page.evaluate(() => ({
-        cards: document.querySelectorAll('.artifact-card').length,
-        catalog: document.querySelector('.result-count')?.textContent,
-      }))
-      if (counts.cards !== 30 || counts.catalog !== '100件') {
-        throw new Error('The performance corpus was not visible in the first gallery page.')
-      }
-      durations.push(performance.now() - startedAt)
-    } finally {
-      await context.close()
-      await app.close()
+      browser = await chromium.launch({ headless: true })
+    } catch (error) {
+      await production.close().catch(() => undefined)
+      await rm(state.root, { recursive: true, force: true })
+      throw error
     }
-  }
-  return durations
+    return {
+      measure: async () => {
+        const context = await browser.newContext()
+        try {
+          const page = await context.newPage()
+          const startedAt = performance.now()
+          await page.goto(production.baseUrl)
+          await page.locator('.artifact-card').first().waitFor()
+          await page.waitForFunction(
+            () => document.querySelectorAll('.artifact-card').length === 30,
+          )
+          const catalog = await page.locator('.result-count').textContent()
+          if (catalog !== '100件') {
+            throw new Error('The independent cold run did not render the complete corpus count.')
+          }
+          return performance.now() - startedAt
+        } finally {
+          await context.close()
+        }
+      },
+      close: async () => {
+        await browser.close().catch(() => undefined)
+        try {
+          await production.close()
+        } finally {
+          await rm(state.root, { recursive: true, force: true })
+        }
+      },
+    }
+  })
 }
 
-async function measureInteractiveCases(
-  browser: Browser,
-  options: RuntimeMeasurementOptions & {
-    readonly queries: readonly string[]
-    readonly searchTargetMs: number
-  },
-): Promise<{
-  searches: SearchMeasurement[]
-  coldThumbnailMs: number
-  warmThumbnailMs: number
+async function measureInteractiveSearches(options: {
+  readonly root: string
+  readonly corpusDirectory: string
+  readonly sourcePaths: readonly string[]
+  readonly queries: readonly string[]
+  readonly searchTargetMs: number
+}): Promise<{
+  acceptedToRender: SearchMeasurement[]
+  userObservedFillToRender: SearchMeasurement[]
 }> {
+  const state = await createSeededState(options.root, 'search-', options.sourcePaths)
   const port = await availablePort()
-  const app = await createServerRuntime({
-    ...options,
-    allowedRoots: [options.corpusDirectory],
-    clientDirectory: resolve('dist'),
-    port,
-  })
+  const production = await startProductionProcess(state, options.corpusDirectory, port)
+  const browser = await chromium.launch({ headless: true })
   const context = await browser.newContext()
   try {
-    await app.listen({ host: '127.0.0.1', port })
     const page = await context.newPage()
-    await page.goto(`http://127.0.0.1:${port}`)
+    await page.goto(production.baseUrl)
     await page.locator('.artifact-card').first().waitFor()
     const searchbox = page.getByRole('searchbox', { name: '生成物を検索' })
-    const durationsByQuery = new Map(options.queries.map((query) => [query, [] as number[]]))
+    const acceptedByQuery = new Map(options.queries.map((query) => [query, [] as number[]]))
+    const observedByQuery = new Map(options.queries.map((query) => [query, [] as number[]]))
     let measurementCount = 0
     for (const query of buildSearchRunSequence(options.queries, SEARCH_RUNS)) {
+      const fillStartedAt = performance.now()
       await searchbox.fill(query)
       measurementCount += 1
       await page.waitForFunction(
@@ -190,34 +213,91 @@ async function measureInteractiveCases(
           performance.getEntriesByName('artifact-gallery-search').length >= expectedCount,
         measurementCount,
       )
-      const duration = await page.evaluate(
+      const acceptedDuration = await page.evaluate(
         () => performance.getEntriesByName('artifact-gallery-search').at(-1)?.duration,
       )
-      if (typeof duration !== 'number') throw new Error('The UI search measure is unavailable.')
-      durationsByQuery.get(query)?.push(duration)
+      if (typeof acceptedDuration !== 'number') {
+        throw new Error('The accepted-to-render UI search measure is unavailable.')
+      }
+      acceptedByQuery.get(query)?.push(acceptedDuration)
+      observedByQuery.get(query)?.push(performance.now() - fillStartedAt)
     }
-    const searches = options.queries.map((query) => ({
-      query,
-      summary: summarizeDurations(durationsByQuery.get(query) ?? [], options.searchTargetMs),
-    }))
-    const currentPageResponse = await app.inject({
-      method: 'GET',
-      url: '/api/gallery',
-      headers: authenticatedHeaders(app.sessionToken, port),
-    })
-    const currentPage = currentPageResponse.json<GalleryPage>()
-    const thumbnailPaths = currentPage.items
-      .map(({ thumbnailUrl }) => thumbnailUrl)
-      .filter((path): path is string => path !== null)
     return {
-      searches,
-      coldThumbnailMs: await measureThumbnailBatch(app, thumbnailPaths, port),
-      warmThumbnailMs: await measureThumbnailBatch(app, thumbnailPaths, port),
+      acceptedToRender: summarizeSearches(options.queries, acceptedByQuery, options.searchTargetMs),
+      userObservedFillToRender: summarizeSearches(
+        options.queries,
+        observedByQuery,
+        options.searchTargetMs,
+      ),
     }
   } finally {
-    await context.close()
-    await app.close()
+    await context.close().catch(() => undefined)
+    await browser.close().catch(() => undefined)
+    try {
+      await production.close()
+    } finally {
+      await rm(state.root, { recursive: true, force: true })
+    }
   }
+}
+
+async function measureThumbnailCases(options: {
+  readonly root: string
+  readonly corpusDirectory: string
+  readonly sourcePaths: readonly string[]
+}): Promise<{ coldMs: number; warmMs: number }> {
+  const state = await createSeededState(options.root, 'thumbnails-', options.sourcePaths)
+  const port = await availablePort()
+  const production = await startProductionProcess(state, options.corpusDirectory, port)
+  const bootstrapResponse = await fetch(production.baseUrl)
+  if (!bootstrapResponse.ok) throw new Error('The thumbnail bootstrap is unavailable.')
+  const sessionToken = extractBootstrapToken(await bootstrapResponse.text())
+  const galleryResponse = await fetch(`${production.baseUrl}/api/gallery`, {
+    headers: { 'x-artifact-gallery-token': sessionToken },
+  })
+  if (!galleryResponse.ok) throw new Error('The thumbnail benchmark gallery is unavailable.')
+  const gallery = (await galleryResponse.json()) as GalleryPage
+  const thumbnailPaths = gallery.items
+    .map(({ thumbnailUrl }) => thumbnailUrl)
+    .filter((path): path is string => path !== null)
+  const browser = await chromium.launch({ headless: true })
+  const context = await browser.newContext({
+    extraHTTPHeaders: { 'x-artifact-gallery-token': sessionToken },
+  })
+  try {
+    const page = await context.newPage()
+    const session = await context.newCDPSession(page)
+    await session.send('Network.enable')
+    await session.send('Network.setCacheDisabled', { cacheDisabled: true })
+    const health = await page.goto(`${production.baseUrl}/api/health`)
+    if (!health?.ok()) throw new Error('The thumbnail browser origin is unavailable.')
+    return {
+      coldMs: await measureThumbnailBatch(page, thumbnailPaths),
+      warmMs: await measureThumbnailBatch(page, thumbnailPaths),
+    }
+  } finally {
+    await context.close().catch(() => undefined)
+    await browser.close().catch(() => undefined)
+    try {
+      await production.close()
+    } finally {
+      await rm(state.root, { recursive: true, force: true })
+    }
+  }
+}
+
+async function createSeededState(
+  root: string,
+  prefix: string,
+  sourcePaths: readonly string[],
+): Promise<SeededState> {
+  const stateRoot = await mkdtemp(join(root, prefix))
+  const stateDirectory = join(stateRoot, 'state')
+  const databaseFilename = join(stateDirectory, 'catalog.sqlite')
+  const thumbnailDirectory = join(stateDirectory, 'thumbnails')
+  await mkdir(stateDirectory, { recursive: true })
+  await seedCorpus(databaseFilename, thumbnailDirectory, sourcePaths)
+  return { root: stateRoot, stateDirectory, databaseFilename, thumbnailDirectory }
 }
 
 async function seedCorpus(
@@ -247,7 +327,7 @@ async function seedCorpus(
     for (const sourcePath of sourcePaths) {
       const result = await processor.register({ sourcePath })
       if (result.outcome !== 'completed') {
-        throw new Error(`Unable to index performance corpus item ${sourcePath}.`)
+        throw new Error('Unable to index a performance corpus item.')
       }
     }
   } finally {
@@ -255,25 +335,128 @@ async function seedCorpus(
   }
 }
 
-async function measureThumbnailBatch(
-  app: Awaited<ReturnType<typeof createServerRuntime>>,
-  paths: readonly string[],
+async function startProductionProcess(
+  state: SeededState,
+  corpusDirectory: string,
   port: number,
-): Promise<number> {
-  const startedAt = performance.now()
-  for (const path of paths) {
-    const response = await app.inject({
-      method: 'GET',
-      url: path,
-      headers: authenticatedHeaders(app.sessionToken, port),
-    })
-    if (response.statusCode !== 200) throw new Error('A benchmark thumbnail was unavailable.')
+): Promise<ProductionProcess> {
+  const child = spawn(process.execPath, [resolve('dist/server/server/index.js')], {
+    env: buildIsolatedProductionEnvironment(
+      process.env,
+      {
+        stateDirectory: state.stateDirectory,
+        databaseFilename: state.databaseFilename,
+        thumbnailDirectory: state.thumbnailDirectory,
+        allowedRoots: [corpusDirectory],
+        clientDirectory: resolve('dist'),
+      },
+      port,
+    ),
+    stdio: 'ignore',
+  })
+  const exited = childExit(child)
+  const baseUrl = `http://127.0.0.1:${port}`
+  try {
+    await waitForProductionPort(port, exited)
+    return {
+      baseUrl,
+      close: () => stopProductionProcess(child, exited),
+    }
+  } catch (error) {
+    await stopProductionProcess(child, exited).catch(() => undefined)
+    throw error
   }
-  return performance.now() - startedAt
 }
 
-function authenticatedHeaders(sessionToken: string, port: number): Record<string, string> {
-  return { host: `127.0.0.1:${port}`, 'x-artifact-gallery-token': sessionToken }
+function childExit(
+  child: ChildProcess,
+): Promise<{ code: number | null; signal: NodeJS.Signals | null; error: unknown }> {
+  return Promise.race([
+    once(child, 'exit').then(([code, signal]) => ({ code, signal, error: null })),
+    once(child, 'error').then(([error]) => ({ code: null, signal: null, error })),
+  ])
+}
+
+async function waitForProductionPort(
+  port: number,
+  exited: Promise<{ code: number | null; signal: NodeJS.Signals | null; error: unknown }>,
+): Promise<void> {
+  const deadline = Date.now() + PROCESS_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    const attempt = new Promise<boolean>((resolveAttempt) => {
+      const socket = createConnection({ host: '127.0.0.1', port })
+      socket.setTimeout(Math.min(500, Math.max(1, deadline - Date.now())))
+      socket.once('connect', () => {
+        socket.destroy()
+        resolveAttempt(true)
+      })
+      socket.once('error', () => resolveAttempt(false))
+      socket.once('timeout', () => {
+        socket.destroy()
+        resolveAttempt(false)
+      })
+    })
+    const outcome = await Promise.race([
+      attempt.then((ready) => ({ kind: 'socket' as const, ready })),
+      exited.then(() => ({ kind: 'exit' as const, ready: false })),
+    ])
+    if (outcome.kind === 'exit') throw new Error('A production performance process exited early.')
+    if (outcome.ready) return
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50))
+  }
+  throw new Error('Timed out waiting for a production performance process.')
+}
+
+async function stopProductionProcess(
+  child: ChildProcess,
+  exited: Promise<{ code: number | null; signal: NodeJS.Signals | null; error: unknown }>,
+): Promise<void> {
+  if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM')
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<null>((resolveTimeout) => {
+    timer = setTimeout(() => resolveTimeout(null), PROCESS_TIMEOUT_MS)
+  })
+  const outcome = await Promise.race([exited, timeout])
+  if (timer) clearTimeout(timer)
+  if (outcome === null) {
+    child.kill('SIGKILL')
+    await exited
+    throw new Error('A production performance process did not stop gracefully.')
+  }
+  if (outcome.error || outcome.signal !== null || outcome.code !== 0) {
+    throw new Error('A production performance process exited unsuccessfully.')
+  }
+}
+
+async function measureThumbnailBatch(page: Page, paths: readonly string[]): Promise<number> {
+  return page.evaluate(async (thumbnailPaths) => {
+    const startedAt = performance.now()
+    for (const path of thumbnailPaths) {
+      const response = await fetch(path)
+      if (!response.ok) throw new Error('A benchmark thumbnail was unavailable.')
+      await response.arrayBuffer()
+    }
+    return performance.now() - startedAt
+  }, paths)
+}
+
+function summarizeSearches(
+  queries: readonly string[],
+  durationsByQuery: ReadonlyMap<string, readonly number[]>,
+  targetMs: number,
+): SearchMeasurement[] {
+  return queries.map((query) => ({
+    query,
+    summary: summarizeDurations(durationsByQuery.get(query) ?? [], targetMs),
+  }))
+}
+
+function worstMedian(measurements: readonly SearchMeasurement[]): number {
+  return Math.max(...measurements.map(({ summary }) => summary.medianMs))
+}
+
+function worstMaximum(measurements: readonly SearchMeasurement[]): number {
+  return Math.max(...measurements.map(({ summary }) => summary.maxMs))
 }
 
 function readProfile(arguments_: readonly string[]): PerformanceProfileName {

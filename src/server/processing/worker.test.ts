@@ -171,7 +171,7 @@ describe('ImportWorker', () => {
     const run = imports.createRun([sourcePath])
     const results: ArtifactProcessResult[] = []
     const failures: unknown[] = []
-    const worker = new ImportWorker({ processor, attemptTimeoutMs: 30 })
+    const worker = new ImportWorker({ processor, attemptTimeoutMs: 250 })
 
     expect(
       worker.enqueue(

@@ -113,7 +113,7 @@ export function App() {
         if (next) performance.mark('artifact-gallery-search-accepted')
         setAcceptedQuery(next)
       }
-    }, 250)
+    }, 100)
     return () => window.clearTimeout(timeout)
   }, [acceptedQuery, query])
 

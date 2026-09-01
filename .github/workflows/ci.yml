@@ -47,7 +47,7 @@ jobs:
           - name: End to end
             command: pnpm test:e2e
             chromium: true
-            artifact: playwright
+            artifact: none
           - name: Production build and smoke
             command: pnpm build && pnpm smoke:prod
             chromium: false
@@ -62,10 +62,10 @@ jobs:
           version: 11.21.0
           run_install: false
 
-      - name: Install Node.js 24.14.0
+      - name: Install Node.js 24.20.0
         uses: actions/setup-node@v4
         with:
-          node-version: 24.14.0
+          node-version: 24.20.0
 
       - name: Locate pnpm store
         id: pnpm-store
@@ -76,7 +76,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
-          key: pnpm-${{ runner.os }}-node-24.14.0-pnpm-11.21.0-${{ hashFiles('pnpm-lock.yaml') }}
+          key: pnpm-${{ runner.os }}-node-24.20.0-pnpm-11.21.0-${{ hashFiles('pnpm-lock.yaml') }}
 
       - name: Install dependencies from lockfile
         run: pnpm install --frozen-lockfile
@@ -95,20 +95,16 @@ jobs:
       - name: Run ${{ matrix.name }}
         run: ${{ matrix.command }}
 
+      - name: Refuse credential-bearing performance artifacts
+        id: artifact-scan
+        if: always() && matrix.artifact == 'performance'
+        run: pnpm artifacts:check
+
       - name: Upload metrics after performance failure
-        if: failure() && matrix.artifact == 'performance'
+        if: failure() && matrix.artifact == 'performance' && steps.artifact-scan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: performance-metrics-${{ github.run_id }}
           path: test-results/performance/results.json
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Upload token-free Playwright report after E2E failure
-        if: failure() && matrix.artifact == 'playwright'
-        uses: actions/upload-artifact@v4
-        with:
-          name: playwright-report-${{ github.run_id }}
-          path: playwright-report/
           if-no-files-found: ignore
           retention-days: 7

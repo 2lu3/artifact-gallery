@@ -4,7 +4,7 @@ Artifact Gallery は、手元の HTML / Markdown を登録し、サムネイル�
 
 ## 必要条件
 
-- Node.js `24.14.0`（現在の LTS。`.nvmrc` と `engines.node` で固定）
+- Node.js `24.20.0`（現在の LTS。`.nvmrc` と `engines.node` で固定）
 - pnpm `11.21.0`（`packageManager` と `engines.pnpm` で固定）
 - macOS または Linux。HTML の隔離描画と E2E には Playwright Chromium が必要です。
 
@@ -36,7 +36,7 @@ pnpm build
 pnpm start
 ```
 
-`http://127.0.0.1:3000` を開いてください。`pnpm smoke:prod` は、ビルド済みサーバーを空の一時データ領域で loopback 起動し、bootstrap、認証付き health、空の gallery、SIGTERM による正常終了を検査します。セッショントークンはログへ出しません。
+`http://127.0.0.1:3000` を開いてください。`pnpm smoke:prod` は、親プロセスの DB / thumbnail / state / allowed-root / port 設定を child へ継承せず、絶対パスで指定した空の一時データ領域だけを使ってビルド済みサーバーを loopback 起動します。bootstrap、認証付き health、空の gallery、SIGTERM による正常終了を検査し、セッショントークンはログへ出しません。
 
 ## 生成物を登録する
 
@@ -99,7 +99,9 @@ pnpm build
 pnpm smoke:prod
 ```
 
-性能コーパスは実行ごとに同一内容の HTML 50件 + Markdown 50件（合計 50MB 以下）を一時領域へ生成します。結果は `test-results/performance/results.json` に記録し、初期一覧は5回、固定10検索は各10回、サムネイルは cold/warm を別々に測定します。最大値が目標の2倍を超えた場合も失敗として調査対象にします。
+性能コーパスは実行ごとに同一内容の HTML 50件 + Markdown 50件（合計 50MB 以下）を一時領域へ生成します。初期一覧の5回は、それぞれ新規 state、production Node process、Chromium process、browser context を使い、navigation 開始から30カードが操作可能になるまでを測定します。固定10検索は各10回、debounce 後から render までのアプリ内値と、runner が入力前の `performance.now()` から render まで測る利用者体感値を別々に記録し、acceptance では両方に200msを適用します。サムネイルは別の新規派生ディレクトリと cache disabled の新規 context で cold を読み、その同じリソースを再読して warm を記録します。
+
+結果は `test-results/performance/results.json` に token や resource URL を含めず保存します。CI はこの JSON を credential scanner に通し、bootstrap marker、token header、token候補を検出した場合は artifact upload を拒否します。E2E は line reporter のみで、HTML / trace / video / screenshot を artifact にしません。各中央値が目標を超えた場合、または最大値が目標の2倍を超えた場合は失敗します。
 
 ```sh
 pnpm perf:smoke       # CI 向け: 初期一覧 5秒、検索 1秒の安定性閾値

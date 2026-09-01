@@ -13,7 +13,7 @@ describe('buildApp', () => {
     for (const host of ['localhost', 'localhost:3000', '127.0.0.1', '127.0.0.1:3000']) {
       const response = await app.inject({ method: 'GET', url: '/', headers: { host } })
       expect(response.statusCode, host).toBe(200)
-      expect(response.body, host).toContain(app.sessionToken)
+      expect(response.body.includes(app.sessionToken), host).toBe(true)
     }
     for (const host of [
       'attacker.example',
@@ -28,7 +28,7 @@ describe('buildApp', () => {
         headers: { host, 'x-forwarded-host': 'localhost:3000' },
       })
       expect(response.statusCode, host).toBe(421)
-      expect(response.body, host).not.toContain(app.sessionToken)
+      expect(response.body.includes(app.sessionToken), host).toBe(false)
     }
 
     const forwardedAttacker = await app.inject({
@@ -157,9 +157,9 @@ describe('buildApp', () => {
     const first = buildApp()
     const second = buildApp()
 
-    expect(first.sessionToken).toMatch(/^[A-Za-z0-9_-]{43}$/)
-    expect(second.sessionToken).toMatch(/^[A-Za-z0-9_-]{43}$/)
-    expect(first.sessionToken).not.toBe(second.sessionToken)
+    expect(/^[A-Za-z0-9_-]{43}$/.test(first.sessionToken)).toBe(true)
+    expect(/^[A-Za-z0-9_-]{43}$/.test(second.sessionToken)).toBe(true)
+    expect(first.sessionToken === second.sessionToken).toBe(false)
 
     await first.close()
     await second.close()
@@ -201,14 +201,14 @@ describe('buildApp', () => {
     expect(bootstrap.statusCode).toBe(200)
     expect(bootstrap.headers['content-type']).toContain('text/html')
     expect(bootstrap.headers['cache-control']).toBe('no-store')
-    expect(bootstrap.body).toContain(JSON.stringify({ sessionToken: app.sessionToken }))
+    expect(bootstrap.body.includes(JSON.stringify({ sessionToken: app.sessionToken }))).toBe(true)
     expect(moduleAsset.statusCode).toBe(200)
     expect(moduleAsset.headers['content-type']).toContain('javascript')
     expect(moduleAsset.body).toContain('dataset.loaded')
-    expect(moduleAsset.body).not.toContain(app.sessionToken)
+    expect(moduleAsset.body.includes(app.sessionToken)).toBe(false)
     expect(api.statusCode).toBe(200)
     expect(api.json()).toEqual({ status: 'ok' })
-    expect(publicRoute.body).not.toContain(app.sessionToken)
+    expect(publicRoute.body.includes(app.sessionToken)).toBe(false)
 
     await app.close()
     await rm(directory, { recursive: true })

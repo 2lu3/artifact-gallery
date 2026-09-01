@@ -34,7 +34,7 @@ describe('processing error boundary', () => {
       retryable: false,
       technicalDetail: 'password=secret',
     })
-    expect(JSON.stringify(toPublicProcessingError(mapped))).not.toContain('secret')
+    expect(JSON.stringify(toPublicProcessingError(mapped)).includes('secret')).toBe(false)
   })
 
   it('classifies SQLite busy failures as retryable database contention', () => {

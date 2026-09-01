@@ -3,7 +3,7 @@ import { once } from 'node:events'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { delimiter, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { SESSION_TOKEN_HEADER, type GalleryPage } from '../src/shared/contracts.js'
@@ -13,8 +13,17 @@ export interface ProductionSmokeOptions {
   readonly args: readonly string[]
   readonly port: number
   readonly environment?: NodeJS.ProcessEnv
+  readonly runtime: IsolatedRuntimeEnvironment
   readonly timeoutMs?: number
   readonly log?: (message: string) => void
+}
+
+export interface IsolatedRuntimeEnvironment {
+  readonly stateDirectory: string
+  readonly databaseFilename: string
+  readonly thumbnailDirectory: string
+  readonly allowedRoots: readonly string[]
+  readonly clientDirectory: string
 }
 
 export interface ProductionSmokeResult {
@@ -49,7 +58,11 @@ export async function runProductionSmoke(
   const timeoutMs = options.timeoutMs ?? 15_000
   const log = options.log ?? console.info
   const child = spawn(options.command, [...options.args], {
-    env: { ...process.env, ...options.environment, PORT: String(options.port) },
+    env: buildIsolatedProductionEnvironment(
+      options.environment ?? process.env,
+      options.runtime,
+      options.port,
+    ),
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   child.stdout?.resume()
@@ -83,8 +96,11 @@ export async function runProductionSmoke(
     if (!galleryResponse.ok || !Array.isArray(gallery.items)) {
       throw new Error('The production gallery endpoint failed.')
     }
-    log(`production-smoke gallery-ok items=${gallery.items.length}`)
-    result = { health: 'ok', galleryItems: gallery.items.length }
+    if (gallery.items.length !== 0) {
+      throw new Error('The production smoke requires an empty gallery.')
+    }
+    log('production-smoke gallery-ok items=0')
+    result = { health: 'ok', galleryItems: 0 }
   } catch (error) {
     smokeError = error
   }
@@ -97,6 +113,44 @@ export async function runProductionSmoke(
   if (smokeError) throw smokeError
   if (!result) throw new Error('The production smoke did not produce a result.')
   return { ...result, exitCode: termination.exitCode }
+}
+
+export function buildIsolatedProductionEnvironment(
+  inherited: NodeJS.ProcessEnv,
+  runtime: IsolatedRuntimeEnvironment,
+  port: number,
+): NodeJS.ProcessEnv {
+  const paths = [
+    runtime.stateDirectory,
+    runtime.databaseFilename,
+    runtime.thumbnailDirectory,
+    runtime.clientDirectory,
+    ...runtime.allowedRoots,
+  ]
+  if (runtime.allowedRoots.length === 0 || paths.some((path) => !isAbsolute(path))) {
+    throw new TypeError('Production runtime paths must be absolute.')
+  }
+  const environment = { ...inherited }
+  for (const key of [
+    'ARTIFACT_GALLERY_STATE_DIRECTORY',
+    'ARTIFACT_GALLERY_DATABASE',
+    'ARTIFACT_GALLERY_THUMBNAILS',
+    'ARTIFACT_GALLERY_ALLOWED_ROOTS',
+    'ARTIFACT_GALLERY_CLIENT_DIRECTORY',
+    'ARTIFACT_GALLERY_DEVELOPMENT',
+    'PORT',
+  ]) {
+    delete environment[key]
+  }
+  return {
+    ...environment,
+    ARTIFACT_GALLERY_STATE_DIRECTORY: runtime.stateDirectory,
+    ARTIFACT_GALLERY_DATABASE: runtime.databaseFilename,
+    ARTIFACT_GALLERY_THUMBNAILS: runtime.thumbnailDirectory,
+    ARTIFACT_GALLERY_ALLOWED_ROOTS: runtime.allowedRoots.join(delimiter),
+    ARTIFACT_GALLERY_CLIENT_DIRECTORY: runtime.clientDirectory,
+    PORT: String(port),
+  }
 }
 
 async function fetchUntilReady(
@@ -156,9 +210,14 @@ async function runCli(): Promise<void> {
       args: [resolve('dist/server/server/index.js')],
       port,
       environment: {
-        ARTIFACT_GALLERY_STATE_DIRECTORY: join(directory, 'state'),
-        ARTIFACT_GALLERY_ALLOWED_ROOTS: directory,
-        ARTIFACT_GALLERY_CLIENT_DIRECTORY: resolve('dist'),
+        ...process.env,
+      },
+      runtime: {
+        stateDirectory: join(directory, 'state'),
+        databaseFilename: join(directory, 'state', 'catalog.sqlite'),
+        thumbnailDirectory: join(directory, 'state', 'thumbnails'),
+        allowedRoots: [directory],
+        clientDirectory: resolve('dist'),
       },
     })
   } finally {

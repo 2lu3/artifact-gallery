@@ -23,7 +23,9 @@ describe('production smoke', () => {
       '<main>Gallery</main><script id="artifact-gallery-bootstrap" type="application/json">' +
       '{"sessionToken":"0123456789abcdefghijklmnopqrstuvwxyz_SAFE"}</script>'
 
-    expect(extractBootstrapToken(document)).toBe('0123456789abcdefghijklmnopqrstuvwxyz_SAFE')
+    expect(extractBootstrapToken(document) === '0123456789abcdefghijklmnopqrstuvwxyz_SAFE').toBe(
+      true,
+    )
     expect(() => extractBootstrapToken('<main>missing</main>')).toThrow(/bootstrap/u)
     expect(() =>
       extractBootstrapToken(
@@ -33,18 +35,28 @@ describe('production smoke', () => {
     ).toThrow(/exactly one/u)
   })
 
-  it('starts a real child, authorizes health and gallery, hides the token, and stops gracefully', async () => {
+  it('isolates runtime paths, requires an empty gallery, hides the token, and stops gracefully', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-prod-smoke-test-'))
     temporaryDirectories.push(directory)
     const marker = join(directory, 'graceful.txt')
     const fixture = join(directory, 'server.mjs')
     const port = await availablePort()
+    const stateDirectory = join(directory, 'isolated-state')
+    const databaseFilename = join(stateDirectory, 'catalog.sqlite')
+    const thumbnailDirectory = join(stateDirectory, 'thumbnails')
+    const clientDirectory = join(directory, 'client')
     const secret = 'do-not-log-this-session-token-0123456789'
     await writeFile(
       fixture,
       `import { createServer } from 'node:http'
 import { writeFile } from 'node:fs/promises'
 const secret = ${JSON.stringify(secret)}
+const isolated =
+  process.env.ARTIFACT_GALLERY_STATE_DIRECTORY === ${JSON.stringify(stateDirectory)} &&
+  process.env.ARTIFACT_GALLERY_DATABASE === ${JSON.stringify(databaseFilename)} &&
+  process.env.ARTIFACT_GALLERY_THUMBNAILS === ${JSON.stringify(thumbnailDirectory)} &&
+  process.env.ARTIFACT_GALLERY_ALLOWED_ROOTS === ${JSON.stringify(directory)} &&
+  process.env.ARTIFACT_GALLERY_CLIENT_DIRECTORY === ${JSON.stringify(clientDirectory)}
 const server = createServer((request, response) => {
   if (request.url === '/') {
     response.setHeader('content-type', 'text/html')
@@ -63,7 +75,10 @@ const server = createServer((request, response) => {
   }
   if (request.url === '/api/gallery') {
     response.setHeader('content-type', 'application/json')
-    response.end(JSON.stringify({ items: [], nextCursor: null, catalogTotal: 0, filteredTotal: 0, formatCounts: { all: 0, html: 0, markdown: 0 } }))
+    const items = isolated && process.env.ARTIFACT_GALLERY_FORCE_NON_EMPTY !== '1'
+      ? []
+      : [{ id: 1, title: 'unexpected inherited catalog' }]
+    response.end(JSON.stringify({ items, nextCursor: null, catalogTotal: items.length, filteredTotal: items.length, formatCounts: { all: items.length, html: 0, markdown: 0 } }))
     return
   }
   response.statusCode = 404
@@ -83,7 +98,22 @@ process.on('SIGTERM', () => server.close(async () => {
       command: process.execPath,
       args: [fixture],
       port,
-      environment: { PORT: String(port) },
+      environment: {
+        ...process.env,
+        ARTIFACT_GALLERY_STATE_DIRECTORY: '/user/state',
+        ARTIFACT_GALLERY_DATABASE: '/user/catalog.sqlite',
+        ARTIFACT_GALLERY_THUMBNAILS: '/user/thumbnails',
+        ARTIFACT_GALLERY_ALLOWED_ROOTS: '/user/sources',
+        ARTIFACT_GALLERY_CLIENT_DIRECTORY: '/user/client',
+        PORT: '65535',
+      },
+      runtime: {
+        stateDirectory,
+        databaseFilename,
+        thumbnailDirectory,
+        allowedRoots: [directory],
+        clientDirectory,
+      },
       timeoutMs: 5_000,
       log: (message) => logs.push(message),
     })
@@ -91,7 +121,7 @@ process.on('SIGTERM', () => server.close(async () => {
 
     expect(result).toEqual({ health: 'ok', galleryItems: 0, exitCode: 0 })
     await expect(access(marker)).resolves.toBeUndefined()
-    expect(logs.join('\n')).not.toContain(secret)
+    expect(logs.every((message) => !message.includes(secret))).toBe(true)
     expect(logs).toEqual([
       'production-smoke server-ready',
       'production-smoke health-ok',
@@ -99,6 +129,25 @@ process.on('SIGTERM', () => server.close(async () => {
       'production-smoke shutdown-ok',
     ])
     expect(activeTimeoutCount()).toBeLessThanOrEqual(timeoutsBefore)
+
+    const nonEmptyPort = await availablePort()
+    await expect(
+      runProductionSmoke({
+        command: process.execPath,
+        args: [fixture],
+        port: nonEmptyPort,
+        environment: { ...process.env, ARTIFACT_GALLERY_FORCE_NON_EMPTY: '1' },
+        runtime: {
+          stateDirectory,
+          databaseFilename,
+          thumbnailDirectory,
+          allowedRoots: [directory],
+          clientDirectory,
+        },
+        timeoutMs: 5_000,
+        log: () => undefined,
+      }),
+    ).rejects.toThrow(/empty gallery/u)
   })
 
   it('bounds a stalled bootstrap request and still terminates the child', async () => {
@@ -127,6 +176,13 @@ process.on('SIGTERM', () => server.close(async () => {
         args: [fixture],
         port,
         environment: { PORT: String(port) },
+        runtime: {
+          stateDirectory: join(directory, 'state'),
+          databaseFilename: join(directory, 'state', 'catalog.sqlite'),
+          thumbnailDirectory: join(directory, 'state', 'thumbnails'),
+          allowedRoots: [directory],
+          clientDirectory: join(directory, 'client'),
+        },
         timeoutMs: 100,
         log: () => undefined,
       }),

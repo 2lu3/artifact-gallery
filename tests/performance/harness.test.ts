@@ -11,6 +11,7 @@ import {
   performanceProfile,
   summarizeDurations,
 } from './harness.js'
+import * as performanceHarness from './harness.js'
 
 const temporaryDirectories: string[] = []
 
@@ -88,6 +89,7 @@ describe('performance harness', () => {
         },
         firstPage: passing,
         searches: [passing],
+        userObservedSearches: [passing],
       }),
     ).toThrow(/Apple Silicon/u)
     expect(() =>
@@ -101,6 +103,7 @@ describe('performance harness', () => {
         },
         firstPage: missedMedian,
         searches: [passing],
+        userObservedSearches: [passing],
       }),
     ).toThrow(/median/u)
     expect(() =>
@@ -114,8 +117,61 @@ describe('performance harness', () => {
         },
         firstPage: outlier,
         searches: [passing],
+        userObservedSearches: [passing],
       }),
     ).toThrow(/twice/u)
+  })
+
+  it('rejects a slow fill-to-render search even when the debounced app measure passes', () => {
+    const acceptedToRender = summarizeDurations([20, 22, 24, 26, 28], 200)
+    const fillToRender = summarizeDurations([190, 205, 210, 215, 220], 200)
+
+    expect(() =>
+      assertPerformanceGate({
+        profile: performanceProfile('smoke'),
+        hardware: {
+          platform: 'linux',
+          architecture: 'x64',
+          cpuCount: 2,
+          totalMemoryBytes: 2 * 1024 ** 3,
+        },
+        firstPage: summarizeDurations([100, 110, 120, 130, 140], 5_000),
+        searches: [acceptedToRender],
+        userObservedSearches: [fillToRender],
+      }),
+    ).toThrow(/user-observed search median/u)
+  })
+
+  it('creates and closes an independent cold resource for every measurement', async () => {
+    const runIndependentColdMeasurements = (
+      performanceHarness as unknown as {
+        runIndependentColdMeasurements?: (
+          runs: number,
+          createMeasurement: (run: number) => Promise<{
+            measure: () => Promise<number>
+            close: () => Promise<void>
+          }>,
+        ) => Promise<number[]>
+      }
+    ).runIndependentColdMeasurements
+    expect(typeof runIndependentColdMeasurements).toBe('function')
+    if (!runIndependentColdMeasurements) return
+    const created: number[] = []
+    const closed: number[] = []
+
+    const durations = await runIndependentColdMeasurements(5, async (run) => {
+      created.push(run)
+      return {
+        measure: async () => run + 10,
+        close: async () => {
+          closed.push(run)
+        },
+      }
+    })
+
+    expect(durations).toEqual([10, 11, 12, 13, 14])
+    expect(created).toEqual([0, 1, 2, 3, 4])
+    expect(closed).toEqual([0, 1, 2, 3, 4])
   })
 
   it('runs every fixed search the requested number of times without repeating one in place', () => {
