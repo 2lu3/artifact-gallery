@@ -236,6 +236,7 @@ class IndexCommitError extends Error {
 
 interface MutableAttempt {
   artifactId: number | null
+  artifactWasCreated: boolean
   generationId: number | null
   generation: number | null
   contentStatus: DerivedStatus
@@ -307,6 +308,7 @@ export class ArtifactProcessor {
       : this.dependencies.pathPolicy
     const attempt: MutableAttempt = {
       artifactId: null,
+      artifactWasCreated: false,
       generationId: null,
       generation: null,
       contentStatus: 'failed',
@@ -334,12 +336,16 @@ export class ArtifactProcessor {
       )
       this.assertWithinDeadline(request.deadlineAt, 'inspect')
       sourceFormat = formatFor(authorizedFile.canonicalPath)
+      const existingArtifact = this.dependencies.database
+        .prepare('SELECT id FROM artifact WHERE source_path = ?')
+        .get(authorizedFile.canonicalPath)
       const artifact = this.artifacts.register({
         sourcePath: authorizedFile.canonicalPath,
         format: sourceFormat,
         now: this.now(),
       })
       attempt.artifactId = artifact.id
+      attempt.artifactWasCreated = existingArtifact === undefined
       if (request.capabilityId !== undefined) {
         this.dependencies.database
           .prepare(
@@ -811,7 +817,7 @@ export class ArtifactProcessor {
       this.dependencies.database
         .prepare('UPDATE artifact_warning SET generation_id = NULL WHERE generation_id = ?')
         .run(generationId)
-      if (artifact.active_generation_id === null) {
+      if (attempt.artifactWasCreated && artifact.active_generation_id === null) {
         this.dependencies.database
           .prepare('UPDATE import_item SET artifact_id = NULL WHERE id = ?')
           .run(run.itemId)

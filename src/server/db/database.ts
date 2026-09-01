@@ -2,6 +2,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { basename, resolve } from 'node:path'
 import Database from 'better-sqlite3'
 
+import { normalizeArtifactTitle } from '../../shared/artifact-title.js'
 import { normalizePathSegments, normalizeSearchText } from '../search/search-query.js'
 
 export interface OpenDatabaseOptions {
@@ -23,6 +24,9 @@ export function openDatabase({
       normalizePathSegments(value),
     )
     database.function('path_basename', { deterministic: true }, (value: string) => basename(value))
+    database.function('artifact_title_clamp', { deterministic: true }, (value: string | null) =>
+      normalizeArtifactTitle(value),
+    )
     database.pragma('journal_mode = WAL')
     database.pragma('foreign_keys = ON')
     database.pragma('busy_timeout = 5000')

@@ -220,6 +220,29 @@ describe('SearchRepository', () => {
     harness.database.close()
   })
 
+  it('uses a stable repository keyset without rescanning prior relevance pages', async () => {
+    const harness = await makeHarness()
+    for (let index = 0; index < 75; index += 1) {
+      await harness.seed({
+        sourcePath: `/keyset/${index}.md`,
+        text: `keysetneedle ${index}`,
+        registeredAt: timestamp(index),
+      })
+    }
+    const first = harness.search.search('keysetneedle', { limit: 30 })
+    const last = first.at(-1) as (typeof first)[number]
+    const second = harness.search.search('keysetneedle', {
+      limit: 30,
+      after: { relevanceKey: last.relevanceKey, artifactId: last.artifactId },
+    })
+
+    expect(first).toHaveLength(30)
+    expect(second).toHaveLength(30)
+    expect(new Set([...first, ...second].map(({ artifactId }) => artifactId)).size).toBe(60)
+    expect(harness.search.search('keysetneedle', { limit: 30 })).toEqual(first)
+    harness.database.close()
+  })
+
   it('returns visible indexed artifacts newest registered first for an empty query', async () => {
     const harness = await makeHarness()
     const oldest = await harness.seed({

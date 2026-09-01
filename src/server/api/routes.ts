@@ -185,8 +185,7 @@ export function registerApiRoutes(app: FastifyInstance, dependencies: ApiRouteDe
   app.get('/api/search', async (request, reply) => {
     try {
       const query = readPageQuery(request.query, true)
-      const results = search.search(query.query, { limit: Number.MAX_SAFE_INTEGER })
-      return searchPageResponse(dependencies.database, cursorCodec, thumbnailCodec, query, results)
+      return searchPageResponse(dependencies.database, cursorCodec, thumbnailCodec, search, query)
     } catch (error) {
       return sendBoundaryError(reply, error)
     }
@@ -858,40 +857,20 @@ function searchPageResponse(
   database: Database.Database,
   codec: CursorCodec,
   thumbnailCodec: ThumbnailResourceCodec,
+  search: SearchRepository,
   query: PageQuery,
-  results: readonly SearchResult[],
 ): GalleryPage {
   const context = cursorContext(database, query, `search:${normalizeSearchText(query.query)}`)
   const cursor = query.cursor ? codec.decode(query.cursor, context) : null
+  const results = readSearchWindow(database, search, query, cursor, GALLERY_PAGE_SIZE + 1)
   const rowsById = new Map(
     readArtifactRowsInBatches(
       database,
       results.map(({ artifactId }) => artifactId),
     ).map((row) => [row.id, row]),
   )
-  const statusMatched = results.filter((result) => {
-    const row = rowsById.get(result.artifactId)
-    return row && (query.status === 'all' || presentationFor(row) === query.status)
-  })
-  const formatCounts = {
-    all: statusMatched.length,
-    html: statusMatched.filter(({ format }) => format === 'html').length,
-    markdown: statusMatched.filter(({ format }) => format === 'markdown').length,
-  }
-  const filtered = statusMatched.filter(
-    ({ format }) => query.filter === 'all' || format === query.filter,
-  )
-  let start = 0
-  if (cursor) {
-    const previous = filtered.findIndex(
-      ({ artifactId, relevanceKey }) =>
-        artifactId === cursor.lastId && relevanceKey === cursor.lastSortKey,
-    )
-    if (previous === -1) throw new StaleCursorError()
-    start = previous + 1
-  }
-  const window = filtered.slice(start, start + GALLERY_PAGE_SIZE + 1)
-  const page = window.slice(0, GALLERY_PAGE_SIZE)
+  const counts = readSearchCounts(database, search, query, context.catalogRevision)
+  const page = results.slice(0, GALLERY_PAGE_SIZE)
   const last = page.at(-1)
   return {
     items: page.map((result) => {
@@ -903,7 +882,7 @@ function searchPageResponse(
       }
     }),
     nextCursor:
-      window.length > GALLERY_PAGE_SIZE && last
+      results.length > GALLERY_PAGE_SIZE && last
         ? codec.encode({
             version: 1,
             ...context,
@@ -912,10 +891,91 @@ function searchPageResponse(
           })
         : null,
     catalogTotal: database.prepare('SELECT COUNT(*) FROM artifact').pluck().get() as number,
-    filteredTotal: query.filter === 'all' ? formatCounts.all : formatCounts[query.filter],
-    formatCounts,
+    filteredTotal: query.filter === 'all' ? counts.all : counts[query.filter],
+    formatCounts: counts,
   }
 }
+
+function readSearchWindow(
+  database: Database.Database,
+  search: SearchRepository,
+  query: PageQuery,
+  cursor: { lastSortKey: string; lastId: number } | null,
+  limit: number,
+): SearchResult[] {
+  const matches: SearchResult[] = []
+  let after = cursor ? { relevanceKey: cursor.lastSortKey, artifactId: cursor.lastId } : undefined
+  while (matches.length < limit) {
+    const batch = search.search(query.query, { limit: 100, after })
+    if (batch.length === 0) break
+    const rows = new Map(
+      readArtifactRowsInBatches(
+        database,
+        batch.map(({ artifactId }) => artifactId),
+      ).map((row) => [row.id, row]),
+    )
+    for (const result of batch) {
+      const row = rows.get(result.artifactId)
+      if (
+        row &&
+        (query.status === 'all' || presentationFor(row) === query.status) &&
+        (query.filter === 'all' || result.format === query.filter)
+      ) {
+        matches.push(result)
+        if (matches.length === limit) break
+      }
+    }
+    const last = batch.at(-1)
+    if (!last || batch.length < 100) break
+    after = { relevanceKey: last.relevanceKey, artifactId: last.artifactId }
+  }
+  return matches
+}
+
+function readSearchCounts(
+  database: Database.Database,
+  search: SearchRepository,
+  query: PageQuery,
+  revision: string,
+): { all: number; html: number; markdown: number } {
+  const cacheKey = `${revision}\u0000${query.status}\u0000${normalizeSearchText(query.query)}`
+  const cached = searchCountCache.get(database)?.get(cacheKey)
+  if (cached) return cached
+  const counts = { all: 0, html: 0, markdown: 0 }
+  let after: { relevanceKey: string; artifactId: number } | undefined
+  for (;;) {
+    const batch = search.search(query.query, { limit: 250, after })
+    if (batch.length === 0) break
+    const rows = new Map(
+      readArtifactRowsInBatches(
+        database,
+        batch.map(({ artifactId }) => artifactId),
+      ).map((row) => [row.id, row]),
+    )
+    for (const result of batch) {
+      const row = rows.get(result.artifactId)
+      if (!row || (query.status !== 'all' && presentationFor(row) !== query.status)) continue
+      counts.all += 1
+      counts[result.format] += 1
+    }
+    const last = batch.at(-1)
+    if (!last || batch.length < 250) break
+    after = { relevanceKey: last.relevanceKey, artifactId: last.artifactId }
+  }
+  let databaseCache = searchCountCache.get(database)
+  if (!databaseCache) {
+    databaseCache = new Map()
+    searchCountCache.set(database, databaseCache)
+  }
+  if (databaseCache.size >= 32) databaseCache.clear()
+  databaseCache.set(cacheKey, counts)
+  return counts
+}
+
+const searchCountCache = new WeakMap<
+  Database.Database,
+  Map<string, { all: number; html: number; markdown: number }>
+>()
 
 interface PageQuery {
   readonly cursor: string | null
@@ -1042,7 +1102,11 @@ function toArtifactCard(row: ArtifactRow, thumbnailCodec: ThumbnailResourceCodec
   const status = presentationFor(row)
   return {
     id: row.id,
-    title: row.user_title ?? row.derived_title ?? basename(row.source_path),
+    title:
+      normalizeArtifactTitle(row.user_title) ??
+      normalizeArtifactTitle(row.derived_title) ??
+      normalizeArtifactTitle(basename(row.source_path)) ??
+      'Untitled',
     sourcePath: row.source_path,
     format: row.format,
     registeredAt: row.registered_at,

@@ -15,6 +15,39 @@ afterEach(async () => {
 })
 
 describe('openDatabase', () => {
+  it('clamps legacy artifact titles while applying the title-boundary migration', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-title-migration-'))
+    temporaryDirectories.push(directory)
+    const databasePath = join(directory, 'legacy-titles.sqlite')
+    const database = openDatabase({ filename: databasePath })
+    const longTitle = '😀'.repeat(300)
+    database
+      .prepare(
+        `INSERT INTO artifact
+          (source_path, format, derived_title, user_title, source_status,
+           created_at, updated_at, registered_at, generation_counter)
+         VALUES (?, 'markdown', ?, ?, 'available', ?, ?, ?, 0)`,
+      )
+      .run(
+        '/legacy/long.md',
+        longTitle,
+        longTitle,
+        '2026-09-01T00:00:00.000Z',
+        '2026-09-01T00:00:00.000Z',
+        '2026-09-01T00:00:00.000Z',
+      )
+    database.prepare("DELETE FROM schema_migration WHERE version = '007_title_bounds.sql'").run()
+    database.close()
+
+    const migrated = openDatabase({ filename: databasePath })
+    const row = migrated.prepare('SELECT user_title, derived_title FROM artifact').get() as {
+      user_title: string
+      derived_title: string
+    }
+    expect(Array.from(row.user_title)).toHaveLength(256)
+    expect(Array.from(row.derived_title)).toHaveLength(256)
+    migrated.close()
+  })
   it('initializes a fresh database with the complete schema and durable pragmas', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'artifact-gallery-db-'))
     temporaryDirectories.push(directory)
@@ -507,6 +540,7 @@ describe('openDatabase', () => {
         { version: '004_search.sql' },
         { version: '005_capabilities.sql' },
         { version: '006_search_contract.sql' },
+        { version: '007_title_bounds.sql' },
       ],
     )
     expect(
@@ -671,6 +705,7 @@ describe('openDatabase', () => {
         { version: '004_search.sql' },
         { version: '005_capabilities.sql' },
         { version: '006_search_contract.sql' },
+        { version: '007_title_bounds.sql' },
       ],
     )
     expect(

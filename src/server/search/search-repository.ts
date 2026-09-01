@@ -16,6 +16,10 @@ const SNIPPET_CODE_POINT_LIMIT = 160
 
 export interface SearchOptions {
   readonly limit?: number
+  readonly after?: {
+    readonly relevanceKey: string
+    readonly artifactId: number
+  }
 }
 
 export type SearchMatchReason = 'title' | 'body' | 'path' | 'format'
@@ -38,6 +42,7 @@ interface SearchCandidate extends GenerationSearchCandidate {
   readonly sourcePath: string
   readonly format: ArtifactFormat
   readonly registeredAt: string
+  readonly relevanceScore: number | null
   readonly normalizedFields: readonly [
     userTitle: string,
     derivedTitle: string,
@@ -55,6 +60,7 @@ interface SearchCandidateRow {
   source_path: string
   format: ArtifactFormat
   registered_at: string
+  relevance_score?: number
   user_title_normalized: string
   derived_title_normalized: string
   body_normalized: string
@@ -89,7 +95,7 @@ export class SearchRepository {
       candidates =
         ftsParts.length === 0
           ? this.readShortQueryCandidates()
-          : this.readFtsCandidates(buildFtsExpression(ftsParts))
+          : this.readFtsCandidates(buildFtsExpression(ftsParts), limit, options.after)
       candidates = candidates.filter((candidate) => candidateRank(candidate, parts) !== null)
       if (ftsParts.length === 0) {
         candidates = candidates.toSorted((left, right) => compareCandidates(left, right, parts))
@@ -97,7 +103,13 @@ export class SearchRepository {
     }
 
     const visible = this.visibility.filterVisibleCandidates(candidates)
-    return visible.slice(0, limit).map((candidate, index) => {
+    const afterIndex =
+      options.after && parts.length === 0
+        ? visible.findIndex(({ artifactId }) => artifactId === options.after?.artifactId) + 1
+        : options.after && parts.every((part) => !isFtsSearchable(part))
+          ? visible.findIndex(({ artifactId }) => artifactId === options.after?.artifactId) + 1
+          : 0
+    return visible.slice(afterIndex, afterIndex + limit).map((candidate) => {
       const rank = candidateRank(candidate, parts)
       const reason = rank ? reasonForRank(rank) : 'title'
       return {
@@ -108,12 +120,17 @@ export class SearchRepository {
         format: candidate.format,
         matchReason: reason,
         snippet: snippetFor(candidate, reason, parts),
-        relevanceKey: `${String(index).padStart(12, '0')}:${candidate.artifactId}`,
+        relevanceKey: encodeRelevanceKey(candidate),
       }
     })
   }
 
-  private readFtsCandidates(expression: string): SearchCandidate[] {
+  private readFtsCandidates(
+    expression: string,
+    limit: number,
+    after: SearchOptions['after'],
+  ): SearchCandidate[] {
+    const cursor = after ? decodeRelevanceKey(after.relevanceKey, after.artifactId) : null
     const rows = this.database
       .prepare(
         `SELECT artifact_search_document.artifact_id,
@@ -127,7 +144,8 @@ export class SearchRepository {
                 artifact_search_document.derived_title_normalized,
                 artifact_search_document.body_normalized,
                 artifact_search_document.path_segments_normalized,
-                artifact_search_document.format_normalized
+                artifact_search_document.format_normalized,
+                artifact_search_fts.rank AS relevance_score
          FROM artifact_search_fts
          JOIN artifact_search_document
            ON artifact_search_document.generation_id = artifact_search_fts.rowid
@@ -143,11 +161,27 @@ export class SearchRepository {
           AND artifact_search_visibility.generation_id = artifact_generation.id
           AND artifact_search_visibility.state = 'visible'
          WHERE artifact_search_fts MATCH ?
-         ORDER BY bm25(artifact_search_fts, 0.0, 0.0, 16.0, 8.0, 2.0, 1.0, 4.0),
-                  artifact.registered_at DESC,
-                  artifact.id DESC`,
+           AND artifact_search_fts.rank MATCH 'bm25(0.0, 0.0, 16.0, 8.0, 2.0, 1.0, 4.0)'
+           AND (
+             ? IS NULL
+             OR artifact_search_fts.rank > ?
+             OR (artifact_search_fts.rank = ? AND artifact.registered_at < ?)
+             OR (artifact_search_fts.rank = ? AND artifact.registered_at = ? AND artifact.id < ?)
+           )
+         ORDER BY artifact_search_fts.rank, artifact.registered_at DESC, artifact.id DESC
+         LIMIT ?`,
       )
-      .all(expression) as SearchCandidateRow[]
+      .all(
+        expression,
+        cursor?.score ?? null,
+        cursor?.score ?? 0,
+        cursor?.score ?? 0,
+        cursor?.registeredAt ?? '',
+        cursor?.score ?? 0,
+        cursor?.registeredAt ?? '',
+        cursor?.artifactId ?? 0,
+        Math.max(limit * 4, limit),
+      ) as SearchCandidateRow[]
     return rows.map(toCandidate)
   }
 
@@ -304,6 +338,7 @@ function toCandidate(row: SearchCandidateRow): SearchCandidate {
     sourcePath: row.source_path,
     format: row.format,
     registeredAt: row.registered_at,
+    relevanceScore: row.relevance_score ?? null,
     normalizedFields: [
       row.user_title_normalized,
       row.derived_title_normalized,
@@ -311,6 +346,29 @@ function toCandidate(row: SearchCandidateRow): SearchCandidate {
       row.path_segments_normalized,
       row.format_normalized,
     ],
+  }
+}
+
+function encodeRelevanceKey(candidate: SearchCandidate): string {
+  return Buffer.from(
+    JSON.stringify({ score: candidate.relevanceScore, registeredAt: candidate.registeredAt }),
+  ).toString('base64url')
+}
+
+function decodeRelevanceKey(
+  value: string,
+  artifactId: number,
+): { score: number; registeredAt: string; artifactId: number } {
+  try {
+    const decoded = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as {
+      score?: unknown
+      registeredAt?: unknown
+    }
+    if (typeof decoded.score !== 'number' || typeof decoded.registeredAt !== 'string')
+      throw new Error()
+    return { score: decoded.score, registeredAt: decoded.registeredAt, artifactId }
+  } catch {
+    throw new Error('Invalid search relevance cursor.')
   }
 }
 

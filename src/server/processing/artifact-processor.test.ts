@@ -953,6 +953,35 @@ describe('ArtifactProcessor staged pipeline', () => {
     harness.database.close()
   })
 
+  it('preserves an existing failed artifact when a retry is cancelled before commit', async () => {
+    const harness = await makeHarness()
+    await writeFile(harness.sourcePath, '# Existing failed artifact')
+    const artifactId = new ArtifactRepository(harness.database).register({
+      sourcePath: await realpath(harness.sourcePath),
+      format: 'markdown',
+      now: NOW,
+    }).id
+    expect(activeGenerationId(harness.database, artifactId)).toBeNull()
+    const imports = new ImportRepository(harness.database)
+    const run = imports.createRun([harness.sourcePath])
+    imports.startRun(run.id, NOW)
+    imports.requestCancellation(run.id, NOW)
+
+    const retried = await harness.processor.retry({
+      sourcePath: harness.sourcePath,
+      runId: run.id,
+      itemId: run.itemIds[0],
+    })
+
+    expect(retried.outcome).toBe('cancelled')
+    expect(
+      harness.database.prepare('SELECT id FROM artifact WHERE id = ?').get(artifactId),
+    ).toEqual({
+      id: artifactId,
+    })
+    harness.database.close()
+  })
+
   it('clears errors for repaired stages even when a later index stage fails', async () => {
     let renderFails = true
     let indexFails = false
